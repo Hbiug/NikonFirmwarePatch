@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the Z8 menu-bank behaviour patch (auto-store switch + save command) from the official C 3.11 package.
+"""Build the Z8 menu-bank behaviour patch (auto-store switch, save command, link banks) from the official C 3.11 package.
 
 Standalone: it does not combine with the toolkit's four features (they share rows, a state and the text
 gap with each other and with this patch).  Same safeguards as patch.py: exact official input, edits only

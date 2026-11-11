@@ -11,6 +11,13 @@ always holds the last settings used in it.  This patch adds a Z7-style alternati
       - Save current settings to bank : explicit live->bank store of the current photo/video bank and
                                         the current Custom Settings bank
   * One gate at the entry of the data-store copy routine (the only path every live->bank store uses).
+  * Link banks (new): with it on, the photo/video shooting menu bank and the Custom Settings bank always switch
+    together (A-A, B-B, C-C, D-D).  Every settings change - the menu rows and the "shooting menu bank" button + dial
+    shortcut alike - reaches the two bank-switch routines through ONE dispatcher (0x410EA70C, called per item by the
+    data-store transaction 0x410D6284); its one call for item 0x2000546 (menu bank) and its one call for item
+    0x2001613 (Custom Settings bank) are redirected to wrappers that run the stock switch and then the same switch
+    on the other bank type, adding the other item to the same transaction so both ids commit together.  Turning the
+    link on syncs at once (Custom Settings bank := shooting menu bank) through the stock set-item API.
   * Release mode (single / continuous L / continuous H and the L and H speeds) follows the photo/video menu bank:
     stock keeps those three items only in the Custom Settings list.  Every copy of the whole main list (live ->
     bank, bank -> live, bank -> bank, and the explicit save) now copies the three items too, with the same slots;
@@ -18,12 +25,13 @@ always holds the last settings used in it.  This patch adds a Z7-style alternati
 
 The switch lives in the padding byte after the one-byte item 0x12:0x38 of the live movie block, which
 the data store persists with the block and which the bank copy never touches (so it is global, not
-per bank, and 0 = stock behaviour after a factory reset).  Everything is relative to the stock 3.11
+per bank, and 0 = stock behaviour after a factory reset).  Bit 0 = keep stored settings (Z7 style), bit 1 = link
+the banks; the sub-page offers the four combinations plus the save command.  Everything is relative to the stock 3.11
 image; every edited stock byte is checked against its expected value.
 """
 import struct
 from z8prores import menu as pm
-from z8prores.a64 import Block
+from z8prores.a64 import Block, _imm
 from z8prores.package import require
 
 BASE = pm.BASE
@@ -44,6 +52,18 @@ LIST_CUSTOM, N_CUSTOM, CHUNK = 0xA0299EFF8, 609, 0x1FF
 # main list (live<->bank and bank<->bank), which is exactly when the menu bank is stored or loaded.
 RELEASE_IDS = (0x6001A92, 0x6001A29, 0x6001A2A)      # mode 0/1/2 (S/CL/CH), CH speed, CL speed
 
+# ---- link banks: the dispatcher (0x410EA70C) is called once per item of a data-store transaction; it first records the
+# item in the transaction (txn.Set), then runs the item's handler.  Its handler call for item 0x2000546 is
+# `bl 0x410E958C` (thunk: switch(value, 1, txn) = S_MENU) and for item 0x2001613 `bl 0x410E9934` (thunk: S_CUSTOM).
+DISPATCH_MENU_SITE, DISPATCH_MENU_THUNK = 0x410EA9CC, 0x410E958C
+DISPATCH_CUSTOM_SITE, DISPATCH_CUSTOM_THUNK = 0x410EAE38, 0x410E9934
+S_MENU, S_CUSTOM = 0x410DD1EC, 0x410DE050      # switch(new bank 0..3, flags (bit 0 = store the old bank first), txn)
+TXN_SET = 0x410E9318                           # txn.Set(item id, value, txn): append to the transaction
+SET_ITEM = 0x410D61D0                          # public set-item API: (id, value), runs a one-item transaction
+DISPATCH_MENU_BL, DISPATCH_CUSTOM_BL = 0x97FFFAF0, 0x97FFFABF       # stock `bl` words at the two sites
+THUNK_MENU_WORDS = (0x2A0103E8, 0x320003E1, 0x2A0803E0, 0x17FFCF15)   # mov w8,w1; orr w1,wzr,#1; mov w0,w8; b S_MENU
+THUNK_CUSTOM_WORDS = (0x2A0103E8, 0x320003E1, 0x2A0803E0, 0x17FFD1C4)  # same, b S_CUSTOM
+
 # ---- persistent switch: padding byte of one-byte item 0x12:0x38 in the live movie block -------------------
 ITEM_BLOCK_LIVE = 0xA03D5C0DC    # live address of item 0x1238 (type 0, one byte); +1..+3 are padding
 SWITCH_RAM = ITEM_BLOCK_LIVE + 1
@@ -55,12 +75,16 @@ CODE_AT, CODE_LIMIT = pm.CODE_AT, pm.CODE_AT + 0x1000   # the code page is read-
 # ordinary writable RAM (a store into the code page is a permission fault), is reset when the sub-page opens,
 # and only affects the text at the right of the row.
 SCRATCH_RAM = SWITCH_RAM + 1
-STRING_FIRST, STRING_COUNT = 3137, 4                    # label + three options (ids from the shared pool)
-STATE_TEXT = (b'AUTO', b'KEEP', b'SAVED', b'FAILED')    # right-hand value texts (<= 8 bytes)
+STRING_FIRST, STRING_COUNT = 3137, 6                    # label + five options (ids from the shared pool)
+STATE_TEXT = (b'AUTO', b'KEEP', b'A+LINK', b'K+LINK', b'SAVED', b'FAILED')   # value texts, 16-byte slots; at most 6 characters: the text is centred in a fixed box left of the row arrow
+TEXT_SLOT_BYTES = 16
+N_OPTIONS = 5                                           # modes 0..3 (bit 0 keep, bit 1 link) + the save command
 
 ENGLISH = ('Menu bank behavior',
            'Auto-store changes (stock)',
            'Keep stored settings (Z7 style)',
+           'Auto-store + link banks',
+           'Keep stored + link banks',
            'Save current settings to bank')
 
 
@@ -94,19 +118,87 @@ def _get(b, item):
     b.bl(GET_DS)
 
 
+def _tbnz(b, rt, bit, target):
+    b._rel(lambda pc: 0x37000000 | _imm(bit, 5) << 19 | _imm((b._target(target) - pc) >> 2, 14, True) << 5 | rt)
+
+
+def _and7(b, rd, rn):
+    b.raw(0x12000800 | rn << 5 | rd)                      # and wD,wN,#7
+
+
+def _load_id(b, rd, item):
+    b.mov_w(rd, item & 0xFFFF)
+    b.movk_w16(rd, item >> 16)
+
+
+def _switch_byte(b, rd):
+    """wD = the persistent switch byte (bit 0 keep stored settings, bit 1 link the banks)."""
+    b.mov_x64(rd, SWITCH_RAM)
+    b.ldrb_w(rd, rd)
+
+
+def _hook(b, name, own_id, other_id, stock_thunk, switch_other):
+    """Wrapper for one dispatcher call site: the stock handler, then (link on) the same switch on the other bank type.
+
+    In: w0 = item id, w1 = new bank (0..3), x2 = transaction.  Out: w0 = what the stock handler returned.
+    Link off: a plain tail call of the stock thunk, so the stock path is untouched.
+    """
+    b.label(name)
+    _switch_byte(b, 8)
+    b.tbz_w(8, 1, name + '_stock')
+    b.stp_pre(19, 30, -0x30)
+    b.stp(20, 21, 0x10)
+    b.str_x(22, 31, 0x20)
+    b.mov_wr(19, 1)                           # new bank
+    b.mov_x(20, 2)                            # transaction
+    b.mov_w(21, 1)                            # reported when this bank type was already switched in this request
+    _load_id(b, 0, own_id)
+    b.mov_x(1, 20)
+    b.bl('has_prev')
+    b.cbnz_w(0, name + '_done')               # an earlier entry of the same request already moved this bank type
+    b.mov_wr(1, 19)
+    b.mov_x(2, 20)
+    b.bl(stock_thunk)                         # stock: switch(new bank, 1, transaction)
+    b.mov_wr(21, 0)
+    b.tbz_w(21, 0, name + '_done')            # the stock switch failed: nothing to link
+    b.cmp_wi(19, 3)
+    b.b_cond('hi', name + '_done')
+    _load_id(b, 0, other_id)
+    b.mov_x(1, 20)
+    b.bl('has_prev')
+    b.cbnz_w(0, name + '_done')               # the request carries the other bank type itself: leave it alone
+    _get(b, other_id)
+    b.cmp_w(0, 19)
+    b.b_cond('eq', name + '_done')            # already on that bank
+    _load_id(b, 0, other_id)
+    b.mov_wr(1, 19)
+    b.mov_x(2, 20)
+    b.bl(TXN_SET)                             # commit the other item together with this one
+    b.mov_wr(0, 19)
+    b.mov_w(1, 1)                             # store the old bank first, as both stock thunks do
+    b.mov_x(2, 20)
+    b.bl(switch_other)
+    b.label(name + '_done')
+    b.mov_wr(0, 21)
+    b.ldr_x(22, 31, 0x20)
+    b.ldp(20, 21, 0x10)
+    b.ldp_post(19, 30, 0x30)
+    b.ret()
+    b.label(name + '_stock')
+    b.b(stock_thunk)
+
+
 def code(cs):
     blk = Block(va(CODE_AT))
     # ---- gate: entry of the data-store copy routine ------------------------------------------------------
-    # live (slot 0) -> user bank (slot 1..4) is skipped, reporting success, when the switch is exactly 1.
+    # live (slot 0) -> user bank (slot 1..4) is skipped, reporting success, when bit 0 of the switch is set.
     blk.label('gate')
     blk.cbnz_w(0, 'copy_ex')                 # source is not the live slot
     blk.subs_wi(8, 1, 1)
     blk.cmp_wi(8, 3)
     blk.b_cond('hi', 'copy_ex')              # destination is not bank A..D (slot 5 keeps its stash role)
-    blk.mov_x64(8, SWITCH_RAM)
-    blk.ldrb_w(8, 8)
-    blk.cmp_wi(8, 1)
-    blk.b_cond('ne', 'copy_ex')              # anything but 1 = stock auto-store
+    _switch_byte(blk, 8)
+    blk.tbz_w(8, 0, 'copy_ex')               # bit 0 clear = stock auto-store
     blk.mov_w(0, 0)
     blk.ret()
     blk.label('native')                      # also the gate-free entry used by the save command
@@ -130,10 +222,12 @@ def code(cs):
     blk.bl('native')                          # arguments are still in w0,w1,x2,w3
     blk.cbnz_w(0, 'ex_done')                  # failure (-1) is returned as is
     blk.cbz_w(21, 'ex_done')                  # other lists: done (w0 is 0)
+    _switch_byte(blk, 8)
+    _tbnz(blk, 8, 1, 'ex_done')               # linked banks: the Custom Settings bank switch (same letter) carries them
     blk.mov_wr(0, 19)
     blk.mov_wr(1, 20)
     blk.adr(9, 'texts')
-    blk.add_xi(2, 9, 8 * len(STATE_TEXT))     # the id list sits right after the value texts
+    blk.add_xi(2, 9, TEXT_SLOT_BYTES * len(STATE_TEXT))   # the id list sits right after the value texts
     blk.mov_w(3, len(RELEASE_IDS))
     blk.bl('native')
     blk.label('ex_done')
@@ -179,15 +273,55 @@ def code(cs):
     blk.label('save_done')
     blk.ldp_post(19, 30, 0x20)
     blk.ret()
+    # ---- has_prev(id w0, transaction x1) -> w0 = 1 when an entry other than the newest already holds the id --------
+    # The dispatcher records every item (newest entry) before it runs the item's handler, so "other than the newest"
+    # means "an earlier entry of this request", which includes the entry a link wrapper added itself.
+    blk.label('has_prev')
+    blk.ldr_w(2, 1, 0)                        # entry count
+    blk.cbz_w(2, 'hp_no')
+    blk.subs_wi(2, 2, 1)
+    blk.cbz_w(2, 'hp_no')
+    blk.add_xi(1, 1, 4)                       # the id array starts at +4
+    blk.mov_w(4, 0)
+    blk.label('hp_loop')
+    blk.ldr_w_idx(3, 1, 4)
+    blk.cmp_w(3, 0)
+    blk.b_cond('eq', 'hp_yes')
+    _add_wi(blk, 4, 4, 1)
+    blk.cmp_w(4, 2)
+    blk.b_cond('lo', 'hp_loop')
+    blk.label('hp_no')
+    blk.mov_w(0, 0)
+    blk.ret()
+    blk.label('hp_yes')
+    blk.mov_w(0, 1)
+    blk.ret()
+    # ---- the two dispatcher wrappers (link banks) -----------------------------------------------------------------
+    _hook(blk, 'hook_menu', ID_BANK, ID_CUSTOM, DISPATCH_MENU_THUNK, S_CUSTOM)
+    _hook(blk, 'hook_custom', ID_CUSTOM, ID_BANK, DISPATCH_CUSTOM_THUNK, S_MENU)
+    # ---- link_sync: Custom Settings bank := shooting menu bank, through the stock set-item API --------------------
+    blk.label('link_sync')
+    blk.stp_pre(19, 30, -0x20)
+    _get(blk, ID_BANK)
+    blk.mov_wr(19, 0)
+    blk.cmp_wi(19, 3)
+    blk.b_cond('hi', 'ls_done')
+    _get(blk, ID_CUSTOM)
+    blk.cmp_w(0, 19)
+    blk.b_cond('eq', 'ls_done')
+    _load_id(blk, 0, ID_CUSTOM)
+    blk.mov_wr(1, 19)
+    blk.bl(SET_ITEM)                          # runs the stock one-item transaction -> dispatcher -> hook_custom
+    blk.label('ls_done')
+    blk.ldp_post(19, 30, 0x20)
+    blk.ret()
     # ---- entry(state): cursor and mark on the stored mode (stock 4056c8f8 with our value) ----------------------
     blk.label('entry')
     blk.stp_pre(19, 30, -0x20)
     blk.str_x(20, 31, 0x10)
     blk.mov_x(19, 0)
-    blk.mov_x64(8, SWITCH_RAM)
-    blk.ldrb_w(8, 8)
-    blk.cmp_wi(8, 1)
-    _cset_eq(blk, 8)
+    _switch_byte(blk, 8)
+    blk.and_w3(8, 8)                          # mode 0..3
     blk.mov_w(20, pm.ITEM_OPTION0)
     blk.add_w(20, 20, 8)
     blk.mov_x64(9, SCRATCH_RAM)
@@ -218,13 +352,18 @@ def code(cs):
     blk.ldr_w(8, 8, 0x18)
     blk.mov_w(9, pm.ITEM_OPTION0)
     blk.sub_w(8, 8, 9)
-    blk.and_w3(8, 8)
-    blk.cmp_wi(8, 2)
+    _and7(blk, 8, 8)
+    blk.cmp_wi(8, N_OPTIONS - 1)
     blk.b_cond('eq', 'ok_save')
-    blk.mov_x64(9, SWITCH_RAM)                # Auto-store -> 0, Keep stored -> 1
+    blk.mov_x64(9, SWITCH_RAM)                # modes 0..3: bit 0 keep stored settings, bit 1 link the banks
     blk.strb_w(8, 9)
     blk.mov_x64(9, SCRATCH_RAM)
     blk.strb_w(31, 9)
+    blk.tbz_w(8, 1, 'ok_ret')
+    blk.raw(0xF81F0FFE)                       # str x30,[sp,#-0x10]!
+    blk.bl('link_sync')                       # link just selected: bring the Custom Settings bank onto the menu bank
+    blk.raw(0xF84107FE)                       # ldr x30,[sp],#0x10
+    blk.label('ok_ret')
     blk.ret()
     blk.label('ok_save')
     blk.raw(0xF81F0FFE)                       # str x30,[sp,#-0x10]!
@@ -253,15 +392,13 @@ def code(cs):
     blk.mov_x(19, 0)
     blk.mov_x64(8, SCRATCH_RAM)
     blk.ldrb_w(10, 8)                         # last save result: 0 none, 1 saved, 2 failed
-    blk.mov_x64(8, SWITCH_RAM)
-    blk.ldrb_w(8, 8)
-    blk.cmp_wi(8, 1)
-    _cset_eq(blk, 8)                          # mode text index 0/1
+    _switch_byte(blk, 8)
+    blk.and_w3(8, 8)                          # mode text index 0..3
     blk.cbz_w(10, 'refresh_text')
-    _add_wi(blk, 8, 10, 1)                    # 1 -> SAVED (2), 2 -> FAILED (3)
+    _add_wi(blk, 8, 10, 3)                    # 1 -> SAVED (4), 2 -> FAILED (5)
     blk.label('refresh_text')
     blk.adr(9, 'texts')
-    blk.add_x(0, 9, 8, lsl=3)
+    blk.add_x(0, 9, 8, lsl=4)                 # 16-byte text slots
     blk.mov_w(1, pm.TEXT_SLOT)
     blk.mov_w(2, pm.TEXT_STYLE)
     blk.bl(pm.F_SET_TEXT)
@@ -275,7 +412,7 @@ def code(cs):
     blk.ret()
     blk.label('texts')
     listing = blk.listing(cs)
-    data = blk.bytes() + b''.join(t.ljust(8, b'\0') for t in STATE_TEXT) + \
+    data = blk.bytes() + b''.join(t.ljust(TEXT_SLOT_BYTES, b'\0') for t in STATE_TEXT) + \
         b''.join(struct.pack('<I', i) for i in RELEASE_IDS)
     return blk, data, listing
 
@@ -283,11 +420,11 @@ def code(cs):
 def strings(context):
     """English text in every language: the stock string pool has no equivalent wording."""
     ids = context.add('bank-store', [list(ENGLISH) for _ in range(36)])
-    return dict(label_id=ids[0], option_ids=ids[1:4])
+    return dict(label_id=ids[0], option_ids=ids[1:1 + N_OPTIONS])
 
 
 def menu(img, ids, blk):
-    """Sub-page, stub state and video-menu row; same plumbing as z8prores.menu.menu with three options."""
+    """Sub-page, stub state and video-menu row; same plumbing as z8prores.menu.menu with five options."""
     layout = bytearray(img.old[pm.NRAW_LAYOUT:pm.NRAW_LAYOUT + 0x110])
     if struct.unpack_from('<I', layout, 0x44)[0] != 0x8A6:
         raise ValueError('stock layout: title id not where expected')
@@ -296,7 +433,7 @@ def menu(img, ids, blk):
     if stock_row[0] != 0x35E or stock_row[6] != 0x3119:
         raise ValueError('stock N-RAW option row differs')
     rows = b''.join(struct.pack('<11I', ids['option_ids'][i], *stock_row[1:6], pm.ITEM_OPTION0 + i, *stock_row[7:])
-                    for i in range(3))
+                    for i in range(N_OPTIONS))
     ok = blk.labels['ok']
     table = pm.events(img, pm.NRAW_EVENTS, 14, lambda e, a, g, t: (e, ok if a == pm.NRAW_OK else a, g, t))
     if table.count(struct.pack('<Q', ok)) != 3:
@@ -305,20 +442,20 @@ def menu(img, ids, blk):
     layout_at = at; at += len(layout)
     rows_at = at; at += len(rows)
     at = (at + 7) & ~7
-    tables_at = at; at += 3 * len(table)
-    evptr_at = at; at += 3 * 8
+    tables_at = at; at += N_OPTIONS * len(table)
+    evptr_at = at; at += N_OPTIONS * 8
     callbacks_at = at; at += 5 * 8
     page_at = at; at += 0x50
     if at > pm.TEXT_AT:
         raise ValueError('GUI area too small')
     page = bytearray(img.old[pm.NRAW_PAGE:pm.NRAW_PAGE + 0x50])
     struct.pack_into('<3Q', page, 8, va(layout_at), va(rows_at), va(evptr_at))
-    struct.pack_into('<H', page, 0x20, 3)
+    struct.pack_into('<H', page, 0x20, N_OPTIONS)
     callbacks = struct.pack('<5Q', blk.labels['entry'], *pm.NRAW_CALLBACKS[1:])
     img.put(layout_at, layout, 'sub-page layout (stock N-RAW quality layout, new title id)', expect_zero=True)
-    img.put(rows_at, rows, 'sub-page rows: three options', expect_zero=True)
-    img.put(tables_at, table * 3, 'sub-page transition tables, one per row', expect_zero=True)
-    img.put(evptr_at, struct.pack('<3Q', *(va(tables_at + len(table) * i) for i in range(3))),
+    img.put(rows_at, rows, 'sub-page rows: five options', expect_zero=True)
+    img.put(tables_at, table * N_OPTIONS, 'sub-page transition tables, one per row', expect_zero=True)
+    img.put(evptr_at, struct.pack(f'<{N_OPTIONS}Q', *(va(tables_at + len(table) * i) for i in range(N_OPTIONS))),
             'sub-page transition table pointers', expect_zero=True)
     img.put(callbacks_at, callbacks, 'sub-page state callbacks', expect_zero=True)
     img.put(page_at, page, 'sub-page page record', expect_zero=True)
@@ -394,9 +531,22 @@ def build_main(eg, strings_context):
     delta = blk.labels['gate'] - COPY_API
     img.put(COPY_API_OFF, struct.pack('<I', 0x14000000 | ((delta // 4) & 0x3FFFFFF)),
             'data-store copy routine entry -> gate', expect=struct.pack('<I', COPY_API_STOCK))
+    # ---- link banks: the dispatcher's two handler calls -> wrappers -----------------------------------------------
+    for thunk, words in ((DISPATCH_MENU_THUNK, THUNK_MENU_WORDS), (DISPATCH_CUSTOM_THUNK, THUNK_CUSTOM_WORDS)):
+        require(struct.unpack_from('<4I', eg, thunk - BASE) == words, f'stock dispatcher thunk {thunk:#x} differs')
+    for site, stock_bl, label, what in ((DISPATCH_MENU_SITE, DISPATCH_MENU_BL, 'hook_menu', 'shooting menu bank'),
+                                        (DISPATCH_CUSTOM_SITE, DISPATCH_CUSTOM_BL, 'hook_custom', 'Custom Settings bank')):
+        require(struct.unpack_from('<I', eg, site - BASE)[0] == stock_bl, f'stock dispatcher call {site:#x} differs')
+        delta = blk.labels[label] - site
+        img.put(site - BASE, struct.pack('<I', 0x94000000 | ((delta // 4) & 0x3FFFFFF)),
+                f'dispatcher: {what} switch call -> link wrapper', expect=struct.pack('<I', stock_bl))
     return img, dict(strings=ids, menu=where,
                      hook=dict(site=hex(COPY_API), gate=hex(blk.labels['gate']), native=hex(blk.labels['native']),
                                save=hex(blk.labels['save'])),
-                     switch=dict(ram=hex(SWITCH_RAM), carrier_item='0x1238', default=0, scratch=hex(SCRATCH_RAM)),
+                     link=dict(menu_site=hex(DISPATCH_MENU_SITE), custom_site=hex(DISPATCH_CUSTOM_SITE),
+                               hook_menu=hex(blk.labels['hook_menu']), hook_custom=hex(blk.labels['hook_custom']),
+                               has_prev=hex(blk.labels['has_prev']), sync=hex(blk.labels['link_sync'])),
+                     switch=dict(ram=hex(SWITCH_RAM), carrier_item='0x1238', default=0, scratch=hex(SCRATCH_RAM),
+                                 bits='bit0 keep stored settings, bit1 link banks'),
                      code=[dict(va=hex(x), word=w, text=t) for x, w, t in listing],
                      release_ids=[hex(i) for i in RELEASE_IDS], copy_ex=hex(blk.labels['copy_ex']))

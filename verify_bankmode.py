@@ -6,7 +6,9 @@ Reads both packages with the toolkit's reader only (not the builder), then verif
   * every byte that differs from stock lies inside a window this patch is allowed to touch;
   * the data-store copy routine's first word is now one branch into the new code, and that code
     (re)executes the displaced instruction;
-  * every branch in the new code lands inside the new code or on a known stock address.
+  * every branch in the new code lands inside the new code or on a known stock address;
+  * the two dispatcher call sites (link banks) are now `bl`s into wrappers that call exactly the stock thunk, the
+    transaction append and the other bank switch, and fall back to a tail call of the stock thunk.
 """
 import argparse
 import binascii
@@ -25,6 +27,10 @@ from z8prores import menu as pm
 BASE = pm.BASE
 CODE_REGION_END = 0x14E4000
 COPY_API_OFF = 0x41013A14 - BASE
+MENU_SITE, CUSTOM_SITE = 0x410EA9CC, 0x410EAE38
+MENU_THUNK, CUSTOM_THUNK = 0x410E958C, 0x410E9934
+S_MENU, S_CUSTOM, TXN_SET, SET_ITEM = 0x410DD1EC, 0x410DE050, 0x410E9318, 0x410D61D0
+N_TEXTS, TEXT_SLOT = 6, 16
 
 
 def windows(version, tag, n, stock):
@@ -35,6 +41,8 @@ def windows(version, tag, n, stock):
         'trailer identity': (n - 11, 8),
         'EG CRC16': (n - 2, 2),
         'copy routine entry (gate hook)': (COPY_API_OFF, 4),
+        'dispatcher menu-bank call (link hook)': (MENU_SITE - BASE, 4),
+        'dispatcher custom-bank call (link hook)': (CUSTOM_SITE - BASE, 4),
         'text loader boundary': (0x1024D8C, 8),
         'shared language directory': (0x311C5A0, 36 * 8),
         'shared strings text': (0x770000, 0x10000),
@@ -115,6 +123,7 @@ def verify(stock_raw, out_raw, version, tag):
         report.append(dict(start=a, end=b, window=owners[0], windows=owners))
     # code region: only these windows may differ
     code_ok = {'public version', 'runtime identity', 'copy routine entry (gate hook)', 'text loader boundary',
+               'dispatcher menu-bank call (link hook)', 'dispatcher custom-bank call (link hook)',
                'video menu hide site', 'new code, sub-page, state material', 'shared strings text',
                'shared string tables'}
     for r in report:
@@ -135,12 +144,13 @@ def verify(stock_raw, out_raw, version, tag):
     require(len(native) == 1, 'expected exactly one displaced-instruction copy')
     nb = by_addr[native[0] + 4]
     require(nb[0] == 'b' and int(nb[1], 16) == 0x41013A18, 'native entry must continue at the copy routine body')
-    # code extent: everything before the value texts (AUTO, KEEP, SAVED, FAILED), which are followed by the id list
-    texts = code_all.find(b'AUTO\0\0\0\0')
+    # code extent: everything before the value texts (AUTO, KEEP, A+LINK, K+LINK, SAVED, FAILED in 16-byte
+    # slots), which are followed by the id list
+    texts = code_all.find(b'AUTO' + b'\0' * 12 + b'KEEP' + b'\0' * 12)
     require(texts > 0 and texts % 4 == 0, 'value texts not found in the new code page')
     limit = BASE + 0x8A0000 + texts
     allowed_stock = {0x41012C84, 0x403AE0F8, 0x403B0048, 0x403B00B8, 0x40572B2C, 0x4050A6F0, 0x403F2920,
-                     0x403F645C, 0x41013A18}
+                     0x403F645C, 0x41013A18, MENU_THUNK, CUSTOM_THUNK, TXN_SET, S_MENU, S_CUSTOM, SET_ITEM}
     for a, m, o in rows_all:
         if a >= limit:
             break
@@ -149,18 +159,48 @@ def verify(stock_raw, out_raw, version, tag):
             inside = BASE + 0x8A0000 <= tgt < limit
             require(inside or tgt in allowed_stock, f'branch at {a:#x} to unexpected {tgt:#x}')
     # release-mode ride-along list: exactly these three ids, each present in the stock Custom Settings list
-    ids = struct.unpack_from('<3I', eg1, 0x8A0000 + texts + 32)
+    ids_at = texts + N_TEXTS * TEXT_SLOT
+    require(code_all[texts:ids_at] == b''.join(t.ljust(TEXT_SLOT, b'\0') for t in
+                                              (b'AUTO', b'KEEP', b'A+LINK', b'K+LINK', b'SAVED', b'FAILED')),
+            'value texts differ')
+    ids = struct.unpack_from('<3I', eg1, 0x8A0000 + ids_at)
     require(ids == (0x6001A92, 0x6001A29, 0x6001A2A), f'release id list differs: {[hex(i) for i in ids]}')
     custom = struct.unpack_from('<609I', eg0, 0xA0299EFF8 - 0xA02808000 + 0x4B13000)
     main = struct.unpack_from('<465I', eg0, 0xA0299E888 - 0xA02808000 + 0x4B13000)
     for i in ids:
         require(i in custom and i not in main, f'id {i:#x}: expected in the stock custom list only')
-    require(eg1[0x8A0000 + texts + 44:0x8A0000 + texts + 48] == b'\0\0\0\0', 'unexpected data after the id list')
+    require(eg1[0x8A0000 + ids_at + 12:0x8A0000 + ids_at + 16] == b'\0\0\0\0', 'unexpected data after the id list')
     # copy_ex: calls the stock copy twice (main list, then the id list) and nothing else in the data store
     calls = [(a, o) for a, m, o in rows_all if a < limit and m == 'bl' and int(o.split()[-1], 16) == native[0]]
     require(len(calls) >= 4, 'copy_ex / save do not call the copy routine as expected')
+    # link banks: the two dispatcher calls
+    def bl_target(site):
+        w = struct.unpack_from('<I', eg1, site - BASE)[0]
+        require(w >> 26 == 0b100101, f'dispatcher call {site:#x} is not a bl')
+        d = w & 0x3FFFFFF
+        d = d - (1 << 26) if d & (1 << 25) else d
+        return site + (d << 2)
+    wrappers = {}
+    for site, thunk, other, name in ((MENU_SITE, MENU_THUNK, S_CUSTOM, 'menu'), (CUSTOM_SITE, CUSTOM_THUNK, S_MENU, 'custom')):
+        hook = bl_target(site)
+        require(BASE + 0x8A0000 <= hook < limit, f'{name} link wrapper outside the new code')
+        i = [a for a, _, _ in rows_all].index(hook)
+        body = rows_all[i:]
+        # the wrapper = everything up to and including its closing tail call `b <stock thunk>`
+        end = next(k for k, (a, m, o) in enumerate(body) if m == 'b' and int(o.split()[-1], 16) == thunk)
+        body = body[:end + 1]
+        first = [m for _, m, _ in body[:6]]
+        require(first[:4] == ['mov', 'movk', 'movk', 'movk'] and first[4] == 'ldrb' and first[5] == 'tbz',
+                f'{name} wrapper does not start with the switch-bit test')
+        tgt = {int(o.split()[-1], 16) for a, m, o in body if m == 'bl'}
+        inside = {t for t in tgt if BASE + 0x8A0000 <= t < limit}
+        outside = tgt - inside
+        require(outside == {thunk, TXN_SET, other, 0x41012C84}, f'{name} wrapper calls {[hex(t) for t in sorted(outside)]}')
+        require(len(inside) == 1 and all(by_addr[t][0] == 'ldr' for t in inside), f'{name} wrapper: unexpected inner call')
+        require(sum(1 for a, m, o in body if m == 'ret') == 1, f'{name} wrapper: expected one ret')
+        wrappers[name] = hex(hook)
     return dict(status='VERIFIED', changed_ranges=len(report), windows=sorted({w for r in report for w in r['windows']}),
-                gate=hex(gate), native=hex(native[0]), output_sha256=sha(out_raw))
+                gate=hex(gate), native=hex(native[0]), link_wrappers=wrappers, output_sha256=sha(out_raw))
 
 
 def main():
