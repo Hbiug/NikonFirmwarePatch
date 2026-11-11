@@ -15,5 +15,6 @@ SECTIONS {
   .s_txnset      0x410E9318 : { *(.s_txnset) }
   .s_thunk_menu  0x410E958C : { *(.s_thunk_menu) }
   .s_thunk_custom 0x410E9934 : { *(.s_thunk_custom) }
+  .s_disp        0x410EA70C : { *(.s_disp) }
   /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }

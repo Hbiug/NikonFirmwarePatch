@@ -18,10 +18,9 @@ always holds the last settings used in it.  This patch adds a Z7-style alternati
     0x2001613 (Custom Settings bank) are redirected to wrappers that run the stock switch and then the same switch
     on the other bank type, adding the other item to the same transaction so both ids commit together.  Turning the
     link on syncs at once (Custom Settings bank := shooting menu bank) through the stock set-item API.
-  * Release mode (single / continuous L / continuous H and the L and H speeds) follows the photo/video menu bank:
-    stock keeps those three items only in the Custom Settings list.  Every copy of the whole main list (live ->
-    bank, bank -> live, bank -> bank, and the explicit save) now copies the three items too, with the same slots;
-    the gate skips them together with the main list, so Keep stored settings covers them as well.
+  * Release mode (single / continuous and its sub-type / self-timer) follows the photo/video menu bank: the bank being
+    left remembers it (auto-store, or the explicit save command), the bank being entered sets it again through the
+    stock dispatcher.  It is kept outside the stock bank lists (see ID_REL_MODE below).
 
 The switch lives in the padding byte after the one-byte item 0x12:0x38 of the live movie block, which
 the data store persists with the block and which the bank copy never touches (so it is global, not
@@ -47,10 +46,20 @@ ID_BANK, ID_EXT, ID_CUSTOM = 0x2000546, 0x200054B, 0x2001613   # current menu ba
 LIST_MAIN, N_MAIN = 0xA0299E888, 465
 LIST_EXT, N_EXT = 0xA0299EFCC, 11
 LIST_CUSTOM, N_CUSTOM, CHUNK = 0xA0299EFF8, 609, 0x1FF
-# Release mode (single / continuous L / continuous H, with the L and H speed): stock keeps these three items in the
-# Custom Settings list only, so a menu-bank switch never touches them.  They ride along with every copy of the
-# main list (live<->bank and bank<->bank), which is exactly when the menu bank is stored or loaded.
-RELEASE_IDS = (0x6001A92, 0x6001A29, 0x6001A2A)      # mode 0/1/2 (S/CL/CH), CH speed, CL speed
+# b2/b3 copied 0x6001A92 / 0x6001A29 / 0x6001A2A with the main list; a camera test showed they are not the active
+# release mode, so that ride-along is gone.  The active release mode is two items of group 0x01, which has no bank
+# slots (the group descriptor has no slot table), so no stock bank can carry them:
+#   0x6000108  release mode: 0 single frame, 1 continuous, 4 self-timer
+#   0x600010A  continuous sub-type (CL, CH, high-speed frame capture variants), meaningful when the mode is 1
+# The shooting-display state builder 0x404249A0 takes them from the 439-item settings mirror (id list 0xA0283A9C4,
+# offsets 0x4E4 and 0x4FC) and hard-codes the Z9's release dial position to "quick selection" (7).
+# Each menu bank gets its own copy in two padding bytes of the bank's slot of the one-byte item 0x12:0x38
+# (data byte, then its complement as a validity check); restoring goes through the stock dispatcher, i.e. exactly
+# what a normal change of the two items does.
+ID_REL_MODE, ID_REL_SUB = 0x6000108, 0x600010A
+DISPATCHER = 0x410EA70C                              # dispatcher(item id, value, txn): record the item, run its handler
+REL_SLOT_STEP = 0x2D0                                # distance between the slots of item 0x12:0x38 (live, A, B, C, D)
+SLOT_TABLE_OFF = 0x4C59188                           # stock table of the five slot addresses of item 0x12:0x38
 
 # ---- link banks: the dispatcher (0x410EA70C) is called once per item of a data-store transaction; it first records the
 # item in the transaction (txn.Set), then runs the item's handler.  Its handler call for item 0x2000546 is
@@ -193,46 +202,110 @@ def code(cs):
     # ---- gate: entry of the data-store copy routine ------------------------------------------------------
     # live (slot 0) -> user bank (slot 1..4) is skipped, reporting success, when bit 0 of the switch is set.
     blk.label('gate')
-    blk.cbnz_w(0, 'copy_ex')                 # source is not the live slot
+    blk.cbnz_w(0, 'native')                  # source is not the live slot
     blk.subs_wi(8, 1, 1)
     blk.cmp_wi(8, 3)
-    blk.b_cond('hi', 'copy_ex')              # destination is not bank A..D (slot 5 keeps its stash role)
+    blk.b_cond('hi', 'native')               # destination is not bank A..D (slot 5 keeps its stash role)
     _switch_byte(blk, 8)
-    blk.tbz_w(8, 0, 'copy_ex')               # bit 0 clear = stock auto-store
+    blk.tbz_w(8, 0, 'native')                # bit 0 clear = stock auto-store
     blk.mov_w(0, 0)
     blk.ret()
     blk.label('native')                      # also the gate-free entry used by the save command
     blk.raw(COPY_API_STOCK)
     blk.b(COPY_API_BODY)
-    # ---- copy_ex: the stock copy, plus the release-mode items whenever the whole main list is copied -----------
-    blk.label('copy_ex')
+    # ---- per-bank release mode ----------------------------------------------------------------------------------
+    # rel_addr(bank w0 = 0..3) -> x9 = address of the bank's data byte (the check byte follows); uses x10, x11
+    blk.label('rel_addr')
+    _add_wi(blk, 11, 0, 1)
+    blk.mov_w(10, REL_SLOT_STEP)
+    blk.mov_x64(9, SWITCH_RAM)
+    blk.madd_x(9, 11, 10, 9)
+    blk.ret()
+    # rel_store(bank w0): remember the current release mode for that bank
+    blk.label('rel_store')
     blk.stp_pre(19, 30, -0x20)
     blk.str_x(20, 31, 0x10)
-    blk.str_x(21, 31, 0x18)
-    blk.mov_wr(19, 0)                         # source slot
-    blk.mov_wr(20, 1)                         # destination slot
-    blk.mov_w(21, 0)                          # 1 when this call copies the main list in full
-    blk.mov_x64(8, LIST_MAIN)
-    blk.raw(0xEB08005F)                       # cmp x2,x8
-    blk.b_cond('ne', 'ex_copy')
-    blk.cmp_wi(3, N_MAIN)
-    blk.b_cond('ne', 'ex_copy')
-    blk.mov_w(21, 1)
-    blk.label('ex_copy')
-    blk.bl('native')                          # arguments are still in w0,w1,x2,w3
-    blk.cbnz_w(0, 'ex_done')                  # failure (-1) is returned as is
-    blk.cbz_w(21, 'ex_done')                  # other lists: done (w0 is 0)
-    _switch_byte(blk, 8)
-    _tbnz(blk, 8, 1, 'ex_done')               # linked banks: the Custom Settings bank switch (same letter) carries them
+    blk.mov_wr(19, 0)
+    _get(blk, ID_REL_MODE)
+    _and7(blk, 20, 0)
+    _get(blk, ID_REL_SUB)
+    _and7(blk, 0, 0)
+    blk.raw(0x2A000E94)                       # orr w20,w20,w0,lsl #3
+    blk.raw(0x32190294)                       # orr w20,w20,#0x80   (bit 7: a value has been stored)
     blk.mov_wr(0, 19)
-    blk.mov_wr(1, 20)
-    blk.adr(9, 'texts')
-    blk.add_xi(2, 9, TEXT_SLOT_BYTES * len(STATE_TEXT))   # the id list sits right after the value texts
-    blk.mov_w(3, len(RELEASE_IDS))
-    blk.bl('native')
-    blk.label('ex_done')
+    blk.bl('rel_addr')
+    blk.strb_w(20, 9)
+    blk.raw(0x2A3403EA)                       # mvn w10,w20
+    blk.strb_w(10, 9, 1)
     blk.ldr_x(20, 31, 0x10)
-    blk.ldr_x(21, 31, 0x18)
+    blk.ldp_post(19, 30, 0x20)
+    blk.ret()
+    # rel_load(bank w0, transaction x1): set the two items to the bank's remembered values, through the dispatcher
+    blk.label('rel_load')
+    blk.stp_pre(19, 30, -0x20)
+    blk.stp(20, 21, 0x10)
+    blk.mov_x(20, 1)
+    blk.bl('rel_addr')
+    blk.ldrb_w(19, 9)
+    blk.ldrb_w(10, 9, 1)
+    blk.raw(0x2A2A03EA)                       # mvn w10,w10
+    blk.raw(0x53001D4A)                       # uxtb w10,w10
+    blk.cmp_w(10, 19)
+    blk.b_cond('ne', 'rl_done')               # never stored (or not ours): leave the release mode alone
+    blk.tbz_w(19, 7, 'rl_done')
+    _get(blk, ID_REL_MODE)
+    _and7(blk, 21, 19)
+    blk.cmp_w(0, 21)
+    blk.b_cond('eq', 'rl_sub')
+    _load_id(blk, 0, ID_REL_MODE)
+    blk.mov_wr(1, 21)
+    blk.mov_x(2, 20)
+    blk.bl(DISPATCHER)
+    blk.label('rl_sub')
+    _get(blk, ID_REL_SUB)
+    blk.raw(0x53031675)                       # ubfx w21,w19,#3,#3
+    blk.cmp_w(0, 21)
+    blk.b_cond('eq', 'rl_done')
+    _load_id(blk, 0, ID_REL_SUB)
+    blk.mov_wr(1, 21)
+    blk.mov_x(2, 20)
+    blk.bl(DISPATCHER)
+    blk.label('rl_done')
+    blk.ldp(20, 21, 0x10)
+    blk.ldp_post(19, 30, 0x20)
+    blk.ret()
+    # menu_switch(new bank w0, flags w1, transaction x2): the stock menu-bank switch with the release mode around it
+    blk.label('menu_thunk')                   # same shape as the stock dispatcher thunk: (id, new bank, txn)
+    blk.raw(0x2A0103E8)                       # mov w8,w1
+    blk.raw(0x320003E1)                       # orr w1,wzr,#1
+    blk.raw(0x2A0803E0)                       # mov w0,w8
+    blk.label('menu_switch')
+    blk.stp_pre(19, 30, -0x20)
+    blk.stp(20, 21, 0x10)
+    blk.mov_wr(19, 0)
+    blk.mov_wr(21, 1)
+    blk.mov_x(20, 2)
+    _switch_byte(blk, 8)
+    _tbnz(blk, 8, 0, 'ms_switch')             # keep stored settings: leaving a bank stores nothing
+    _get(blk, ID_BANK)
+    blk.cmp_wi(0, 3)
+    blk.b_cond('hi', 'ms_switch')
+    blk.bl('rel_store')                       # auto-store: the bank being left remembers the release mode
+    blk.label('ms_switch')
+    blk.mov_wr(0, 19)
+    blk.mov_wr(1, 21)
+    blk.mov_x(2, 20)
+    blk.bl(S_MENU)
+    blk.mov_wr(21, 0)
+    blk.tbz_w(21, 0, 'ms_done')               # the stock switch failed
+    blk.cmp_wi(19, 3)
+    blk.b_cond('hi', 'ms_done')
+    blk.mov_wr(0, 19)
+    blk.mov_x(1, 20)
+    blk.bl('rel_load')
+    blk.label('ms_done')
+    blk.mov_wr(0, 21)
+    blk.ldp(20, 21, 0x10)
     blk.ldp_post(19, 30, 0x20)
     blk.ret()
     # ---- save: explicit live -> bank stores, exactly the store half of the two stock bank switches -----------
@@ -242,7 +315,8 @@ def code(cs):
     blk.cmp_wi(0, 3)
     blk.b_cond('hi', 'save_fail')
     _add_wi(blk, 19, 0, 1)
-    _copy_call(blk, 19, LIST_MAIN, N_MAIN, 'copy_ex')
+    blk.bl('rel_store')                       # w0 is still the menu bank
+    _copy_call(blk, 19, LIST_MAIN, N_MAIN)
     _cmn_wi(blk, 0, 1)
     blk.b_cond('eq', 'save_fail')
     _get(blk, ID_EXT)
@@ -297,8 +371,8 @@ def code(cs):
     blk.mov_w(0, 1)
     blk.ret()
     # ---- the two dispatcher wrappers (link banks) -----------------------------------------------------------------
-    _hook(blk, 'hook_menu', ID_BANK, ID_CUSTOM, DISPATCH_MENU_THUNK, S_CUSTOM)
-    _hook(blk, 'hook_custom', ID_CUSTOM, ID_BANK, DISPATCH_CUSTOM_THUNK, S_MENU)
+    _hook(blk, 'hook_menu', ID_BANK, ID_CUSTOM, 'menu_thunk', S_CUSTOM)
+    _hook(blk, 'hook_custom', ID_CUSTOM, ID_BANK, DISPATCH_CUSTOM_THUNK, 'menu_switch')
     # ---- link_sync: Custom Settings bank := shooting menu bank, through the stock set-item API --------------------
     blk.label('link_sync')
     blk.stp_pre(19, 30, -0x20)
@@ -412,8 +486,7 @@ def code(cs):
     blk.ret()
     blk.label('texts')
     listing = blk.listing(cs)
-    data = blk.bytes() + b''.join(t.ljust(TEXT_SLOT_BYTES, b'\0') for t in STATE_TEXT) + \
-        b''.join(struct.pack('<I', i) for i in RELEASE_IDS)
+    data = blk.bytes() + b''.join(t.ljust(TEXT_SLOT_BYTES, b'\0') for t in STATE_TEXT)
     return blk, data, listing
 
 
@@ -521,6 +594,10 @@ def build_main(eg, strings_context):
     # the carrier item must be a one-byte item with value 1 and zero padding in the factory defaults
     require(eg[SWITCH_ITEM_DEFAULT_OFF:SWITCH_ITEM_DEFAULT_OFF + 4] == b'\x01\0\0\0',
             'stock defaults: carrier item padding is not zero')
+    require(struct.unpack_from('<5Q', eg, SLOT_TABLE_OFF) ==
+            tuple(ITEM_BLOCK_LIVE + REL_SLOT_STEP * k for k in range(5)), 'stock slot addresses of the carrier item differ')
+    require(struct.unpack_from('<I', eg, 0x410EB6F0 - BASE)[0] == 0x97FFFACD and
+            struct.unpack_from('<I', eg, 0x410EB70C - BASE)[0] == 0x97FFFAC9, 'stock release-mode handler calls differ')
     ids = strings(strings_context)
     blk, code_bytes, listing = code(cs)
     require(CODE_AT + len(code_bytes) <= CODE_LIMIT, 'Code overruns its page')
@@ -549,4 +626,7 @@ def build_main(eg, strings_context):
                      switch=dict(ram=hex(SWITCH_RAM), carrier_item='0x1238', default=0, scratch=hex(SCRATCH_RAM),
                                  bits='bit0 keep stored settings, bit1 link banks'),
                      code=[dict(va=hex(x), word=w, text=t) for x, w, t in listing],
-                     release_ids=[hex(i) for i in RELEASE_IDS], copy_ex=hex(blk.labels['copy_ex']))
+                     release=dict(mode_item=hex(ID_REL_MODE), sub_item=hex(ID_REL_SUB), dispatcher=hex(DISPATCHER),
+                                  menu_switch=hex(blk.labels['menu_switch']), store=hex(blk.labels['rel_store']),
+                                  load=hex(blk.labels['rel_load']),
+                                  slots=[hex(SWITCH_RAM + REL_SLOT_STEP * k) for k in (1, 2, 3, 4)]))

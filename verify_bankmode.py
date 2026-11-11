@@ -30,6 +30,7 @@ COPY_API_OFF = 0x41013A14 - BASE
 MENU_SITE, CUSTOM_SITE = 0x410EA9CC, 0x410EAE38
 MENU_THUNK, CUSTOM_THUNK = 0x410E958C, 0x410E9934
 S_MENU, S_CUSTOM, TXN_SET, SET_ITEM = 0x410DD1EC, 0x410DE050, 0x410E9318, 0x410D61D0
+DISPATCHER, REL_MODE, REL_SUB = 0x410EA70C, 0x6000108, 0x600010A
 N_TEXTS, TEXT_SLOT = 6, 16
 
 
@@ -144,13 +145,12 @@ def verify(stock_raw, out_raw, version, tag):
     require(len(native) == 1, 'expected exactly one displaced-instruction copy')
     nb = by_addr[native[0] + 4]
     require(nb[0] == 'b' and int(nb[1], 16) == 0x41013A18, 'native entry must continue at the copy routine body')
-    # code extent: everything before the value texts (AUTO, KEEP, A+LINK, K+LINK, SAVED, FAILED in 16-byte
-    # slots), which are followed by the id list
+    # code extent: everything before the value texts (AUTO, KEEP, A+LINK, K+LINK, SAVED, FAILED in 16-byte slots)
     texts = code_all.find(b'AUTO' + b'\0' * 12 + b'KEEP' + b'\0' * 12)
     require(texts > 0 and texts % 4 == 0, 'value texts not found in the new code page')
     limit = BASE + 0x8A0000 + texts
     allowed_stock = {0x41012C84, 0x403AE0F8, 0x403B0048, 0x403B00B8, 0x40572B2C, 0x4050A6F0, 0x403F2920,
-                     0x403F645C, 0x41013A18, MENU_THUNK, CUSTOM_THUNK, TXN_SET, S_MENU, S_CUSTOM, SET_ITEM}
+                     0x403F645C, 0x41013A18, CUSTOM_THUNK, TXN_SET, S_MENU, S_CUSTOM, SET_ITEM, DISPATCHER}
     for a, m, o in rows_all:
         if a >= limit:
             break
@@ -158,22 +158,48 @@ def verify(stock_raw, out_raw, version, tag):
             tgt = int(o.split()[-1], 16)
             inside = BASE + 0x8A0000 <= tgt < limit
             require(inside or tgt in allowed_stock, f'branch at {a:#x} to unexpected {tgt:#x}')
-    # release-mode ride-along list: exactly these three ids, each present in the stock Custom Settings list
-    ids_at = texts + N_TEXTS * TEXT_SLOT
-    require(code_all[texts:ids_at] == b''.join(t.ljust(TEXT_SLOT, b'\0') for t in
-                                              (b'AUTO', b'KEEP', b'A+LINK', b'K+LINK', b'SAVED', b'FAILED')),
+    texts_end = texts + N_TEXTS * TEXT_SLOT
+    require(code_all[texts:texts_end] == b''.join(t.ljust(TEXT_SLOT, b'\0') for t in
+                                                (b'AUTO', b'KEEP', b'A+LINK', b'K+LINK', b'SAVED', b'FAILED')),
             'value texts differ')
-    ids = struct.unpack_from('<3I', eg1, 0x8A0000 + ids_at)
-    require(ids == (0x6001A92, 0x6001A29, 0x6001A2A), f'release id list differs: {[hex(i) for i in ids]}')
-    custom = struct.unpack_from('<609I', eg0, 0xA0299EFF8 - 0xA02808000 + 0x4B13000)
-    main = struct.unpack_from('<465I', eg0, 0xA0299E888 - 0xA02808000 + 0x4B13000)
-    for i in ids:
-        require(i in custom and i not in main, f'id {i:#x}: expected in the stock custom list only')
-    require(eg1[0x8A0000 + ids_at + 12:0x8A0000 + ids_at + 16] == b'\0\0\0\0', 'unexpected data after the id list')
-    # copy_ex: calls the stock copy twice (main list, then the id list) and nothing else in the data store
+    require(not any(code_all[texts_end:]), 'unexpected data after the value texts')
     calls = [(a, o) for a, m, o in rows_all if a < limit and m == 'bl' and int(o.split()[-1], 16) == native[0]]
-    require(len(calls) >= 4, 'copy_ex / save do not call the copy routine as expected')
+    require(len(calls) == 4, 'the save command does not call the copy routine as expected')
+    code_rows = [r for r in rows_all if r[0] < limit]
+    addrs = [a for a, _, _ in code_rows]
+
+    def const_before(k):
+        """The 32-bit constant built in w0 by the mov/movk pair that precedes row k (searching back a few rows)."""
+        for j in range(k - 1, max(k - 6, 0), -1):
+            a, m, o = code_rows[j]
+            if m == 'movk' and o.startswith('w0,'):
+                hi = int(o.split('#')[1].split(',')[0], 16)
+                lo = int(code_rows[j - 1][2].split('#')[1], 16)
+                require(code_rows[j - 1][1] == 'mov' and code_rows[j - 1][2].startswith('w0,'), 'constant load shape')
+                return hi << 16 | lo
+        raise ValueError('no constant before the call')
+    # per-bank release mode: the stock dispatcher is called exactly twice, for the two release-mode items, and the two
+    # stock handler calls for those items are where the notes say they are
+    disp = [k for k, (a, m, o) in enumerate(code_rows) if m == 'bl' and int(o.split()[-1], 16) == DISPATCHER]
+    require(len(disp) == 2 and [const_before(k) for k in disp] == [REL_MODE, REL_SUB],
+            'release mode: dispatcher calls differ')
+    require(struct.unpack_from('<I', eg0, 0x410EB6F0 - BASE)[0] == 0x97FFFACD and
+            struct.unpack_from('<I', eg0, 0x410EB70C - BASE)[0] == 0x97FFFAC9, 'stock release-mode handler calls differ')
+    require(struct.unpack_from('<5Q', eg0, 0x4C59188) == tuple(0xA03D5C0DC + 0x2D0 * k for k in range(5)),
+            'stock slot addresses of the carrier item differ')
+    for i in (REL_MODE, REL_SUB):                      # stock bank lists never carry them
+        for lst, n in ((0xA0299E888, 465), (0xA0299EFCC, 11), (0xA0299EFF8, 609)):
+            ids = struct.unpack_from(f'<{n}I', eg0, lst - 0xA02808000 + 0x4B13000)
+            require(all((x & 0xFFFFFF) != (i & 0xFFFFFF) for x in ids), f'{i:#x} is in a stock bank list')
+    # menu_switch: the only call of the stock menu-bank switch from the new code; its thunk has the stock shape
+    smenu = [a for a, m, o in code_rows if m == 'bl' and int(o.split()[-1], 16) == S_MENU]
+    require(len(smenu) == 1, 'expected exactly one call of the stock menu-bank switch')
+    thunk_at = [a for a in addrs if struct.unpack_from('<3I', eg1, a - BASE) == (0x2A0103E8, 0x320003E1, 0x2A0803E0)]
+    require(len(thunk_at) == 1, 'menu thunk not found')
+    menu_thunk, menu_switch = thunk_at[0], thunk_at[0] + 12
+    require(by_addr[menu_switch][0] == 'stp' and menu_switch < smenu[0] < menu_switch + 0x80, 'menu_switch shape')
     # link banks: the two dispatcher calls
+
     def bl_target(site):
         w = struct.unpack_from('<I', eg1, site - BASE)[0]
         require(w >> 26 == 0b100101, f'dispatcher call {site:#x} is not a bl')
@@ -181,12 +207,14 @@ def verify(stock_raw, out_raw, version, tag):
         d = d - (1 << 26) if d & (1 << 25) else d
         return site + (d << 2)
     wrappers = {}
-    for site, thunk, other, name in ((MENU_SITE, MENU_THUNK, S_CUSTOM, 'menu'), (CUSTOM_SITE, CUSTOM_THUNK, S_MENU, 'custom')):
+    for site, thunk, out_expected, in_expected, name in (
+            (MENU_SITE, menu_thunk, {TXN_SET, S_CUSTOM, 0x41012C84}, {menu_thunk}, 'menu'),
+            (CUSTOM_SITE, CUSTOM_THUNK, {CUSTOM_THUNK, TXN_SET, 0x41012C84}, {menu_switch}, 'custom')):
         hook = bl_target(site)
         require(BASE + 0x8A0000 <= hook < limit, f'{name} link wrapper outside the new code')
-        i = [a for a, _, _ in rows_all].index(hook)
-        body = rows_all[i:]
-        # the wrapper = everything up to and including its closing tail call `b <stock thunk>`
+        i = addrs.index(hook)
+        body = code_rows[i:]
+        # the wrapper = everything up to and including its closing tail call `b <thunk>`
         end = next(k for k, (a, m, o) in enumerate(body) if m == 'b' and int(o.split()[-1], 16) == thunk)
         body = body[:end + 1]
         first = [m for _, m, _ in body[:6]]
@@ -195,12 +223,14 @@ def verify(stock_raw, out_raw, version, tag):
         tgt = {int(o.split()[-1], 16) for a, m, o in body if m == 'bl'}
         inside = {t for t in tgt if BASE + 0x8A0000 <= t < limit}
         outside = tgt - inside
-        require(outside == {thunk, TXN_SET, other, 0x41012C84}, f'{name} wrapper calls {[hex(t) for t in sorted(outside)]}')
-        require(len(inside) == 1 and all(by_addr[t][0] == 'ldr' for t in inside), f'{name} wrapper: unexpected inner call')
+        require(outside == out_expected, f'{name} wrapper calls {[hex(t) for t in sorted(outside)]}')
+        helper = inside - in_expected
+        require(inside >= in_expected and len(helper) == 1 and by_addr[next(iter(helper))][0] == 'ldr',
+                f'{name} wrapper: unexpected inner call')
         require(sum(1 for a, m, o in body if m == 'ret') == 1, f'{name} wrapper: expected one ret')
         wrappers[name] = hex(hook)
     return dict(status='VERIFIED', changed_ranges=len(report), windows=sorted({w for r in report for w in r['windows']}),
-                gate=hex(gate), native=hex(native[0]), link_wrappers=wrappers, output_sha256=sha(out_raw))
+                gate=hex(gate), native=hex(native[0]), link_wrappers=wrappers, menu_switch=hex(menu_switch), output_sha256=sha(out_raw))
 
 
 def main():

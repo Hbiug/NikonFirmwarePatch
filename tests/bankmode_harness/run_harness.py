@@ -37,7 +37,10 @@ MUTATIONS = {
     # the "already moved by an earlier entry" test is gone: a request carrying both ids switches twice
     'no-has-prev': lambda d, L, b: _nop_first(d, L['hook_menu'], L['hook_custom'], b, 0xFF000000, 0x35000000),
     # copy_ex rides the release ids along even when the link is on
-    'ride-along-with-link': lambda d, L, b: _nop_first(d, L['copy_ex'], L['save'], b, 0xFF000000, 0x37000000),
+    # the release mode is restored even when the slot's check byte does not match
+    'release-no-check': lambda d, L, b: _nop_first(d, L['rel_load'], L['rl_sub'], b, 0xFF00001F, 0x54000001),
+    # leaving a bank stores the release mode even with keep stored settings
+    'release-store-with-keep': lambda d, L, b: _nop_first(d, L['menu_switch'], L['ms_switch'], b, 0xFF000000, 0x37000000),
     # the gate no longer looks at the keep bit: live->bank stores are always skipped
     'gate-always-skips': lambda d, L, b: _nop_first(d, L['gate'], L['native'], b, 0xFF000000, 0x36000000),
 }
@@ -62,6 +65,7 @@ def main():
     th = lambda w: '"' + ','.join('0x%08X' % x for x in w) + '"'
     (a.out / 'gen.h').write_text('\n'.join([
         f'#define ID_BANK {P.ID_BANK:#x}u', f'#define ID_EXT {P.ID_EXT:#x}u', f'#define ID_CUSTOM {P.ID_CUSTOM:#x}u',
+        f'#define ID_REL_MODE {P.ID_REL_MODE:#x}u', f'#define ID_REL_SUB {P.ID_REL_SUB:#x}u',
         f'#define LIST_MAIN {P.LIST_MAIN:#x}UL', f'#define N_MAIN {P.N_MAIN}',
         f'#define LIST_EXT {P.LIST_EXT:#x}UL', f'#define N_EXT {P.N_EXT}',
         f'#define LIST_CUSTOM {P.LIST_CUSTOM:#x}UL', f'#define N_CUSTOM {P.N_CUSTOM}',

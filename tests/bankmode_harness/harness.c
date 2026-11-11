@@ -40,11 +40,12 @@ static void halt(int code) {
 struct txn { u32 count; u32 ids[0x28F]; u32 pad; u32 values[0x28F]; };
 _Static_assert(__builtin_offsetof(struct txn, values) == 0xA44, "transaction layout");
 
-enum { K_SMENU = 1, K_SCUSTOM, K_COPY, K_SETITEM };
+enum { K_SMENU = 1, K_SCUSTOM, K_COPY, K_SETITEM, K_DISP };
 struct rec { u32 kind; u64 a, b, c, d; };
 static struct rec L[64];
 static int nlog;
-static u32 ds_menu, ds_custom, ds_ext;
+static u32 ds_menu, ds_custom, ds_ext, ds_relmode, ds_relsub;
+#define REL(bank) ((volatile u8 *)(SWITCH_ADDR + 0x2D0UL * ((bank) + 1)))   /* data byte, then its complement */
 static u32 s_menu_result = 1, s_custom_result = 1;
 static int copy_calls, copy_fail_at;     /* fail (return -1) on the Nth copy call, 0 = never */
 
@@ -56,12 +57,20 @@ __attribute__((section(".s_getds"), noinline, used)) u32 st_getds(u32 id) {
     if (id == ID_BANK) return ds_menu;
     if (id == ID_CUSTOM) return ds_custom;
     if (id == ID_EXT) return ds_ext;
+    if (id == ID_REL_MODE) return ds_relmode;
+    if (id == ID_REL_SUB) return ds_relsub;
     return 0;
 }
 __attribute__((section(".s_txnset"), noinline, used)) void st_txnset(u32 id, u32 value, struct txn *t) {
     t->ids[t->count] = id;
     t->values[t->count] = value;
     t->count++;
+}
+/* the stock dispatcher, as far as the release-mode restore uses it: record the item (its handler adds nothing we model) */
+__attribute__((section(".s_disp"), noinline, used)) u32 st_dispatcher(u32 id, u32 value, struct txn *t) {
+    logrec(K_DISP, id, value, t->count, 0);
+    st_txnset(id, value, t);
+    return 1;
 }
 __attribute__((section(".s_smenu"), noinline, used)) u32 st_smenu(u32 bank, u32 flags, struct txn *t) {
     logrec(K_SMENU, bank, flags, t->count, 0);
@@ -121,6 +130,8 @@ static void commit(struct txn *t) {
     for (u32 i = 0; i < t->count; i++) {
         if (t->ids[i] == ID_BANK) ds_menu = t->values[i];
         if (t->ids[i] == ID_CUSTOM) ds_custom = t->values[i];
+        if (t->ids[i] == ID_REL_MODE) ds_relmode = t->values[i];
+        if (t->ids[i] == ID_REL_SUB) ds_relsub = t->values[i];
     }
 }
 /* stock set-item API: a one-item transaction through the dispatcher */
@@ -143,7 +154,11 @@ static void check(int ok, const char *name) {
 static void reset(u32 sw, u32 menu, u32 custom) {
     SWITCH = (u8)sw; ds_menu = menu; ds_custom = custom; ds_ext = 0;
     nlog = 0; copy_calls = 0; copy_fail_at = 0; s_menu_result = s_custom_result = 1;
+    ds_relmode = ds_relsub = 0;
+    for (u32 b = 0; b < 4; b++) { REL(b)[0] = 0; REL(b)[1] = 0; }
 }
+static void relog(void) { nlog = 0; }
+static int relis(u32 b, u32 mode, u32 sub) { u8 v = (u8)(0x80 | mode | sub << 3); return REL(b)[0] == v && REL(b)[1] == (u8)~v; }
 static struct txn T;
 static void fresh(void) { T.count = 0; }
 static int is(int i, u32 k, u64 a, u64 b, u64 c) { return nlog > i && L[i].kind == k && L[i].a == a && L[i].b == b && L[i].c == c; }
@@ -152,7 +167,6 @@ static void dump(void) {
     for (int i = 0; i < nlog; i++) { puts_("    log "); puthex(L[i].kind); putc_(' '); puthex(L[i].a); putc_(' '); puthex(L[i].b); putc_(' '); puthex(L[i].c); putc_(' '); puthex(L[i].d); putc_('\n'); }
 }
 
-#define RELEASE_LIST ((u64)hook_texts + 16 * 6)
 
 __attribute__((used)) void fault(u64 elr, u64 far) {
     puts_("FAIL unexpected exception at "); puthex(elr); puts_(" far "); puthex(far); putc_('\n');
@@ -259,67 +273,105 @@ pairs_done:
     call(hook_link_sync, 0, 0, 0, 0);
     check(nlog == 0, "enable link: invalid menu bank value -> nothing to do");
 
-    /* ---------------- copy gate and the release-mode ride-along ---------------- */
+    /* ---------------- copy gate ---------------- */
     for (u32 sw = 0; sw < 4; sw++) {
-        int keep = sw & 1, link = (sw >> 1) & 1;
+        int keep = sw & 1;
         for (u32 dst = 1; dst <= 4; dst++) {
             reset(sw, 0, 0);
             long cr = call((void *)0x41013A14, 0, dst, LIST_MAIN, N_MAIN);
-            int ok;
-            if (keep) ok = cr == 0 && nlog == 0;
-            else if (link) ok = cr == 0 && nlog == 1 && isc(0, 0, dst, LIST_MAIN, N_MAIN);
-            else ok = cr == 0 && nlog == 2 && isc(0, 0, dst, LIST_MAIN, N_MAIN) && isc(1, 0, dst, RELEASE_LIST, 3);
+            int ok = keep ? (cr == 0 && nlog == 0) : (cr == 0 && nlog == 1 && isc(0, 0, dst, LIST_MAIN, N_MAIN));
             if (!ok) { check(0, "copy gate: live->bank store (switch / slot combination)"); dump(); goto gate_done; }
         }
     }
-    check(1, "copy gate: live->bank store skipped with keep, one call with link, main list + release ids otherwise (16 combinations)");
+    check(1, "copy gate: live->bank store skipped with keep, exactly the stock copy otherwise (16 combinations)");
 gate_done:
     reset(1, 0, 0);
     call((void *)0x41013A14, 1, 0, LIST_MAIN, N_MAIN);
-    check(nlog == 2 && isc(0, 1, 0, LIST_MAIN, N_MAIN) && isc(1, 1, 0, RELEASE_LIST, 3), "bank->live load is not gated, release ids ride along (keep on)");
+    check(nlog == 1 && isc(0, 1, 0, LIST_MAIN, N_MAIN), "bank->live load is not gated (keep on)");
     reset(1, 0, 0);
     call((void *)0x41013A14, 0, 5, LIST_MAIN, N_MAIN);
-    check(nlog == 2 && isc(0, 0, 5, LIST_MAIN, N_MAIN) && isc(1, 0, 5, RELEASE_LIST, 3), "live->stash (slot 5) is not gated");
-    reset(3, 0, 0);
-    call((void *)0x41013A14, 1, 0, LIST_MAIN, N_MAIN);
-    check(nlog == 1 && isc(0, 1, 0, LIST_MAIN, N_MAIN), "link on: bank->live load copies the main list only (custom bank carries release ids)");
+    check(nlog == 1 && isc(0, 0, 5, LIST_MAIN, N_MAIN), "live->stash (slot 5) is not gated");
+    reset(1, 0, 0);
+    call((void *)0x41013A14, 0, 0, LIST_MAIN, N_MAIN);
+    call((void *)0x41013A14, 0, 6, LIST_MAIN, N_MAIN);
+    check(nlog == 2, "slots 0 and 6 as destination are not gated");
     reset(0, 0, 0);
     call((void *)0x41013A14, 0, 2, LIST_CUSTOM, 0x1FF);
-    check(nlog == 1 && isc(0, 0, 2, LIST_CUSTOM, 0x1FF), "custom list copy: no ride-along");
-    reset(0, 0, 0);
-    call((void *)0x41013A14, 0, 2, LIST_MAIN, 100);
-    check(nlog == 1, "partial main list copy: no ride-along");
+    check(nlog == 1 && isc(0, 0, 2, LIST_CUSTOM, 0x1FF), "custom list copy passes through unchanged");
     reset(0, 0, 0); copy_fail_at = 1;
     long cr = call((void *)0x41013A14, 0, 2, LIST_MAIN, N_MAIN);
-    check(cr == -1 && nlog == 1, "stock copy failure is returned and stops the ride-along");
-    reset(0, 0, 0); copy_fail_at = 2;
-    cr = call((void *)0x41013A14, 0, 2, LIST_MAIN, N_MAIN);
-    check(nlog == 2, "ride-along failure still logged (return value reported)");
+    check(cr == -1 && nlog == 1, "stock copy failure is returned");
 
     /* ---------------- save command ---------------- */
-    reset(0, 2, 1);
+    reset(0, 2, 1); ds_relmode = 1; ds_relsub = 1;
     r = (u32)call(hook_save, 0, 0, 0, 0);
-    check(r == 1 && nlog == 4 && isc(0, 0, 3, LIST_MAIN, N_MAIN) && isc(1, 0, 3, RELEASE_LIST, 3) &&
-          isc(2, 0, 2, LIST_CUSTOM, 0x1FF) && isc(3, 0, 2, LIST_CUSTOM + 4 * 0x1FF, N_CUSTOM - 0x1FF), "save: menu bank C + custom bank B stored (ext banks off)");
-    reset(1, 2, 1); ds_ext = 1;
+    check(r == 1 && nlog == 3 && isc(0, 0, 3, LIST_MAIN, N_MAIN) &&
+          isc(1, 0, 2, LIST_CUSTOM, 0x1FF) && isc(2, 0, 2, LIST_CUSTOM + 4 * 0x1FF, N_CUSTOM - 0x1FF), "save: menu bank C + custom bank B stored (ext banks off)");
+    check(relis(2, 1, 1) && REL(0)[0] == 0 && REL(1)[0] == 0 && REL(3)[0] == 0, "save: release mode remembered for the current menu bank only");
+    reset(1, 2, 1); ds_ext = 1; ds_relmode = 4;
     r = (u32)call(hook_save, 0, 0, 0, 0);
-    check(r == 1 && nlog == 5 && isc(2, 0, 3, LIST_EXT, N_EXT), "save under keep + extended banks: still stores, ext list included");
-    reset(2, 2, 2);
-    r = (u32)call(hook_save, 0, 0, 0, 0);
-    check(r == 1 && nlog == 3 && isc(0, 0, 3, LIST_MAIN, N_MAIN) && isc(1, 0, 3, LIST_CUSTOM, 0x1FF), "save with link on: no release ride-along (custom bank carries them)");
+    check(r == 1 && nlog == 4 && isc(1, 0, 3, LIST_EXT, N_EXT) && relis(2, 4, 0), "save under keep + extended banks: still stores, ext list included, release mode remembered");
     reset(0, 9, 1);
     r = (u32)call(hook_save, 0, 0, 0, 0);
-    check(r == 0 && nlog == 0, "save: invalid menu bank -> fail, nothing copied");
+    check(r == 0 && nlog == 0 && REL(0)[0] == 0, "save: invalid menu bank -> fail, nothing copied or remembered");
     reset(0, 1, 9);
     r = (u32)call(hook_save, 0, 0, 0, 0);
     check(r == 0, "save: invalid custom bank -> fail");
-    for (int k = 1; k <= 4; k++) {
+    for (int k = 1; k <= 3; k++) {
         reset(0, 2, 1); copy_fail_at = k;
         r = (u32)call(hook_save, 0, 0, 0, 0);
         if (r != 0) { check(0, "save: a failing copy makes the command report failure"); goto save_done; }
     }
-    check(1, "save: a failing copy (any of the first 4) makes the command report failure");
+    check(1, "save: a failing copy (any of the 3) makes the command report failure");
 save_done:
+
+    /* ---------------- release mode per menu bank ---------------- */
+    reset(0, 0, 0); ds_relmode = 1; ds_relsub = 1; fresh();           /* bank A: continuous, sub-type 1 */
+    r = dispatch(&T, ID_BANK, 1); commit(&T);
+    check(r == 1 && nlog == 1 && is(0, K_SMENU, 1, 1, 1) && relis(0, 1, 1) && ds_relmode == 1 && ds_relsub == 1,
+          "release: leaving A remembers it; B was never stored, so the mode is left alone");
+    ds_relmode = 0; ds_relsub = 0; relog(); fresh();                   /* in B: single frame */
+    r = dispatch(&T, ID_BANK, 0); commit(&T);
+    check(nlog == 3 && is(0, K_SMENU, 0, 1, 1) && is(1, K_DISP, ID_REL_MODE, 1, 1) && is(2, K_DISP, ID_REL_SUB, 1, 2),
+          "release: back to A sets both items through the dispatcher, after the stock switch, mode first");
+    check(relis(1, 0, 0) && ds_relmode == 1 && ds_relsub == 1 && ds_menu == 0, "release: B remembered single frame; A's continuous mode is active again");
+    relog(); fresh();
+    r = dispatch(&T, ID_BANK, 1); commit(&T);
+    check(nlog == 3 && ds_relmode == 0 && ds_relsub == 0, "release: A -> B restores single frame");
+    ds_relsub = 5; relog(); fresh();                                   /* B: only the sub-type differs from A's */
+    ds_relmode = 1; REL(0)[0] = 0x80 | 1 | 2 << 3; REL(0)[1] = (u8)~(0x80 | 1 | 2 << 3);
+    r = dispatch(&T, ID_BANK, 0); commit(&T);
+    check(nlog == 2 && is(1, K_DISP, ID_REL_SUB, 2, 1) && ds_relsub == 2, "release: only the item that differs is set");
+    reset(1, 0, 0); ds_relmode = 4; fresh();                           /* keep stored */
+    REL(1)[0] = 0x80 | 1; REL(1)[1] = (u8)~(0x80 | 1);
+    r = dispatch(&T, ID_BANK, 1); commit(&T);
+    check(REL(0)[0] == 0 && nlog == 2 && is(1, K_DISP, ID_REL_MODE, 1, 1) && ds_relmode == 1,
+          "release + keep: leaving stores nothing, entering restores the bank's saved mode");
+    reset(0, 0, 0); ds_relmode = 1; fresh();
+    REL(1)[0] = 0x80; REL(1)[1] = 0x55;                                /* check byte wrong (stored mode 0, current 1) */
+    r = dispatch(&T, ID_BANK, 1); commit(&T);
+    check(nlog == 1 && ds_relmode == 1, "release: a slot whose check byte does not match is ignored");
+    reset(0, 0, 0); ds_relmode = 1; fresh();
+    REL(1)[0] = 0x00; REL(1)[1] = 0xFF;                                /* bit 7 clear (stored mode 0, current 1) */
+    r = dispatch(&T, ID_BANK, 1); commit(&T);
+    check(nlog == 1 && ds_relmode == 1, "release: a slot without the stored bit is ignored");
+    reset(0, 0, 0); ds_relmode = 1; fresh(); s_menu_result = 0;
+    REL(1)[0] = 0x80; REL(1)[1] = 0x7F;
+    r = dispatch(&T, ID_BANK, 1); commit(&T);
+    check(r == 0 && nlog == 1 && ds_relmode == 1, "release: stock switch failed -> nothing restored");
+    reset(0, 9, 0); fresh();
+    r = dispatch(&T, ID_BANK, 1);
+    check(nlog == 1 && REL(0)[0] == 0 && REL(1)[0] == 0 && REL(2)[0] == 0 && REL(3)[0] == 0, "release: invalid current bank -> nothing remembered");
+    reset(2, 0, 0); ds_relmode = 1; ds_relsub = 1; fresh();           /* link on, switch started from the custom side */
+    REL(2)[0] = 0x80; REL(2)[1] = 0x7F;
+    r = dispatch(&T, ID_CUSTOM, 2); commit(&T);
+    check(nlog == 4 && is(0, K_SCUSTOM, 2, 1, 1) && is(1, K_SMENU, 2, 1, 2) && is(2, K_DISP, ID_REL_MODE, 0, 2) && is(3, K_DISP, ID_REL_SUB, 0, 3) &&
+          relis(0, 1, 1) && ds_relmode == 0 && ds_menu == 2 && ds_custom == 2, "release + link: a custom-bank switch moves the menu bank and its release mode");
+    reset(2, 0, 0); ds_relmode = 4; fresh();                           /* link on, menu side, then the request's own custom entry */
+    REL(1)[0] = 0x80; REL(1)[1] = 0x7F;
+    r = dispatch(&T, ID_BANK, 1); u32 r3 = dispatch(&T, ID_CUSTOM, 1); commit(&T);
+    check(r3 == 1 && nlog == 3 && is(0, K_SMENU, 1, 1, 1) && is(1, K_DISP, ID_REL_MODE, 0, 1) && is(2, K_SCUSTOM, 1, 1, 3) && ds_relmode == 0 && ds_custom == 1,
+          "release + link: entries added by the restore do not disturb the link or the double-switch guard");
 
     /* ---------------- has_prev ---------------- */
     fresh(); T.ids[0] = 5; T.ids[1] = 6; T.ids[2] = 7; T.count = 3;
