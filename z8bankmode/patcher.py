@@ -70,6 +70,15 @@ S_MENU, S_CUSTOM = 0x410DD1EC, 0x410DE050      # switch(new bank 0..3, flags (bi
 TXN_SET = 0x410E9318                           # txn.Set(item id, value, txn): append to the transaction
 SET_ITEM = 0x410D61D0                          # public set-item API: (id, value), runs a one-item transaction
 DISPATCH_MENU_BL, DISPATCH_CUSTOM_BL = 0x97FFFAF0, 0x97FFFABF       # stock `bl` words at the two sites
+# After a committed transaction the firmware queues ONE change notice (0x410DC874): the transaction's own ids plus the
+# id list of the bank type that switched.  A transaction has a single marker for that (byte +0x155C "a bank switched",
+# word +0x1560 = 0 menu bank / 1 extended / 2 Custom Settings bank; the notice buffer holds 999 ids, the two lists
+# are 465 + 609).  With the link both switches run in one transaction and the second marker replaces the first, so the
+# first bank's settings were loaded but never announced (found on a camera with b3: displays and ISO handling kept
+# the old bank's values).  The notice routine is wrapped: with the link on and both bank ids in the transaction it
+# runs a second time for the other bank type.
+POST_COMMIT, POST_COMMIT_STOCK = 0x410DC874, 0xA9BD5BF7             # first instruction: stp x23,x22,[sp,#-0x30]!
+TXN_MARK, TXN_MARK_TYPE = 0x155C, 0x1560
 THUNK_MENU_WORDS = (0x2A0103E8, 0x320003E1, 0x2A0803E0, 0x17FFCF15)   # mov w8,w1; orr w1,wzr,#1; mov w0,w8; b S_MENU
 THUNK_CUSTOM_WORDS = (0x2A0103E8, 0x320003E1, 0x2A0803E0, 0x17FFD1C4)  # same, b S_CUSTOM
 
@@ -350,11 +359,16 @@ def code(cs):
     # ---- has_prev(id w0, transaction x1) -> w0 = 1 when an entry other than the newest already holds the id --------
     # The dispatcher records every item (newest entry) before it runs the item's handler, so "other than the newest"
     # means "an earlier entry of this request", which includes the entry a link wrapper added itself.
+    blk.label('has_any')                      # same, over every entry
+    blk.ldr_w(2, 1, 0)
+    blk.cbz_w(2, 'hp_no')
+    blk.b('hp_scan')
     blk.label('has_prev')
     blk.ldr_w(2, 1, 0)                        # entry count
     blk.cbz_w(2, 'hp_no')
     blk.subs_wi(2, 2, 1)
     blk.cbz_w(2, 'hp_no')
+    blk.label('hp_scan')
     blk.add_xi(1, 1, 4)                       # the id array starts at +4
     blk.mov_w(4, 0)
     blk.label('hp_loop')
@@ -373,6 +387,44 @@ def code(cs):
     # ---- the two dispatcher wrappers (link banks) -----------------------------------------------------------------
     _hook(blk, 'hook_menu', ID_BANK, ID_CUSTOM, 'menu_thunk', S_CUSTOM)
     _hook(blk, 'hook_custom', ID_CUSTOM, ID_BANK, DISPATCH_CUSTOM_THUNK, 'menu_switch')
+    # ---- post_wrap(transaction x0): the stock change notice, twice when the link switched both bank types ------------
+    blk.label('post_native')
+    blk.raw(POST_COMMIT_STOCK)
+    blk.b(POST_COMMIT + 4)
+    blk.label('post_wrap')
+    blk.stp_pre(19, 30, -0x20)
+    blk.str_x(20, 31, 0x10)
+    blk.mov_x(19, 0)
+    blk.bl('post_native')                     # stock: announces the bank type that switched last
+    _switch_byte(blk, 8)
+    blk.tbz_w(8, 1, 'pw_done')                # link off: stock behaviour only
+    blk.mov_w(8, TXN_MARK)
+    blk.raw(0x38686A68)                       # ldrb w8,[x19,x8]
+    blk.cbz_w(8, 'pw_done')                   # no bank switched in this transaction
+    blk.ldr_w(20, 19, TXN_MARK_TYPE)
+    blk.cmp_wi(20, 0)
+    blk.b_cond('eq', 'pw_both')
+    blk.cmp_wi(20, 2)
+    blk.b_cond('ne', 'pw_done')               # extended-banks toggle: not a linked switch
+    blk.label('pw_both')
+    _load_id(blk, 0, ID_BANK)
+    blk.mov_x(1, 19)
+    blk.bl('has_any')
+    blk.cbz_w(0, 'pw_done')
+    _load_id(blk, 0, ID_CUSTOM)
+    blk.mov_x(1, 19)
+    blk.bl('has_any')
+    blk.cbz_w(0, 'pw_done')                   # only one bank type switched
+    blk.mov_w(8, 2)
+    blk.sub_w(8, 8, 20)                       # the other bank type: 0 <-> 2
+    blk.str_w(8, 19, TXN_MARK_TYPE)
+    blk.mov_x(0, 19)
+    blk.bl('post_native')
+    blk.str_w(20, 19, TXN_MARK_TYPE)          # leave the transaction as the stock code left it
+    blk.label('pw_done')
+    blk.ldr_x(20, 31, 0x10)
+    blk.ldp_post(19, 30, 0x20)
+    blk.ret()
     # ---- link_sync: Custom Settings bank := shooting menu bank, through the stock set-item API --------------------
     blk.label('link_sync')
     blk.stp_pre(19, 30, -0x20)
@@ -617,12 +669,18 @@ def build_main(eg, strings_context):
         delta = blk.labels[label] - site
         img.put(site - BASE, struct.pack('<I', 0x94000000 | ((delta // 4) & 0x3FFFFFF)),
                 f'dispatcher: {what} switch call -> link wrapper', expect=struct.pack('<I', stock_bl))
+    require(struct.unpack_from('<I', eg, POST_COMMIT - BASE)[0] == POST_COMMIT_STOCK, 'stock change-notice routine differs')
+    delta = blk.labels['post_wrap'] - POST_COMMIT
+    img.put(POST_COMMIT - BASE, struct.pack('<I', 0x14000000 | ((delta // 4) & 0x3FFFFFF)),
+            'change-notice routine entry -> wrapper (second notice for linked switches)',
+            expect=struct.pack('<I', POST_COMMIT_STOCK))
     return img, dict(strings=ids, menu=where,
                      hook=dict(site=hex(COPY_API), gate=hex(blk.labels['gate']), native=hex(blk.labels['native']),
                                save=hex(blk.labels['save'])),
                      link=dict(menu_site=hex(DISPATCH_MENU_SITE), custom_site=hex(DISPATCH_CUSTOM_SITE),
                                hook_menu=hex(blk.labels['hook_menu']), hook_custom=hex(blk.labels['hook_custom']),
-                               has_prev=hex(blk.labels['has_prev']), sync=hex(blk.labels['link_sync'])),
+                               has_prev=hex(blk.labels['has_prev']), sync=hex(blk.labels['link_sync']),
+                               notice_wrapper=hex(blk.labels['post_wrap'])),
                      switch=dict(ram=hex(SWITCH_RAM), carrier_item='0x1238', default=0, scratch=hex(SCRATCH_RAM),
                                  bits='bit0 keep stored settings, bit1 link banks'),
                      code=[dict(va=hex(x), word=w, text=t) for x, w, t in listing],

@@ -37,10 +37,12 @@ static void halt(int code) {
 }
 
 /* ---- fake data store and call log -------------------------------------------------------------------------- */
-struct txn { u32 count; u32 ids[0x28F]; u32 pad; u32 values[0x28F]; };
+struct txn { u32 count; u32 ids[0x28F]; u32 pad; u32 values[0x28F]; u8 tail[0x100]; };
+#define MARK(t) (*((volatile u8 *)(t) + 0x155C))        /* a bank switched in this transaction */
+#define MARKTYPE(t) (*(volatile u32 *)((u8 *)(t) + 0x1560))   /* 0 menu bank, 1 extended, 2 Custom Settings bank */
 _Static_assert(__builtin_offsetof(struct txn, values) == 0xA44, "transaction layout");
 
-enum { K_SMENU = 1, K_SCUSTOM, K_COPY, K_SETITEM, K_DISP };
+enum { K_SMENU = 1, K_SCUSTOM, K_COPY, K_SETITEM, K_DISP, K_POST };
 struct rec { u32 kind; u64 a, b, c, d; };
 static struct rec L[64];
 static int nlog;
@@ -74,10 +76,12 @@ __attribute__((section(".s_disp"), noinline, used)) u32 st_dispatcher(u32 id, u3
 }
 __attribute__((section(".s_smenu"), noinline, used)) u32 st_smenu(u32 bank, u32 flags, struct txn *t) {
     logrec(K_SMENU, bank, flags, t->count, 0);
+    if (s_menu_result & 1) { MARK(t) = 1; MARKTYPE(t) = 0; }
     return s_menu_result;
 }
 __attribute__((section(".s_scustom"), noinline, used)) u32 st_scustom(u32 bank, u32 flags, struct txn *t) {
     logrec(K_SCUSTOM, bank, flags, t->count, 0);
+    if (s_custom_result & 1) { MARK(t) = 1; MARKTYPE(t) = 2; }
     return s_custom_result;
 }
 /* the stock copy API body (the part after the first instruction, which the patch's `native` entry reproduces) */
@@ -86,6 +90,15 @@ __attribute__((noinline, used)) long c_copy(u32 src, u32 dst, u64 list, u32 coun
     logrec(K_COPY, src, dst, list, count);
     return (copy_fail_at && copy_calls == copy_fail_at) ? -1 : 0;
 }
+/* the stock change-notice routine (body after its first instruction): which bank type is announced */
+__attribute__((noinline, used)) void c_post(struct txn *t) { logrec(K_POST, MARK(t), MARKTYPE(t), t->count, 0); }
+__asm__(".section .s_post,\"ax\"\n"
+        "    b hook_post_wrap\n"                                      /* the patched entry */
+        "    str x30, [sp, #0x28]\n"                                  /* body: inside the frame of `stp x23,x22,[sp,#-0x30]!` */
+        "    bl c_post\n"
+        "    ldr x30, [sp, #0x28]\n"
+        "    ldp x23, x22, [sp], #0x30\n"
+        "    ret\n");
 __asm__(".section .s_copyentry,\"ax\"\n"
         ".global copy_entry\ncopy_entry:\n    b hook_gate\n"          /* the patched entry: b gate */
         ".section .s_copybody,\"ax\"\n"
@@ -160,7 +173,8 @@ static void reset(u32 sw, u32 menu, u32 custom) {
 static void relog(void) { nlog = 0; }
 static int relis(u32 b, u32 mode, u32 sub) { u8 v = (u8)(0x80 | mode | sub << 3); return REL(b)[0] == v && REL(b)[1] == (u8)~v; }
 static struct txn T;
-static void fresh(void) { T.count = 0; }
+static void fresh(void) { T.count = 0; MARK(&T) = 0; MARKTYPE(&T) = 0; }
+static void post(void) { call((void *)0x410DC874, (u64)&T, 0, 0, 0); }
 static int is(int i, u32 k, u64 a, u64 b, u64 c) { return nlog > i && L[i].kind == k && L[i].a == a && L[i].b == b && L[i].c == c; }
 static int isc(int i, u64 s, u64 d, u64 list, u64 n) { return nlog > i && L[i].kind == K_COPY && L[i].a == s && L[i].b == d && L[i].c == list && L[i].d == n; }
 static void dump(void) {
@@ -372,6 +386,24 @@ save_done:
     r = dispatch(&T, ID_BANK, 1); u32 r3 = dispatch(&T, ID_CUSTOM, 1); commit(&T);
     check(r3 == 1 && nlog == 3 && is(0, K_SMENU, 1, 1, 1) && is(1, K_DISP, ID_REL_MODE, 0, 1) && is(2, K_SCUSTOM, 1, 1, 3) && ds_relmode == 0 && ds_custom == 1,
           "release + link: entries added by the restore do not disturb the link or the double-switch guard");
+
+    /* ---------------- change notice (one per bank type) ---------------- */
+    reset(0, 0, 0); fresh(); dispatch(&T, ID_BANK, 1); relog(); post();
+    check(nlog == 1 && is(0, K_POST, 1, 0, 1), "notice, link off: exactly the stock notice");
+    reset(2, 0, 0); fresh(); dispatch(&T, ID_BANK, 1); relog(); post();
+    check(nlog == 2 && is(0, K_POST, 1, 2, 2) && is(1, K_POST, 1, 0, 2) && MARKTYPE(&T) == 2,
+          "notice, link on, menu side: Custom Settings list announced, then the menu list; marker left as stock left it");
+    reset(2, 0, 0); fresh(); dispatch(&T, ID_CUSTOM, 3); relog(); post();
+    check(nlog == 2 && is(0, K_POST, 1, 0, 2) && is(1, K_POST, 1, 2, 2) && MARKTYPE(&T) == 0,
+          "notice, link on, custom side: menu list announced, then the Custom Settings list");
+    reset(2, 0, 2); fresh(); dispatch(&T, ID_BANK, 2); relog(); post();
+    check(nlog == 1 && is(0, K_POST, 1, 0, 1), "notice, link on but only one bank type switched: one notice");
+    reset(2, 0, 0); fresh(); dispatch(&T, 0x1234, 5); relog(); post();
+    check(nlog == 1 && is(0, K_POST, 0, 0, 1), "notice, link on, no bank switch in the transaction: one notice");
+    reset(2, 0, 0); fresh(); dispatch(&T, ID_BANK, 1); MARKTYPE(&T) = 1; relog(); post();
+    check(nlog == 1, "notice, link on, extended-banks marker: one notice");
+    reset(3, 0, 0); fresh(); dispatch(&T, ID_BANK, 1); relog(); post();
+    check(nlog == 2, "notice, keep + link: both notices");
 
     /* ---------------- has_prev ---------------- */
     fresh(); T.ids[0] = 5; T.ids[1] = 6; T.ids[2] = 7; T.count = 3;

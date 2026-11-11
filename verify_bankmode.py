@@ -31,6 +31,7 @@ MENU_SITE, CUSTOM_SITE = 0x410EA9CC, 0x410EAE38
 MENU_THUNK, CUSTOM_THUNK = 0x410E958C, 0x410E9934
 S_MENU, S_CUSTOM, TXN_SET, SET_ITEM = 0x410DD1EC, 0x410DE050, 0x410E9318, 0x410D61D0
 DISPATCHER, REL_MODE, REL_SUB = 0x410EA70C, 0x6000108, 0x600010A
+POST_COMMIT = 0x410DC874
 N_TEXTS, TEXT_SLOT = 6, 16
 
 
@@ -44,6 +45,7 @@ def windows(version, tag, n, stock):
         'copy routine entry (gate hook)': (COPY_API_OFF, 4),
         'dispatcher menu-bank call (link hook)': (MENU_SITE - BASE, 4),
         'dispatcher custom-bank call (link hook)': (CUSTOM_SITE - BASE, 4),
+        'change-notice routine entry (second notice for linked switches)': (POST_COMMIT - BASE, 4),
         'text loader boundary': (0x1024D8C, 8),
         'shared language directory': (0x311C5A0, 36 * 8),
         'shared strings text': (0x770000, 0x10000),
@@ -125,6 +127,7 @@ def verify(stock_raw, out_raw, version, tag):
     # code region: only these windows may differ
     code_ok = {'public version', 'runtime identity', 'copy routine entry (gate hook)', 'text loader boundary',
                'dispatcher menu-bank call (link hook)', 'dispatcher custom-bank call (link hook)',
+               'change-notice routine entry (second notice for linked switches)',
                'video menu hide site', 'new code, sub-page, state material', 'shared strings text',
                'shared string tables'}
     for r in report:
@@ -150,7 +153,7 @@ def verify(stock_raw, out_raw, version, tag):
     require(texts > 0 and texts % 4 == 0, 'value texts not found in the new code page')
     limit = BASE + 0x8A0000 + texts
     allowed_stock = {0x41012C84, 0x403AE0F8, 0x403B0048, 0x403B00B8, 0x40572B2C, 0x4050A6F0, 0x403F2920,
-                     0x403F645C, 0x41013A18, CUSTOM_THUNK, TXN_SET, S_MENU, S_CUSTOM, SET_ITEM, DISPATCHER}
+                     0x403F645C, 0x41013A18, CUSTOM_THUNK, TXN_SET, S_MENU, S_CUSTOM, SET_ITEM, DISPATCHER, POST_COMMIT + 4}
     for a, m, o in rows_all:
         if a >= limit:
             break
@@ -198,6 +201,18 @@ def verify(stock_raw, out_raw, version, tag):
     require(len(thunk_at) == 1, 'menu thunk not found')
     menu_thunk, menu_switch = thunk_at[0], thunk_at[0] + 12
     require(by_addr[menu_switch][0] == 'stp' and menu_switch < smenu[0] < menu_switch + 0x80, 'menu_switch shape')
+    # change notice: the stock entry branches to a wrapper that calls the displaced-entry copy at most twice
+    word = struct.unpack_from('<I', eg1, POST_COMMIT - BASE)[0]
+    require(word >> 26 == 0b000101, 'change-notice hook is not an unconditional branch')
+    d = word & 0x3FFFFFF
+    post_wrap = POST_COMMIT + ((d - (1 << 26) if d & (1 << 25) else d) << 2)
+    require(BASE + 0x8A0000 <= post_wrap < limit and by_addr[post_wrap][0] == 'stp', 'change-notice wrapper outside the new code')
+    pn = [a for a in addrs if struct.unpack_from('<I', eg1, a - BASE)[0] == 0xA9BD5BF7]
+    require(len(pn) == 1 and by_addr[pn[0] + 4][0] == 'b' and int(by_addr[pn[0] + 4][1], 16) == POST_COMMIT + 4,
+            'displaced change-notice entry differs')
+    require(sum(1 for a, m, o in code_rows if m == 'bl' and int(o.split()[-1], 16) == pn[0]) == 2,
+            'change-notice wrapper: expected two calls of the stock routine')
+    require(struct.unpack_from('<I', eg0, POST_COMMIT - BASE)[0] == 0xA9BD5BF7, 'stock change-notice entry differs')
     # link banks: the two dispatcher calls
 
     def bl_target(site):

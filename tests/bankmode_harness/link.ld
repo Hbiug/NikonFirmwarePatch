@@ -10,6 +10,7 @@ SECTIONS {
   .s_getds       0x41012C84 : { *(.s_getds) }
   .s_copyentry   0x41013A14 : { *(.s_copyentry) *(.s_copybody) }
   .s_setitem     0x410D61D0 : { *(.s_setitem) }
+  .s_post        0x410DC874 : { *(.s_post) }
   .s_smenu       0x410DD1EC : { *(.s_smenu) }
   .s_scustom     0x410DE050 : { *(.s_scustom) }
   .s_txnset      0x410E9318 : { *(.s_txnset) }

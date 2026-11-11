@@ -32,6 +32,8 @@ def _nop_first(data, lo, hi, base, mask, value):
 
 
 MUTATIONS = {
+    # the second change notice for a linked switch is never sent (the b3/b4 defect)
+    'single-notice': lambda d, L, b: _nop_first(d, L['post_wrap'], L['pw_done'], b, 0xFF000000, 0x36000000) or struct.pack_into('<I', d, L['pw_both'] - b, 0x14000000 | ((L['pw_done'] - L['pw_both']) // 4)),
     # the link wrapper no longer tests the link bit: it links even when the link is off
     'always-link': lambda d, L, b: _nop_first(d, L['hook_menu'], L['hook_menu'] + 0x40, b, 0xFF000000, 0x36000000),
     # the "already moved by an earlier entry" test is gone: a request carrying both ids switches twice
@@ -71,7 +73,7 @@ def main():
         f'#define LIST_CUSTOM {P.LIST_CUSTOM:#x}UL', f'#define N_CUSTOM {P.N_CUSTOM}',
         f'#define SWITCH_ADDR {P.SWITCH_RAM:#x}UL',
         f'#define THUNK_MENU {th(P.THUNK_MENU_WORDS)}', f'#define THUNK_CUSTOM {th(P.THUNK_CUSTOM_WORDS)}', '']))
-    defs = [f'--defsym=hook_{n}={L[n]:#x}' for n in ('gate', 'save', 'has_prev', 'hook_menu', 'hook_custom', 'link_sync', 'texts')]
+    defs = [f'--defsym=hook_{n}={L[n]:#x}' for n in ('gate', 'save', 'has_prev', 'hook_menu', 'hook_custom', 'link_sync', 'texts', 'post_wrap')]
     obj = a.out / 'harness.o'
     run = lambda *c: subprocess.run(c, check=True)
     run('clang', '--target=aarch64-none-elf', '-O1', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
