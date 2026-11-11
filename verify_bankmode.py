@@ -32,11 +32,13 @@ MENU_THUNK, CUSTOM_THUNK = 0x410E958C, 0x410E9934
 S_MENU, S_CUSTOM, TXN_SET, SET_ITEM = 0x410DD1EC, 0x410DE050, 0x410E9318, 0x410D61D0
 DISPATCHER, REL_MODE, REL_SUB = 0x410EA70C, 0x6000108, 0x600010A
 POST_COMMIT = 0x410DC874
+SETUP_ROWS, SETUP_EVPTR = 0x43D596D8 - BASE, 0x43D59E68 - BASE
+SETUP_CALLBACKS = 0xA028ECA70 - 0xA02808000 + 0x4B13000
 N_TEXTS, TEXT_SLOT = 6, 16
 
 
 def windows(version, tag, n, stock):
-    dup_table = struct.unpack_from('<Q', stock, pm.EVPTR_A + 8 * pm.ROW_DUP)[0] - BASE
+    row_table = struct.unpack_from('<Q', stock, SETUP_EVPTR + 8 * 43)[0] - BASE
     w = {
         'public version': (0xEB29FC, 12),
         'runtime identity': (0x14EAA90, 8),
@@ -51,11 +53,10 @@ def windows(version, tag, n, stock):
         'shared strings text': (0x770000, 0x10000),
         'shared string tables': (0x780000, 0x70000),
         'new code, sub-page, state material': (0x8A0000, 0x2000),
-        'video menu rows 7..9': (pm.ROWS_A + 44 * pm.ROW_DUP, 3 * 44),
-        'video menu transition pointers 7..9': (pm.EVPTR_A + 8 * pm.ROW_DUP, 3 * 8),
-        'reused row transition table (46 events)': (dup_table, 46 * 32),
-        'video menu refresh callback': (pm.VIDEO_CALLBACKS + 32, 8),
-        'video menu hide site': (pm.HIDE_SITE, 4),
+        'Setup menu row 43': (SETUP_ROWS + 44 * 43, 44),
+        'reused Setup row transition table (59 events)': (row_table, 59 * 32),
+        'Setup menu refresh callback': (SETUP_CALLBACKS + 32, 8),
+        'Setup menu hide site': (0x40597D8C - BASE, 4),
         'stub state callbacks': (pm.STATE_TABLE + pm.STATE_SIZE * pm.STATE_NEW + 0x28, 8),
         'stub state page record': (pm.STATE_TABLE + pm.STATE_SIZE * pm.STATE_NEW + 0x50, 8),
     }
@@ -128,7 +129,7 @@ def verify(stock_raw, out_raw, version, tag):
     code_ok = {'public version', 'runtime identity', 'copy routine entry (gate hook)', 'text loader boundary',
                'dispatcher menu-bank call (link hook)', 'dispatcher custom-bank call (link hook)',
                'change-notice routine entry (second notice for linked switches)',
-               'video menu hide site', 'new code, sub-page, state material', 'shared strings text',
+               'Setup menu hide site', 'new code, sub-page, state material', 'shared strings text',
                'shared string tables'}
     for r in report:
         if r['start'] < CODE_REGION_END and not set(r['windows']) <= code_ok:
@@ -152,7 +153,7 @@ def verify(stock_raw, out_raw, version, tag):
     texts = code_all.find(b'AUTO' + b'\0' * 12 + b'KEEP' + b'\0' * 12)
     require(texts > 0 and texts % 4 == 0, 'value texts not found in the new code page')
     limit = BASE + 0x8A0000 + texts
-    allowed_stock = {0x41012C84, 0x403AE0F8, 0x403B0048, 0x403B00B8, 0x40572B2C, 0x4050A6F0, 0x403F2920,
+    allowed_stock = {0x41012C84, 0x403AE0F8, 0x403B0048, 0x403B00B8, 0x40597E6C, 0x4050A6F0, 0x403F2920,
                      0x403F645C, 0x41013A18, CUSTOM_THUNK, TXN_SET, S_MENU, S_CUSTOM, SET_ITEM, DISPATCHER, POST_COMMIT + 4}
     for a, m, o in rows_all:
         if a >= limit:

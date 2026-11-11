@@ -3,8 +3,8 @@
 Stock behaviour: every live->bank store happens automatically whenever the bank changes, so a bank
 always holds the last settings used in it.  This patch adds a Z7-style alternative:
 
-  * "Menu bank behavior" row in the Video recording menu (same plumbing as the ProRes row in
-    z8prores/menu.py: reused hidden row 0x311B, stub state 0x102, cloned N-RAW sub-page).
+  * "Menu bank behavior" row at the end of the Setup menu (reused slot of the hidden "Special shooting" row, item
+    0x3968; stub state 0x102 and a cloned N-RAW sub-page as in z8prores/menu.py).
       - Auto-store (stock)            : nothing changes
       - Keep stored settings (Z7)     : live->bank stores are skipped, so leaving a bank discards the
                                         changes made since it was loaded
@@ -88,6 +88,15 @@ SWITCH_RAM = ITEM_BLOCK_LIVE + 1
 SWITCH_ITEM_DEFAULT_OFF = pm.MOVIE_DEFAULTS + (ITEM_BLOCK_LIVE - pm.MOVIE_BLOCK)
 
 # ---- new material (same text-gap regions as the ProRes row; this patch does not combine with it) ------------
+# ---- the row lives in the Setup menu (state 0x297), in the slot of its last row "Special shooting" (item 0x3968), which
+# the stock entry callback hides unless internal flag 0x14 is set.  b0..b5 had the row in the Video recording menu.
+SETUP_ROWS, SETUP_EVPTR, SETUP_COUNT = 0x43D596D8 - BASE, 0x43D59E68 - BASE, 44
+SETUP_ROW = 43                                       # "Special shooting"
+SETUP_ITEM, SETUP_STOCK_LABEL, SETUP_STOCK_TARGET = 0x3968, 1634, 0x4F1
+SETUP_CALLBACKS = 0xA028ECA70 - 0xA02808000 + 0x4B13000   # five pointers of state 0x297 (data image)
+F_SETUP_REFRESH = 0x40597E6C                         # its value-refresh callback
+SETUP_HIDE_SITE, SETUP_HIDE_STOCK = 0x40597D8C, 0x35000100   # cbnz w0,0x40597dac: skip hiding item 0x3968 when the flag is set
+VIDEO_NRAW_ROW = pm.ROWS_A + 44 * pm.ROW_NRAW        # stock row with a value text at the right: field template
 CODE_AT, CODE_LIMIT = pm.CODE_AT, pm.CODE_AT + 0x1000   # the code page is read-only at run time: no data lives in it
 # last save result (0 none, 1 saved, 2 failed): second padding byte of the same one-byte item.  It sits in
 # ordinary writable RAM (a store into the code page is a permission fault), is reset when the sub-page opens,
@@ -502,16 +511,16 @@ def code(cs):
     blk.strb_w(8, 9)
     blk.raw(0xF84107FE)                       # ldr x30,[sp],#0x10
     blk.ret()
-    # ---- refresh(state): stock video-menu value refresh, then our row's text -----------------------------------
+    # ---- refresh(state): stock Setup-menu value refresh, then our row's text -----------------------------------
     blk.label('refresh')
     blk.stp_pre(19, 30, -0x20)
     blk.str_x(20, 31, 0x10)
     blk.mov_x(19, 0)
-    blk.bl(pm.F_VIDEO_REFRESH)
+    blk.bl(F_SETUP_REFRESH)
     blk.mov_x(20, 0)                          # keep the stock return value
     blk.cbz_x(19, 'refresh_done')
     blk.mov_x(0, 19)
-    blk.mov_w(1, pm.ITEM_ROW)
+    blk.mov_w(1, SETUP_ITEM)
     blk.mov_w(2, pm.VALUE_CHILD)
     blk.bl(pm.F_CHILD)
     blk.cbz_x(0, 'refresh_done')
@@ -549,7 +558,7 @@ def strings(context):
 
 
 def menu(img, ids, blk):
-    """Sub-page, stub state and video-menu row; same plumbing as z8prores.menu.menu with five options."""
+    """Sub-page, stub state and Setup-menu row; the sub-page plumbing follows z8prores.menu.menu, with five options."""
     layout = bytearray(img.old[pm.NRAW_LAYOUT:pm.NRAW_LAYOUT + 0x110])
     if struct.unpack_from('<I', layout, 0x44)[0] != 0x8A6:
         raise ValueError('stock layout: title id not where expected')
@@ -598,37 +607,37 @@ def menu(img, ids, blk):
     img.put(record + 0x50, struct.pack('<Q', va(page_at)),
             f'state {pm.STATE_NEW:#x}: page record -> menu bank behavior sub-page',
             expect=struct.pack('<Q', pm.STATE_NEW_STOCK[1]))
-    # ---- the row in the video recording menu ------------------------------------------------------------------
-    stock = [img.old[pm.ROWS_A + 44 * i:pm.ROWS_A + 44 * i + 44] for i in (pm.ROW_DUP, pm.ROW_FRAME, pm.ROW_NRAW)]
-    nraw = struct.unpack('<11I', stock[2])
-    dup = struct.unpack('<11I', stock[0])
-    if dup[6] != pm.ITEM_ROW or nraw[6] != 0x3118 or nraw[0] != 0x8A6:
-        raise ValueError('stock video menu rows differ')
-    new_row = struct.pack('<11I', ids['label_id'], *nraw[1:6], pm.ITEM_ROW, *nraw[7:])
-    img.put(pm.ROWS_A + 44 * pm.ROW_DUP, stock[1] + stock[2] + new_row,
-            'video menu rows 7..9: frame size, N-RAW quality, new menu bank behavior row', expect=b''.join(stock))
-    pointers = struct.unpack_from('<3Q', img.old, pm.EVPTR_A + 8 * pm.ROW_DUP)
-    img.put(pm.EVPTR_A + 8 * pm.ROW_DUP, struct.pack('<3Q', pointers[1], pointers[2], pointers[0]),
-            'video menu transition table pointers 7..9, same order as the rows')
-    dup_table = pointers[0] - BASE
+    # ---- the row in the Setup menu ---------------------------------------------------------------------------------
+    row_at = SETUP_ROWS + 44 * SETUP_ROW
+    stock_row = struct.unpack_from('<11I', img.old, row_at)
+    nraw = struct.unpack_from('<11I', img.old, VIDEO_NRAW_ROW)
+    if stock_row[0] != SETUP_STOCK_LABEL or stock_row[6] != SETUP_ITEM or nraw[6] != 0x3118 or nraw[0] != 0x8A6 or \
+            stock_row[7:] != nraw[7:]:
+        raise ValueError('stock Setup menu row differs')
+    new_row = struct.pack('<11I', ids['label_id'], *nraw[1:6], SETUP_ITEM, *nraw[7:])
+    img.put(row_at, new_row, 'Setup menu row 43: "Special shooting" slot -> menu bank behavior row',
+            expect=struct.pack('<11I', *stock_row))
+    row_table = img.u64(SETUP_EVPTR + 8 * SETUP_ROW) - BASE
+    if sum(1 for k in range(SETUP_COUNT) if img.u64(SETUP_EVPTR + 8 * k) - BASE == row_table) != 1:
+        raise ValueError('the transition table of the reused Setup row is shared')
     changed = []
 
     def retarget(e, a, g, t):
-        if t == pm.STATE_FILETYPE:
+        if t == SETUP_STOCK_TARGET:
             changed.append(e)
             return e, a, g, pm.STATE_NEW
         return e, a, g, t
-    table7 = pm.events(img, dup_table, 46, retarget)
+    table43 = pm.events(img, row_table, 59, retarget)
     if changed != [0x286, 0x28B, 0x29F, 0x2AE]:
-        raise ValueError(f'unexpected transitions to the file type page: {changed}')
-    img.put(dup_table, table7, 'transition table of the reused row: enter the new state instead of the file type page')
-    img.put(pm.HIDE_SITE, struct.pack('<I', 0x52800001 | 0x2E38 << 5),
-            'video menu entry callback: hide item 2e38 again instead of hiding item 311b',
-            expect=struct.pack('<I', 0x52800001 | pm.ITEM_ROW << 5))
-    if img.u64(pm.VIDEO_CALLBACKS + 32) != pm.F_VIDEO_REFRESH:
-        raise ValueError('stock video menu refresh callback differs')
-    img.put(pm.VIDEO_CALLBACKS + 32, struct.pack('<Q', blk.labels['refresh']),
-            'video menu value refresh callback -> wrapper')
+        raise ValueError(f'unexpected transitions of the reused Setup row: {changed}')
+    img.put(row_table, table43, 'transition table of the reused Setup row: enter the new state')
+    img.put(SETUP_HIDE_SITE - BASE, struct.pack('<I', 0x14000008),
+            'Setup menu entry callback: never hide item 3968 (b 0x40597dac)',
+            expect=struct.pack('<I', SETUP_HIDE_STOCK))
+    if img.u64(SETUP_CALLBACKS + 32) != F_SETUP_REFRESH:
+        raise ValueError('stock Setup menu refresh callback differs')
+    img.put(SETUP_CALLBACKS + 32, struct.pack('<Q', blk.labels['refresh']),
+            'Setup menu value refresh callback -> wrapper')
     return dict(layout=hex(va(layout_at)), rows=hex(va(rows_at)), tables=hex(va(tables_at)),
                 pointers=hex(va(evptr_at)), callbacks=hex(va(callbacks_at)), page=hex(va(page_at)),
                 state=hex(pm.state_ram(pm.STATE_NEW)))
