@@ -32,6 +32,8 @@ def _nop_first(data, lo, hi, base, mask, value):
 
 
 MUTATIONS = {
+    # bracketing is switched on even when it is already on (the press test of the shot number is gone)
+    'bkt-always-on': lambda d, L, b: _nop_first(d, L['bkt_wrap'] + 0x44, L['bw_call'], b, 0xFF000000, 0x35000000),
     # the second change notice for a linked switch is never sent (the b3/b4 defect)
     'single-notice': lambda d, L, b: _nop_first(d, L['post_wrap'], L['pw_done'], b, 0xFF000000, 0x36000000) or struct.pack_into('<I', d, L['pw_both'] - b, 0x14000000 | ((L['pw_done'] - L['pw_both']) // 4)),
     # the link wrapper no longer tests the link bit: it links even when the link is off
@@ -67,13 +69,14 @@ def main():
     th = lambda w: '"' + ','.join('0x%08X' % x for x in w) + '"'
     (a.out / 'gen.h').write_text('\n'.join([
         f'#define ID_BANK {P.ID_BANK:#x}u', f'#define ID_EXT {P.ID_EXT:#x}u', f'#define ID_CUSTOM {P.ID_CUSTOM:#x}u',
+        f'#define ID_BKT_SHOTS {P.ID_BKT_SHOTS:#x}u', f'#define ID_BKT_DIR {P.ID_BKT_DIR:#x}u',
         f'#define ID_REL_MODE {P.ID_REL_MODE:#x}u', f'#define ID_REL_SUB {P.ID_REL_SUB:#x}u',
         f'#define LIST_MAIN {P.LIST_MAIN:#x}UL', f'#define N_MAIN {P.N_MAIN}',
         f'#define LIST_EXT {P.LIST_EXT:#x}UL', f'#define N_EXT {P.N_EXT}',
         f'#define LIST_CUSTOM {P.LIST_CUSTOM:#x}UL', f'#define N_CUSTOM {P.N_CUSTOM}',
         f'#define SWITCH_ADDR {P.SWITCH_RAM:#x}UL',
         f'#define THUNK_MENU {th(P.THUNK_MENU_WORDS)}', f'#define THUNK_CUSTOM {th(P.THUNK_CUSTOM_WORDS)}', '']))
-    defs = [f'--defsym=hook_{n}={L[n]:#x}' for n in ('gate', 'save', 'has_prev', 'hook_menu', 'hook_custom', 'link_sync', 'texts', 'post_wrap')]
+    defs = [f'--defsym=hook_{n}={L[n]:#x}' for n in ('gate', 'save', 'has_prev', 'hook_menu', 'hook_custom', 'link_sync', 'texts', 'post_wrap', 'bkt_wrap')]
     obj = a.out / 'harness.o'
     run = lambda *c: subprocess.run(c, check=True)
     run('clang', '--target=aarch64-none-elf', '-O1', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',

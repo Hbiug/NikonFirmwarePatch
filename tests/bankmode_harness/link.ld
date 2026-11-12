@@ -7,6 +7,7 @@ SECTIONS {
   . = 0x40100000;
   .data   : { *(.data*) }
   .bss    : { *(.bss*) *(COMMON) }
+  .s_bkt         0x40D4D680 : { *(.s_bkt) }
   .s_getds       0x41012C84 : { *(.s_getds) }
   .s_copyentry   0x41013A14 : { *(.s_copyentry) *(.s_copybody) }
   .s_setitem     0x410D61D0 : { *(.s_setitem) }

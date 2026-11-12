@@ -42,11 +42,12 @@ struct txn { u32 count; u32 ids[0x28F]; u32 pad; u32 values[0x28F]; u8 tail[0x10
 #define MARKTYPE(t) (*(volatile u32 *)((u8 *)(t) + 0x1560))   /* 0 menu bank, 1 extended, 2 Custom Settings bank */
 _Static_assert(__builtin_offsetof(struct txn, values) == 0xA44, "transaction layout");
 
-enum { K_SMENU = 1, K_SCUSTOM, K_COPY, K_SETITEM, K_DISP, K_POST };
+enum { K_SMENU = 1, K_SCUSTOM, K_COPY, K_SETITEM, K_DISP, K_POST, K_BKT };
 struct rec { u32 kind; u64 a, b, c, d; };
 static struct rec L[64];
 static int nlog;
-static u32 ds_menu, ds_custom, ds_ext, ds_relmode, ds_relsub;
+static u32 ds_menu, ds_custom, ds_ext, ds_relmode, ds_relsub, ds_bktshots, ds_bktdir;
+#define BKTFLAG (*(volatile u8 *)(SWITCH_ADDR + 2))
 #define REL(bank) ((volatile u8 *)(SWITCH_ADDR + 0x2D0UL * ((bank) + 1)))   /* data byte, then its complement */
 static u32 s_menu_result = 1, s_custom_result = 1;
 static int copy_calls, copy_fail_at;     /* fail (return -1) on the Nth copy call, 0 = never */
@@ -61,6 +62,8 @@ __attribute__((section(".s_getds"), noinline, used)) u32 st_getds(u32 id) {
     if (id == ID_EXT) return ds_ext;
     if (id == ID_REL_MODE) return ds_relmode;
     if (id == ID_REL_SUB) return ds_relsub;
+    if (id == ID_BKT_SHOTS) return ds_bktshots;
+    if (id == ID_BKT_DIR) return ds_bktdir;
     return 0;
 }
 __attribute__((section(".s_txnset"), noinline, used)) void st_txnset(u32 id, u32 value, struct txn *t) {
@@ -90,6 +93,15 @@ __attribute__((noinline, used)) long c_copy(u32 src, u32 dst, u64 list, u32 coun
     logrec(K_COPY, src, dst, list, count);
     return (copy_fail_at && copy_calls == copy_fail_at) ? -1 : 0;
 }
+/* the stock Bracketing burst button handler (body after its first instruction) */
+__attribute__((noinline, used)) u32 c_bkt(u32 button, u32 pressed, u32 a, u32 b) { logrec(K_BKT, button, pressed, a, ds_bktshots << 8 | b); return 0x55; }
+__asm__(".section .s_bkt,\"ax\"\n"
+        "    b hook_bkt_wrap\n"                                       /* the patched entry */
+        "    str x30, [sp, #0x28]\n"                                  /* body: inside the frame of `str x22,[sp,#-0x30]!` */
+        "    bl c_bkt\n"
+        "    ldr x30, [sp, #0x28]\n"
+        "    ldr x22, [sp], #0x30\n"
+        "    ret\n");
 /* the stock change-notice routine (body after its first instruction): which bank type is announced */
 __attribute__((noinline, used)) void c_post(struct txn *t) { logrec(K_POST, MARK(t), MARKTYPE(t), t->count, 0); }
 __asm__(".section .s_post,\"ax\"\n"
@@ -145,6 +157,8 @@ static void commit(struct txn *t) {
         if (t->ids[i] == ID_CUSTOM) ds_custom = t->values[i];
         if (t->ids[i] == ID_REL_MODE) ds_relmode = t->values[i];
         if (t->ids[i] == ID_REL_SUB) ds_relsub = t->values[i];
+        if (t->ids[i] == ID_BKT_SHOTS) ds_bktshots = t->values[i];
+        if (t->ids[i] == ID_BKT_DIR) ds_bktdir = t->values[i];
     }
 }
 /* stock set-item API: a one-item transaction through the dispatcher */
@@ -167,7 +181,7 @@ static void check(int ok, const char *name) {
 static void reset(u32 sw, u32 menu, u32 custom) {
     SWITCH = (u8)sw; ds_menu = menu; ds_custom = custom; ds_ext = 0;
     nlog = 0; copy_calls = 0; copy_fail_at = 0; s_menu_result = s_custom_result = 1;
-    ds_relmode = ds_relsub = 0;
+    ds_relmode = ds_relsub = 0; ds_bktshots = ds_bktdir = 0; BKTFLAG = 0;
     for (u32 b = 0; b < 4; b++) { REL(b)[0] = 0; REL(b)[1] = 0; }
 }
 static void relog(void) { nlog = 0; }
@@ -404,6 +418,26 @@ save_done:
     check(nlog == 1, "notice, link on, extended-banks marker: one notice");
     reset(3, 0, 0); fresh(); dispatch(&T, ID_BANK, 1); relog(); post();
     check(nlog == 2, "notice, keep + link: both notices");
+
+    /* ---------------- Bracketing burst button with bracketing off ---------------- */
+#define BKT(pressed) ((u32)call((void *)0x40D4D680, 0x19, pressed, 7, 9))
+    reset(0, 0, 0); ds_bktdir = 1;
+    r = BKT(1);
+    check(r == 0x55 && nlog == 3 && L[0].kind == K_SETITEM && L[0].a == ID_BKT_DIR && L[0].b == 3 && L[1].kind == K_SETITEM && L[1].a == ID_BKT_SHOTS && L[1].b == 3 &&
+          L[2].kind == K_BKT && L[2].a == 0x19 && L[2].b == 1 && L[2].c == 7 && L[2].d == (3 << 8 | 9) && ds_bktshots == 3 && ds_bktdir == 3 && BKTFLAG == 0x81,
+          "bracketing burst, bracketing off: press sets 3 frames before the stock handler runs, arguments and result passed through");
+    relog(); r = BKT(1);
+    check(nlog == 1 && L[0].kind == K_BKT && BKTFLAG == 0x81, "bracketing burst: a repeated press changes nothing");
+    relog(); r = BKT(0);
+    check(r == 0x55 && nlog == 3 && L[0].kind == K_BKT && L[0].b == 0 && L[1].kind == K_SETITEM && L[1].a == ID_BKT_SHOTS && L[1].b == 0 && L[2].kind == K_SETITEM && L[2].a == ID_BKT_DIR && L[2].b == 1 &&
+          ds_bktshots == 0 && ds_bktdir == 1 && BKTFLAG == 0, "bracketing burst: release runs the stock handler, then switches bracketing off and restores the direction");
+    relog(); r = BKT(0);
+    check(nlog == 1 && ds_bktshots == 0, "bracketing burst: a release without our press only runs the stock handler");
+    reset(0, 0, 0); ds_bktshots = 5; ds_bktdir = 3;
+    r = BKT(1); r = BKT(0);
+    check(nlog == 2 && L[0].kind == K_BKT && L[1].kind == K_BKT && ds_bktshots == 5 && ds_bktdir == 3 && BKTFLAG == 0, "bracketing burst, bracketing already on: stock behaviour, settings untouched");
+    reset(0, 0, 0); BKT(1); ds_bktshots = 7; relog(); BKT(0);
+    check(ds_bktshots == 0 && BKTFLAG == 0, "bracketing burst: release switches off even if the frame count was changed while held");
 
     /* ---------------- has_prev ---------------- */
     fresh(); T.ids[0] = 5; T.ids[1] = 6; T.ids[2] = 7; T.count = 3;

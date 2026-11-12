@@ -79,6 +79,17 @@ DISPATCH_MENU_BL, DISPATCH_CUSTOM_BL = 0x97FFFAF0, 0x97FFFABF       # stock `bl`
 # runs a second time for the other bank type.
 POST_COMMIT, POST_COMMIT_STOCK = 0x410DC874, 0xA9BD5BF7             # first instruction: stp x23,x22,[sp,#-0x30]!
 TXN_MARK, TXN_MARK_TYPE = 0x155C, 0x1560
+# ---- "Bracketing burst" button with bracketing off --------------------------------------------------------------
+# 0x40D4D680(button, pressed, a, b) is the press / release handler of the custom-control function "Bracketing burst"
+# (called twice from the function-button dispatcher 0x40D3CBC4); it switches the burst state with 0x40D515D4(on).
+# Stock does nothing useful when AE/flash bracketing is off.  The wrapper turns bracketing on for the time the button
+# is held: on press, if eDSID_Setting_AeFlashBracketingShotNum (0x700067E) is 0, it sets 3 frames (shot number 3 with
+# eDSID_Setting_AeFlashBracketingDirection 0x700068A = 3, the pair the stock picker uses for "3F", table 0x43A1A500)
+# and remembers the old direction; on release it sets the shot number back to 0 and the direction back.
+BKT_HANDLER, BKT_HANDLER_STOCK = 0x40D4D680, 0xF81D0FF6              # first instruction: str x22,[sp,#-0x30]!
+ID_BKT_SHOTS, ID_BKT_DIR = 0x700067E, 0x700068A
+BKT_FRAMES, BKT_DIR_SYMMETRIC = 3, 3
+BKT_FLAG_RAM = 0xA03D5C0DC + 3                                       # third padding byte of the carrier item: 0x80 | old direction while ours
 THUNK_MENU_WORDS = (0x2A0103E8, 0x320003E1, 0x2A0803E0, 0x17FFCF15)   # mov w8,w1; orr w1,wzr,#1; mov w0,w8; b S_MENU
 THUNK_CUSTOM_WORDS = (0x2A0103E8, 0x320003E1, 0x2A0803E0, 0x17FFD1C4)  # same, b S_CUSTOM
 
@@ -434,6 +445,59 @@ def code(cs):
     blk.ldr_x(20, 31, 0x10)
     blk.ldp_post(19, 30, 0x20)
     blk.ret()
+    # ---- bkt_wrap(button, pressed, a, b): bracketing on while the Bracketing burst button is held --------------------
+    blk.label('bkt_native')
+    blk.raw(BKT_HANDLER_STOCK)
+    blk.b(BKT_HANDLER + 4)
+    blk.label('bkt_wrap')
+    blk.stp_pre(19, 30, -0x40)
+    blk.stp(20, 21, 0x10)
+    blk.stp(22, 23, 0x20)
+    blk.str_x(24, 31, 0x30)
+    blk.mov_wr(19, 0)
+    blk.mov_wr(20, 1)
+    blk.mov_wr(21, 2)
+    blk.mov_wr(22, 3)
+    blk.mov_x64(24, BKT_FLAG_RAM)
+    blk.tbz_w(20, 0, 'bw_call')               # release: stock first
+    blk.ldrb_w(8, 24)
+    blk.cbnz_w(8, 'bw_call')                  # already switched on by us
+    _get(blk, ID_BKT_SHOTS)
+    blk.cbnz_w(0, 'bw_call')                  # bracketing is on: stock behaviour
+    _get(blk, ID_BKT_DIR)
+    _and7(blk, 0, 0)
+    blk.raw(0x32190000)                       # orr w0,w0,#0x80
+    blk.strb_w(0, 24)
+    _load_id(blk, 0, ID_BKT_DIR)
+    blk.mov_w(1, BKT_DIR_SYMMETRIC)
+    blk.bl(SET_ITEM)
+    _load_id(blk, 0, ID_BKT_SHOTS)
+    blk.mov_w(1, BKT_FRAMES)
+    blk.bl(SET_ITEM)
+    blk.label('bw_call')
+    blk.mov_wr(0, 19)
+    blk.mov_wr(1, 20)
+    blk.mov_wr(2, 21)
+    blk.mov_wr(3, 22)
+    blk.bl('bkt_native')
+    blk.mov_wr(23, 0)
+    _tbnz(blk, 20, 0, 'bw_done')              # press: done
+    blk.ldrb_w(19, 24)
+    blk.tbz_w(19, 7, 'bw_done')               # not switched on by us
+    blk.strb_w(31, 24)
+    _load_id(blk, 0, ID_BKT_SHOTS)
+    blk.mov_w(1, 0)
+    blk.bl(SET_ITEM)
+    _load_id(blk, 0, ID_BKT_DIR)
+    _and7(blk, 1, 19)
+    blk.bl(SET_ITEM)
+    blk.label('bw_done')
+    blk.mov_wr(0, 23)
+    blk.ldr_x(24, 31, 0x30)
+    blk.ldp(22, 23, 0x20)
+    blk.ldp(20, 21, 0x10)
+    blk.ldp_post(19, 30, 0x40)
+    blk.ret()
     # ---- link_sync: Custom Settings bank := shooting menu bank, through the stock set-item API --------------------
     blk.label('link_sync')
     blk.stp_pre(19, 30, -0x20)
@@ -683,6 +747,13 @@ def build_main(eg, strings_context):
     img.put(POST_COMMIT - BASE, struct.pack('<I', 0x14000000 | ((delta // 4) & 0x3FFFFFF)),
             'change-notice routine entry -> wrapper (second notice for linked switches)',
             expect=struct.pack('<I', POST_COMMIT_STOCK))
+    require(struct.unpack_from('<I', eg, BKT_HANDLER - BASE)[0] == BKT_HANDLER_STOCK and
+            struct.unpack_from('<2I', eg, 0x40D4D6DC - BASE) == (0x320003E0, 0x94000FBD) and
+            struct.unpack_from('<10I', eg, 0x43A1A500 - BASE)[:4] == (0, 0, 303, 3), 'stock bracketing-burst handler differs')
+    delta = blk.labels['bkt_wrap'] - BKT_HANDLER
+    img.put(BKT_HANDLER - BASE, struct.pack('<I', 0x14000000 | ((delta // 4) & 0x3FFFFFF)),
+            'Bracketing burst button handler entry -> wrapper (bracketing on while held)',
+            expect=struct.pack('<I', BKT_HANDLER_STOCK))
     return img, dict(strings=ids, menu=where,
                      hook=dict(site=hex(COPY_API), gate=hex(blk.labels['gate']), native=hex(blk.labels['native']),
                                save=hex(blk.labels['save'])),
@@ -693,6 +764,8 @@ def build_main(eg, strings_context):
                      switch=dict(ram=hex(SWITCH_RAM), carrier_item='0x1238', default=0, scratch=hex(SCRATCH_RAM),
                                  bits='bit0 keep stored settings, bit1 link banks'),
                      code=[dict(va=hex(x), word=w, text=t) for x, w, t in listing],
+                     bracketing_burst=dict(wrapper=hex(blk.labels['bkt_wrap']), flag_ram=hex(BKT_FLAG_RAM),
+                                           frames=BKT_FRAMES),
                      release=dict(mode_item=hex(ID_REL_MODE), sub_item=hex(ID_REL_SUB), dispatcher=hex(DISPATCHER),
                                   menu_switch=hex(blk.labels['menu_switch']), store=hex(blk.labels['rel_store']),
                                   load=hex(blk.labels['rel_load']),
