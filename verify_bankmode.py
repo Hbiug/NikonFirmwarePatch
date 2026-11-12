@@ -36,6 +36,14 @@ BKT_HANDLER = 0x40D4D680
 SETUP_ROWS, SETUP_EVPTR = 0x43D596D8 - BASE, 0x43D59E68 - BASE
 SETUP_CALLBACKS = 0xA028ECA70 - 0xA02808000 + 0x4B13000
 N_TEXTS, TEXT_SLOT = 6, 16
+# focus shift end point (b8)
+FS_HIDE_SITES = (0x405EF0F4, 0x405EF110)
+FS_FRAME_SITE, FS_START_SITE = 0x40FCEA2C, 0x40FB3B64
+FS_ROWS, FS_EVPTR = 0x43DF8EF0 - BASE, 0x43DF90D8 - BASE
+FS_CALLBACKS = 0xA028E8060 - 0xA02808000 + 0x4B13000
+FS_TEXTS = (b'SET', b'OFF', b'--', b'~%d')
+FS_STOCK_CALLS = {0x40EC4544, 0x40C78518, 0x40C790DC, 0x40DB47F0, 0x40DB76B0, 0x40DB3F90, 0x4127D850, 0x403AF870,
+                  0x40399EF0, 0x405EF210, 0x403B26C0}
 
 
 def windows(version, tag, n, stock):
@@ -54,13 +62,23 @@ def windows(version, tag, n, stock):
         'shared language directory': (0x311C5A0, 36 * 8),
         'shared strings text': (0x770000, 0x10000),
         'shared string tables': (0x780000, 0x70000),
-        'new code, sub-page, state material': (0x8A0000, 0x2000),
+        'new code, sub-page, state material': (0x8A0000, 0x3000),
+        'focus shift cursor table address (low half)': (0x405EF4D0 - BASE, 4),
+        'focus shift cursor table address (high half)': (0x405EF4D8 - BASE, 4),
+        'focus shift cursor table count': (0x405EF4EC - BASE, 4),
         'Setup menu row 43': (SETUP_ROWS + 44 * 43, 44),
         'reused Setup row transition table (59 events)': (row_table, 59 * 32),
         'Setup menu refresh callback': (SETUP_CALLBACKS + 32, 8),
         'Setup menu hide site': (0x40597D8C - BASE, 4),
         'stub state callbacks': (pm.STATE_TABLE + pm.STATE_SIZE * pm.STATE_NEW + 0x28, 8),
         'stub state page record': (pm.STATE_TABLE + pm.STATE_SIZE * pm.STATE_NEW + 0x50, 8),
+        'focus shift page entry: show row 5': (FS_HIDE_SITES[0] - BASE, 4),
+        'focus shift page entry: show row 6': (FS_HIDE_SITES[1] - BASE, 4),
+        'focus shift per-frame remaining-shots load': (FS_FRAME_SITE - BASE, 4),
+        'focus shift start: No. of shots read': (FS_START_SITE - BASE, 4),
+        'focus shift page rows 5 and 6': (FS_ROWS + 44 * 5, 88),
+        'focus shift page row 5/6 transition pointers': (FS_EVPTR + 8 * 5, 16),
+        'focus shift page refresh callback': (FS_CALLBACKS + 32, 8),
     }
     return w
 
@@ -132,7 +150,10 @@ def verify(stock_raw, out_raw, version, tag):
                'dispatcher menu-bank call (link hook)', 'dispatcher custom-bank call (link hook)',
                'change-notice routine entry (second notice for linked switches)', 'Bracketing burst handler entry',
                'Setup menu hide site', 'new code, sub-page, state material', 'shared strings text',
-               'shared string tables'}
+               'shared string tables', 'focus shift page entry: show row 5', 'focus shift page entry: show row 6',
+               'focus shift per-frame remaining-shots load', 'focus shift start: No. of shots read',
+               'focus shift cursor table address (low half)', 'focus shift cursor table address (high half)',
+               'focus shift cursor table count'}
     for r in report:
         if r['start'] < CODE_REGION_END and not set(r['windows']) <= code_ok:
             raise ValueError(f'unexpected code-region change: {r}')
@@ -156,7 +177,8 @@ def verify(stock_raw, out_raw, version, tag):
     require(texts > 0 and texts % 4 == 0, 'value texts not found in the new code page')
     limit = BASE + 0x8A0000 + texts
     allowed_stock = {0x41012C84, 0x403AE0F8, 0x403B0048, 0x403B00B8, 0x40597E6C, 0x4050A6F0, 0x403F2920,
-                     0x403F645C, 0x41013A18, CUSTOM_THUNK, TXN_SET, S_MENU, S_CUSTOM, SET_ITEM, DISPATCHER, POST_COMMIT + 4, BKT_HANDLER + 4}
+                     0x403F645C, 0x41013A18, CUSTOM_THUNK, TXN_SET, S_MENU, S_CUSTOM, SET_ITEM, DISPATCHER, POST_COMMIT + 4,
+                     BKT_HANDLER + 4} | FS_STOCK_CALLS
     for a, m, o in rows_all:
         if a >= limit:
             break
@@ -164,9 +186,9 @@ def verify(stock_raw, out_raw, version, tag):
             tgt = int(o.split()[-1], 16)
             inside = BASE + 0x8A0000 <= tgt < limit
             require(inside or tgt in allowed_stock, f'branch at {a:#x} to unexpected {tgt:#x}')
-    texts_end = texts + N_TEXTS * TEXT_SLOT
+    texts_end = texts + (N_TEXTS + len(FS_TEXTS)) * TEXT_SLOT
     require(code_all[texts:texts_end] == b''.join(t.ljust(TEXT_SLOT, b'\0') for t in
-                                                (b'AUTO', b'KEEP', b'A+LINK', b'K+LINK', b'SAVED', b'FAILED')),
+                                                (b'AUTO', b'KEEP', b'A+LINK', b'K+LINK', b'SAVED', b'FAILED') + FS_TEXTS),
             'value texts differ')
     require(not any(code_all[texts_end:]), 'unexpected data after the value texts')
     calls = [(a, o) for a, m, o in rows_all if a < limit and m == 'bl' and int(o.split()[-1], 16) == native[0]]
@@ -228,6 +250,62 @@ def verify(stock_raw, out_raw, version, tag):
     require(sum(1 for a, m, o in code_rows if m == 'bl' and int(o.split()[-1], 16) == bn[0]) == 1,
             'bracketing-burst wrapper: expected one call of the stock handler')
     require(struct.unpack_from('<I', eg0, BKT_HANDLER - BASE)[0] == 0xF81D0FF6, 'stock bracketing-burst entry differs')
+    # focus shift end point: the two stock sites are `bl`s into the new code, the hide calls now show, refresh wrapped
+    def bl_into(site, stock_word, name):
+        require(struct.unpack_from('<I', eg0, site - BASE)[0] == stock_word, f'stock {name} differs')
+        w = struct.unpack_from('<I', eg1, site - BASE)[0]
+        require(w >> 26 == 0b100101, f'{name} is not a bl')
+        d = w & 0x3FFFFFF
+        tgt = site + ((d - (1 << 26) if d & (1 << 25) else d) << 2)
+        require(BASE + 0x8A0000 <= tgt < limit, f'{name}: target outside the new code')
+        return tgt
+    remain = bl_into(FS_FRAME_SITE, 0xB9400108, 'focus shift remaining-shots load')
+    shots = bl_into(FS_START_SITE, 0x94017C48, 'focus shift No. of shots read')
+    i = addrs.index(remain)
+    body = code_rows[i:i + 64]
+    end = next(k for k, (a, m, o) in enumerate(body) if m == 'ret')
+    body = body[:end + 1]
+    saves = [o for a, m, o in body[:8] if m == 'stp']
+    loads = [o for a, m, o in body if m == 'ldp' and o.startswith('x')]
+    require(body[0][1:] == ('sub', 'sp, sp, #0x70') and body[-2][1:] == ('add', 'sp, sp, #0x70'), 'fs_remain frame')
+    for pair in ('x0, x1', 'x2, x3', 'x4, x5', 'x6, x7', 'x19, x20', 'x21, x22'):
+        require(any(o.startswith(pair) for o in saves) and any(o.startswith(pair) for o in loads),
+                f'fs_remain does not preserve {pair}')
+    require(body[-10][1:] == ('mov', 'w8, w20'), 'fs_remain must return the count in w8')
+    first = code_rows[addrs.index(shots) + 1]
+    require(first[1] == 'bl' and int(first[2].split()[-1], 16) == 0x41012C84, 'fs_shots must start with the stock read')
+    for site in FS_HIDE_SITES:
+        require(struct.unpack_from('<I', eg0, site - BASE)[0] == 0x320003E2 and
+                struct.unpack_from('<I', eg1, site - BASE)[0] == 0x2A1F03E2, f'focus shift row show site {site:#x}')
+    require(struct.unpack_from('<Q', eg0, FS_CALLBACKS + 32)[0] == 0x405EF210, 'stock focus shift refresh callback')
+    refresh = struct.unpack_from('<Q', eg1, FS_CALLBACKS + 32)[0]
+    require(BASE + 0x8A0000 <= refresh < limit and by_addr[refresh][0] == 'stp', 'focus shift refresh wrapper')
+    calls = [int(o.split()[-1], 16) for a, m, o in code_rows[addrs.index(refresh):addrs.index(refresh) + 6] if m == 'bl']
+    require(calls == [0x405EF210], 'focus shift refresh wrapper must call the stock refresh first')
+    for k in (5, 6):
+        t = struct.unpack_from('<Q', eg1, FS_EVPTR + 8 * k)[0] - BASE
+        require(0x8A1000 <= t < 0x8A3000, f'focus shift row {k}: transition table outside the new material')
+        actions = set()
+        j = 0
+        while True:
+            e, act, g, tg = struct.unpack_from('<4Q', eg1, t + 32 * j)
+            if BASE + 0x8A0000 <= act < limit:
+                actions.add(act)
+                require(tg == 0x68C and e in (0x286, 0x28B, 0x2AE), f'focus shift row {k}: our action on event {e:#x}')
+            j += 1
+            if e == 0x3BB:
+                break
+        require(len(actions) == 1 and by_addr[next(iter(actions))][0] == 'stp', f'focus shift row {k}: action')
+    # focus shift cursor table: the stock nine entries plus the end point row, loaded by the patched mov/movk/mov
+    require(struct.unpack_from('<3I', eg0, 0x405EF4D0 - BASE)[::2] == (0xD293DA16, 0xF2A85656) and
+            struct.unpack_from('<I', eg0, 0x405EF4EC - BASE)[0] == 0x52800121, 'stock focus shift cursor code')
+    lo, hi = (struct.unpack_from('<I', eg1, a - BASE)[0] for a in (0x405EF4D0, 0x405EF4D8))
+    require(lo & 0xFFE0001F == 0xD2800016 and hi & 0xFFE0001F == 0xF2A00016, 'focus shift cursor table load shape')
+    nav = ((hi >> 5) & 0xFFFF) << 16 | ((lo >> 5) & 0xFFFF)
+    require(BASE + 0x8A1000 <= nav < BASE + 0x8A3000, 'focus shift cursor table outside the new material')
+    require(struct.unpack_from('<I', eg1, 0x405EF4EC - BASE)[0] == 0x52800141, 'focus shift cursor table count is not 10')
+    stock_nav = eg0[0x42B29ED0 - BASE:0x42B29ED0 - BASE + 72]
+    require(eg1[nav - BASE:nav - BASE + 80] == stock_nav + struct.pack('<IHH', 0x2C86, 0xFFFF, 1), 'focus shift cursor table content')
     # link banks: the two dispatcher calls
 
     def bl_target(site):

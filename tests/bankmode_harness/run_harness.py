@@ -31,6 +31,17 @@ def _nop_first(data, lo, hi, base, mask, value):
     raise SystemExit('mutation site not found')
 
 
+def _always(data, lo, hi, base, cond_word):
+    """Turn the first b.<cond> (low 5 bits = condition) in lo..hi into an unconditional branch to the same target."""
+    for a, w in _words(data, lo, hi, base):
+        if w & 0xFF00001F == cond_word:
+            imm = (w >> 5) & 0x7FFFF
+            imm = imm - (1 << 19) if imm & (1 << 18) else imm
+            struct.pack_into('<I', data, a - base, 0x14000000 | (imm & 0x3FFFFFF))
+            return
+    raise SystemExit('mutation site not found')
+
+
 MUTATIONS = {
     # bracketing is switched on even when it is already on (the press test of the shot number is gone)
     'bkt-always-on': lambda d, L, b: _nop_first(d, L['bkt_wrap'] + 0x44, L['bw_call'], b, 0xFF000000, 0x35000000),
@@ -45,6 +56,12 @@ MUTATIONS = {
     'release-no-check': lambda d, L, b: _nop_first(d, L['rel_load'], L['rl_sub'], b, 0xFF00001F, 0x54000001),
     # leaving a bank stores the release mode even with keep stored settings
     'release-store-with-keep': lambda d, L, b: _nop_first(d, L['menu_switch'], L['ms_switch'], b, 0xFF000000, 0x37000000),
+    # focus shift: the "end point reached" test is gone (the sequence never stops at the end point)
+    'fs-no-stop': lambda d, L, b: _always(d, L['fs_remain'], L['rm_more'], b, 0x5400000C),
+    # focus shift: the run is never extended when the estimate runs out before the end point
+    'fs-no-extend': lambda d, L, b: struct.pack_into('<I', d, L['rm_more'] - b, 0x14000000 | ((L['rm_out'] - L['rm_more']) // 4)),
+    # focus shift: the direction of the step is ignored (negative pulses per step)
+    'fs-no-direction': lambda d, L, b: _nop_first(d, L['fs_est'], L['est_dir'], b, 0xFFFFFFFF, 0x4B0803E8),
     # the gate no longer looks at the keep bit: live->bank stores are always skipped
     'gate-always-skips': lambda d, L, b: _nop_first(d, L['gate'], L['native'], b, 0xFF000000, 0x36000000),
 }
@@ -75,8 +92,13 @@ def main():
         f'#define LIST_EXT {P.LIST_EXT:#x}UL', f'#define N_EXT {P.N_EXT}',
         f'#define LIST_CUSTOM {P.LIST_CUSTOM:#x}UL', f'#define N_CUSTOM {P.N_CUSTOM}',
         f'#define SWITCH_ADDR {P.SWITCH_RAM:#x}UL',
+        f'#define FS_END0 {P.FS_END0:#x}UL', f'#define FS_REMAIN {P.FS_REMAIN:#x}UL', f'#define FS_DIV_TABLE {P.FS_DIV_TABLE:#x}UL',
+        f'#define ID_FS_SHOTS {P.ID_FS_SHOTS:#x}u', f'#define ID_FS_WIDTH {P.ID_FS_WIDTH:#x}u',
+        f'#define FS_ITEM_SET {P.FS_ITEM_SET:#x}u', f'#define FS_ITEM_SHOTS {P.FS_ITEM_SHOTS:#x}u',
         f'#define THUNK_MENU {th(P.THUNK_MENU_WORDS)}', f'#define THUNK_CUSTOM {th(P.THUNK_CUSTOM_WORDS)}', '']))
-    defs = [f'--defsym=hook_{n}={L[n]:#x}' for n in ('gate', 'save', 'has_prev', 'hook_menu', 'hook_custom', 'link_sync', 'texts', 'post_wrap', 'bkt_wrap')]
+    defs = [f'--defsym=hook_{n}={L[n]:#x}' for n in ('gate', 'save', 'has_prev', 'hook_menu', 'hook_custom', 'link_sync', 'texts', 'post_wrap', 'bkt_wrap',
+                                                 'fs_end_get', 'fs_pps', 'fs_est', 'fs_shots', 'fs_remain', 'fs_refresh',
+                                                 'fs_set_end', 'fs_clear_end')]
     obj = a.out / 'harness.o'
     run = lambda *c: subprocess.run(c, check=True)
     run('clang', '--target=aarch64-none-elf', '-O1', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',

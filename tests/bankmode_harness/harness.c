@@ -46,7 +46,7 @@ enum { K_SMENU = 1, K_SCUSTOM, K_COPY, K_SETITEM, K_DISP, K_POST, K_BKT };
 struct rec { u32 kind; u64 a, b, c, d; };
 static struct rec L[64];
 static int nlog;
-static u32 ds_menu, ds_custom, ds_ext, ds_relmode, ds_relsub, ds_bktshots, ds_bktdir;
+static u32 ds_menu, ds_custom, ds_ext, ds_relmode, ds_relsub, ds_bktshots, ds_bktdir, ds_fsshots, ds_fswidth;
 #define BKTFLAG (*(volatile u8 *)(SWITCH_ADDR + 2))
 #define REL(bank) ((volatile u8 *)(SWITCH_ADDR + 0x2D0UL * ((bank) + 1)))   /* data byte, then its complement */
 static u32 s_menu_result = 1, s_custom_result = 1;
@@ -64,6 +64,8 @@ __attribute__((section(".s_getds"), noinline, used)) u32 st_getds(u32 id) {
     if (id == ID_REL_SUB) return ds_relsub;
     if (id == ID_BKT_SHOTS) return ds_bktshots;
     if (id == ID_BKT_DIR) return ds_bktdir;
+    if (id == ID_FS_SHOTS) return ds_fsshots;
+    if (id == ID_FS_WIDTH) return ds_fswidth;
     return 0;
 }
 __attribute__((section(".s_txnset"), noinline, used)) void st_txnset(u32 id, u32 value, struct txn *t) {
@@ -199,6 +201,232 @@ static void dump(void) {
 __attribute__((used)) void fault(u64 elr, u64 far) {
     puts_("FAIL unexpected exception at "); puthex(elr); puts_(" far "); puthex(far); putc_('\n');
     halt(3);
+}
+
+
+/* ---- focus shift end point: stubs of the lens / menu routines ------------------------------------------------ */
+static int p_a0, p_a1, p_b0, p_b1;            /* the two (denominator, value) properties 0x2103 / 0x2821 */
+static u32 r_num, r_den;                       /* 0x40C790DC result */
+static int k_val, k_ok;                        /* lens coefficient model: pulses*256 = amount * k_val */
+static int lens_pos;
+static int fs_calls_refresh, fs_calls_redraw;
+static u64 fs_last_state;
+struct shown { u32 item, slot; char text[16]; };
+static struct shown shown[8];
+static int nshown;
+static char pending[16];
+static u32 pending_slot;
+__attribute__((section(".s_prop"), noinline, used)) u32 st_prop(u32 id, u32 size, int *buf) {
+    if (size != 8) return 0;
+    if (id == 0x2103) { buf[0] = p_a0; buf[1] = p_a1; }
+    if (id == 0x2821) { buf[0] = p_b0; buf[1] = p_b1; }
+    return 1;
+}
+__attribute__((section(".s_rescale"), noinline, used)) u32 st_rescale(int a0, int *b) {   /* as stock 0x40C78518 */
+    if (a0 > 0x400 || a0 == -1) return 0;
+    if (b[0] == -1 || b[0] > 0x400) return 0;
+    if (b[0] == a0) return 1;
+    b[1] = b[1] * a0 / b[0]; b[0] = a0;
+    return 1;
+}
+__attribute__((section(".s_ratio"), noinline, used)) void st_ratio(int *a, u32 *out) { (void)a; out[0] = r_num; out[1] = r_den; }
+__attribute__((section(".s_lensk"), noinline, used)) u32 st_lensk(int *buf) { buf[0] = k_val; buf[1] = 1; buf[2] = k_ok ? 0x3200 : -1; return 1; }
+__attribute__((section(".s_def2pulse"), noinline, used)) u32 st_def2pulse(int *buf, int amount, int *out) {
+    if (buf[2] < 0) return 0;
+    *out = amount * buf[0];
+    return 1;
+}
+__attribute__((section(".s_lenspos"), noinline, used)) int st_lenspos(void) { return lens_pos; }
+__attribute__((section(".s_fsrefresh"), noinline, used)) u64 st_fsrefresh(u64 state) { fs_calls_refresh++; fs_last_state = state; return 0x77; }
+__attribute__((section(".s_redraw"), noinline, used)) void st_redraw(u64 state) { fs_calls_redraw++; fs_last_state = state; }
+__attribute__((section(".s_rowindex"), noinline, used)) int st_rowindex(u64 state, u32 item) { (void)state; return item == 0xDEAD ? -1 : (int)item; }
+__attribute__((section(".s_rowobj"), noinline, used)) u64 st_rowobj(u64 rows, int idx, u32 z) { (void)z; return rows ? 0x500000UL + (u64)idx : 0; }
+__attribute__((section(".s_settext"), noinline, used)) void st_settext(const char *t, u32 slot, u32 style) {
+    int i = 0;
+    for (; i < 15 && t[i]; i++) pending[i] = t[i];
+    pending[i] = 0;
+    pending_slot = slot;
+    if (style != 0x220) pending[0] = '!';
+}
+__attribute__((section(".s_setcontent"), noinline, used)) void st_setcontent(u64 obj, u32 slot) {
+    if (nshown < 8) { shown[nshown].item = (u32)(obj - 0x500000UL) | (slot == pending_slot ? 0 : 0x80000000u); shown[nshown].slot = slot;
+                      for (int i = 0; i < 16; i++) shown[nshown].text[i] = pending[i]; nshown++; }
+}
+__attribute__((section(".s_sprintf"), noinline, used)) int st_sprintf(char *buf, const char *fmt, int v) {
+    char *o = buf;
+    for (; *fmt; fmt++) {
+        if (fmt[0] == '%' && fmt[1] == 'd') {
+            char tmp[12]; int n = 0; u32 u = v < 0 ? (u32)-v : (u32)v;
+            if (v < 0) *o++ = '-';
+            do { tmp[n++] = '0' + u % 10; u /= 10; } while (u);
+            while (n) *o++ = tmp[--n];
+            fmt++;
+        } else *o++ = *fmt;
+    }
+    *o = 0;
+    return (int)(o - buf);
+}
+extern char hook_fs_end_get[], hook_fs_pps[], hook_fs_est[], hook_fs_shots[], hook_fs_remain[], hook_fs_refresh[];
+extern char hook_fs_set_end[], hook_fs_clear_end[];
+extern void call_remain(u64 *io);
+#define FSB(k) (*(volatile u8 *)(FS_END0 + 0x2D0UL * (k)))
+#define FS_REM (*(volatile u32 *)FS_REMAIN)
+#define FS_TOTAL (*(volatile u32 *)(FS_REMAIN + 0xA8))
+#define FS_WIDTH (*(volatile u32 *)(FS_REMAIN + 0xB0))
+#define DIVT ((volatile u8 *)FS_DIV_TABLE)
+static void fs_set(int has, int pos) {
+    u32 e = has ? ((u32)pos ^ 0x80000000u) : 0;
+    for (int k = 0; k < 4; k++) FSB(k) = (u8)(e >> (8 * k));
+}
+static u32 fs_raw(void) { u32 e = 0; for (int k = 0; k < 4; k++) e |= (u32)FSB(k) << (8 * k); return e; }
+static int ref_pps(int w) {
+    if (w < 1 || w > 10) return 0;
+    int b0 = p_b0, b1 = p_b1, bb[2] = {b0, b1};
+    st_rescale(p_a0, bb);
+    int diff = p_a1 - bb[1];
+    int q = p_a0 ? diff / p_a0 : 0;
+    int cls = q > 1 ? 0 : q == 1 ? 1 : q != 0 ? 3 : (diff <= 0 ? 3 : 2);
+    u32 v = r_den ? (r_num * 256000u) / r_den : 0;
+    int div = DIVT[cls * 10 + w - 1];
+    int d = div ? (int)v / div : 0;
+    if (!k_ok) return 0;
+    int out = (d / 1000) * k_val;
+    return out / 256;
+}
+static void fs_lens(int a0, int a1, int b0, int b1, u32 num, u32 den, int k) {
+    p_a0 = a0; p_a1 = a1; p_b0 = b0; p_b1 = b1; r_num = num; r_den = den; k_val = k; k_ok = 1;
+}
+static int shown_is(int i, u32 item, const char *t) {
+    if (i >= nshown || shown[i].item != item || shown[i].slot != (item == FS_ITEM_SHOTS ? 5u : 8u)) return 0;
+    for (int j = 0; j < 16; j++) { if (shown[i].text[j] != t[j]) return 0; if (!t[j]) return 1; }
+    return 1;
+}
+
+static void focus_tests(void) {
+    for (int c = 0; c < 4; c++) for (int i = 0; i < 10; i++) DIVT[c * 10 + i] = (u8)(90 - 8 * i - c);
+    /* storage */
+    fs_set(0, 0);
+    check(call(hook_fs_end_get, 0, 0, 0, 0) == 0, "focus end: nothing stored -> no end point");
+    u64 st[0x20]; for (int i = 0; i < 0x20; i++) st[i] = 0; st[9] = 0x1000;     /* state; +0x48 = row container */
+    u64 ctx[1] = { (u64)st };
+    lens_pos = -12345; fs_calls_refresh = fs_calls_redraw = 0; nshown = 0;
+    call(hook_fs_set_end, (u64)ctx, 0, 0, 0);
+    check(fs_raw() == ((u32)-12345 ^ 0x80000000u) && call(hook_fs_end_get, 0, 0, 0, 0) == 1,
+          "focus end: the action stores the current position (four padding bytes, position ^ 0x80000000)");
+    check(fs_calls_refresh == 1 && fs_calls_redraw == 1 && fs_last_state == (u64)st, "focus end: the action refreshes the page and redraws it");
+    lens_pos = 0; call(hook_fs_set_end, (u64)ctx, 0, 0, 0);
+    check(call(hook_fs_end_get, 0, 0, 0, 0) == 1, "focus end: position 0 is a valid end point");
+    call(hook_fs_clear_end, (u64)ctx, 0, 0, 0);
+    check(fs_raw() == 0 && call(hook_fs_end_get, 0, 0, 0, 0) == 0 && fs_calls_redraw == 3, "focus end: clear forgets it and redraws");
+    u8 relb[8]; for (int b = 0; b < 4; b++) { REL(b)[0] = (u8)(0x91 + b); REL(b)[1] = (u8)~(0x91 + b); relb[2 * b] = REL(b)[0]; relb[2 * b + 1] = REL(b)[1]; }
+    u8 sw0 = SWITCH, bk0 = BKTFLAG;
+    lens_pos = 0x7F00FF01; call(hook_fs_set_end, (u64)ctx, 0, 0, 0); call(hook_fs_clear_end, (u64)ctx, 0, 0, 0); lens_pos = -1; call(hook_fs_set_end, (u64)ctx, 0, 0, 0);
+    int same = SWITCH == sw0 && BKTFLAG == bk0;
+    for (int b = 0; b < 4; b++) same &= REL(b)[0] == relb[2 * b] && REL(b)[1] == relb[2 * b + 1];
+    check(same && call(hook_fs_end_get, 0, 0, 0, 0) == 1, "focus end: switch, bracketing and release-mode bytes untouched by the end point");
+    /* pulses per step: the stock arithmetic, every width and aperture class */
+    int bad = 0;
+    int cls_cases[4][4] = { {10, 56, 10, 30}, {10, 56, 10, 40}, {10, 56, 10, 50}, {10, 40, 10, 56} };   /* q=2, 1, 0+, <0 */
+    for (int c = 0; c < 4; c++) {
+        fs_lens(cls_cases[c][0], cls_cases[c][1], cls_cases[c][2], cls_cases[c][3], 500, 100, 5000);
+        for (int w = 0; w <= 11; w++) {
+            long got = call(hook_fs_pps, (u64)w, 0, 0, 0);
+            if ((int)got != ref_pps(w)) { bad++; puts_("    pps class "); puthex(c); puts_(" width "); puthex(w); puts_(" got "); puthex((u32)got);
+                                           puts_(" want "); puthex((u32)ref_pps(w)); putc_('\n'); }
+        }
+    }
+    check(!bad, "focus pps: same as the stock step arithmetic for 4 aperture classes x widths 0..11 (0 outside 1..10)");
+    fs_lens(10, 56, 20, 80, 500, 100, 5000);                       /* the second property has another denominator */
+    check((int)call(hook_fs_pps, 5, 0, 0, 0) == ref_pps(5) && ref_pps(5) > 0, "focus pps: property rescaled to the first denominator");
+    fs_lens(10, 56, 10, 40, 500, 100, -5000);
+    check((int)call(hook_fs_pps, 3, 0, 0, 0) == ref_pps(3) && ref_pps(3) < 0, "focus pps: negative lens coefficient gives a negative step (rounded toward zero)");
+    fs_lens(10, 56, 10, 40, 500, 100, 5000); k_ok = 0;
+    check(call(hook_fs_pps, 3, 0, 0, 0) == 0, "focus pps: no lens data -> 0");
+    /* estimate */
+    fs_lens(10, 56, 10, 40, 500, 100, 5000);
+    int p = ref_pps(5);
+    lens_pos = 100000;
+    fs_set(1, 100000 - 10 * p - 5);
+    check(call(hook_fs_est, 5, 0, 0, 0) == 12, "focus estimate: 10 steps and a bit -> 12 frames (last frame at or past the end)");
+    fs_set(1, 100000 - 10 * p);
+    check(call(hook_fs_est, 5, 0, 0, 0) == 11, "focus estimate: exactly 10 steps -> 11 frames");
+    fs_set(1, 100000);
+    check(call(hook_fs_est, 5, 0, 0, 0) == 1, "focus estimate: end point = start -> 1 frame");
+    fs_set(1, 100001);
+    check((int)call(hook_fs_est, 5, 0, 0, 0) == -1, "focus estimate: end point behind the start -> -1");
+    fs_set(1, 100000 - 1000 * p);
+    check(call(hook_fs_est, 5, 0, 0, 0) == 300, "focus estimate: capped at 300");
+    fs_set(0, 0);
+    check(call(hook_fs_est, 5, 0, 0, 0) == 0, "focus estimate: no end point -> 0");
+    fs_set(1, 0); k_ok = 0;
+    check(call(hook_fs_est, 5, 0, 0, 0) == 0, "focus estimate: no lens data -> 0");
+    fs_lens(10, 56, 10, 40, 500, 100, -5000); p = ref_pps(5);
+    fs_set(1, 100000 - 10 * p);                                     /* p < 0: the end point lies at higher positions */
+    check(call(hook_fs_est, 5, 0, 0, 0) == 11, "focus estimate: negative step direction handled");
+    fs_set(1, 99000);
+    check((int)call(hook_fs_est, 5, 0, 0, 0) == -1, "focus estimate: negative step, end point behind -> -1");
+    /* sequence start */
+    fs_lens(10, 56, 10, 40, 500, 100, 5000); p = ref_pps(5);
+    ds_fsshots = 100; ds_fswidth = 5; lens_pos = 50000;
+    fs_set(0, 0);
+    check(call(hook_fs_shots, ID_FS_SHOTS, 0, 0, 0) == 100, "focus start: no end point -> the stock No. of shots");
+    fs_set(1, 50000 - 20 * p);
+    check(call(hook_fs_shots, ID_FS_SHOTS, 0, 0, 0) == 21, "focus start: end point set -> the estimate replaces No. of shots");
+    fs_set(1, 60000);
+    check(call(hook_fs_shots, ID_FS_SHOTS, 0, 0, 0) == 100 && fs_raw() == 0, "focus start: end point behind the start -> stock run, end point forgotten");
+    fs_set(1, 0); k_ok = 0;
+    check(call(hook_fs_shots, ID_FS_SHOTS, 0, 0, 0) == 100 && fs_raw() != 0, "focus start: no lens data -> stock run, end point kept");
+    /* after every shot */
+    fs_lens(10, 56, 10, 40, 500, 100, 5000); p = ref_pps(5);
+    u64 io[9];
+    #define REMAIN_CALL() do { for (int i = 0; i < 8; i++) io[i] = 0xAB00 + i; call_remain(io); } while (0)
+    #define REGS_OK() (io[0] == 0xAB00 && io[1] == 0xAB01 && io[2] == 0xAB02 && io[3] == 0xAB03 && io[4] == 0xAB04 && io[5] == 0xAB05 && io[6] == 0xAB06 && io[7] == 0xAB07)
+    fs_set(0, 0); FS_REM = 7; FS_TOTAL = 10; FS_WIDTH = 5; lens_pos = 1000;
+    REMAIN_CALL();
+    check((u32)io[8] == 7 && FS_REM == 7 && REGS_OK(), "focus frame: no end point -> stock count, x0..x7 preserved");
+    fs_set(1, 1000 - 3 * p); FS_REM = 5;
+    REMAIN_CALL();
+    check((u32)io[8] == 5 && FS_REM == 5 && FS_TOTAL == 10 && REGS_OK(), "focus frame: end point ahead -> keep going");
+    lens_pos = 1000 - 3 * p;
+    REMAIN_CALL();
+    check((u32)io[8] == 0 && FS_REM == 0 && REGS_OK(), "focus frame: at the end point -> that was the last frame");
+    lens_pos = 1000 - 3 * p - 1; FS_REM = 5;
+    REMAIN_CALL();
+    check((u32)io[8] == 0 && FS_REM == 0, "focus frame: past the end point -> stop");
+    lens_pos = 1000; FS_REM = 0; FS_TOTAL = 12;
+    REMAIN_CALL();
+    check((u32)io[8] == 1 && FS_REM == 1 && FS_TOTAL == 13 && REGS_OK(), "focus frame: estimate used up before the end point -> one more frame");
+    FS_REM = 0; FS_TOTAL = 300;
+    REMAIN_CALL();
+    check((u32)io[8] == 0 && FS_REM == 0 && FS_TOTAL == 300, "focus frame: never beyond 300 frames");
+    FS_REM = 4; FS_WIDTH = 0;
+    REMAIN_CALL();
+    check((u32)io[8] == 4 && FS_REM == 4, "focus frame: unknown step (width 0) -> stock count even with an end point");
+    fs_lens(10, 56, 10, 40, 500, 100, -5000); p = ref_pps(5);
+    FS_WIDTH = 5; lens_pos = 1000; fs_set(1, 1000 - 3 * p); FS_REM = 5;
+    REMAIN_CALL();
+    check((u32)io[8] == 5, "focus frame: negative step, end point ahead -> keep going");
+    lens_pos = 1000 - 3 * p + 1;
+    REMAIN_CALL();
+    check((u32)io[8] == 0, "focus frame: negative step, past the end point -> stop");
+    /* page texts */
+    fs_lens(10, 56, 10, 40, 500, 100, 5000); p = ref_pps(5);
+    ds_fswidth = 5; lens_pos = 20000;
+    fs_set(0, 0); nshown = 0; fs_calls_refresh = 0;
+    long rr = call(hook_fs_refresh, (u64)st, 0, 0, 0);
+    check(rr == 0x77 && fs_calls_refresh == 1 && nshown == 1 && shown_is(0, FS_ITEM_SET, "OFF"), "focus page: stock refresh first, then OFF on the end point row; No. of shots untouched");
+    fs_set(1, 20000 - 41 * p); nshown = 0;
+    call(hook_fs_refresh, (u64)st, 0, 0, 0);
+    check(nshown == 2 && shown_is(0, FS_ITEM_SET, "SET") && shown_is(1, FS_ITEM_SHOTS, "~42"), "focus page: SET (text slot 8), and ~42 on the No. of shots row (its own slot 5)");
+    fs_set(1, 20001); nshown = 0;
+    call(hook_fs_refresh, (u64)st, 0, 0, 0);
+    check(nshown == 2 && shown_is(1, FS_ITEM_SHOTS, "--"), "focus page: end point behind the current position -> --");
+    st[9] = 0; nshown = 0;
+    call(hook_fs_refresh, (u64)st, 0, 0, 0);
+    check(nshown == 0, "focus page: no row object -> nothing written");
+    st[9] = 0x1000;
+    nshown = 0; call(hook_fs_refresh, 0, 0, 0, 0);
+    check(nshown == 0, "focus page: no state -> stock refresh only");
 }
 
 void main_(void) {
@@ -449,6 +677,7 @@ save_done:
     T.count = 0;
     check(call(hook_has_prev, 5, (u64)&T, 0, 0) == 0, "has_prev: empty transaction");
 
+    focus_tests();
     check(canary_bad == 0, "callee-saved registers x19..x29 and sp preserved by every routine called");
     if (canary_bad) { puts_("    canary mask "); puthex(canary_bad); putc_('\n'); }
     puts_("checks "); puthex(checks); puts_(" failures "); puthex(failures); putc_('\n');
@@ -475,6 +704,19 @@ __asm__(".section .text.start,\"ax\"\n"
         "    bl fault\n"
         ".balign 128\n"
         ".endr\n"
+        ".global call_remain\n"
+        "call_remain:\n"                                  /* io[0..7] -> x0..x7, x8 = remaining-shots address; back: x0..x8 */
+        "    stp x29, x30, [sp, #-0x20]!\n"
+        "    str x0, [sp, #0x10]\n"
+        "    mov x9, x0\n"
+        "    ldp x0, x1, [x9]\n    ldp x2, x3, [x9, #16]\n    ldp x4, x5, [x9, #32]\n    ldp x6, x7, [x9, #48]\n"
+        "    ldr x8, =0xA03BC8070\n"
+        "    bl hook_fs_remain\n"
+        "    ldr x9, [sp, #0x10]\n"
+        "    stp x0, x1, [x9]\n    stp x2, x3, [x9, #16]\n    stp x4, x5, [x9, #32]\n    stp x6, x7, [x9, #48]\n"
+        "    str x8, [x9, #64]\n"
+        "    ldp x29, x30, [sp], #0x20\n"
+        "    ret\n"
         ".global call_canary\n"
         "call_canary:\n"                                  /* (fn, a0..a3, regs) */
         "    stp x29, x30, [sp, #-0x70]!\n"

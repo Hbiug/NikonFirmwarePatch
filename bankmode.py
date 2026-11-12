@@ -27,6 +27,7 @@ def build(eg, version, tag):
     require(re.fullmatch(r'[a-z][0-9]', tag), 'Tag must be a lowercase letter and digit')
     public = public_words(version)
     shared.STRING_IDS['bank-store'] = (bp.STRING_FIRST, bp.STRING_COUNT)
+    shared.STRING_IDS['focus-end'] = (bp.FS_STRING_FIRST, bp.FS_STRING_COUNT)
     strings = shared.Strings()
     img, detail = bp.build_main(eg, strings)
     detail['shared_strings'] = strings.emit(img)
@@ -71,7 +72,7 @@ def main():
     report.update(status='BUILT', input_sha256=package.sha256, input_filename=a.firmware.name,
                   output_sha256=sha(packet), output_bytes=len(packet), output_filename=name,
                   output_eg_sha256=sha(eg), input_modules=package.modules, output_modules=checked.modules,
-                  scope='Menu-bank behaviour option only; static checks only until tested in the emulator and on a camera')
+                  scope='Menu-bank behaviour option, link banks, per-bank release mode, bracketing burst hold, focus shift end point; static and instruction-level checks, emulator menu runs; not all paths camera-tested')
     a.output.mkdir(parents=True, exist_ok=False)
     with (a.output / name).open('xb') as f:
         f.write(packet)

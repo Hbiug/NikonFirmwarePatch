@@ -22,6 +22,12 @@ always holds the last settings used in it.  This patch adds a Z7-style alternati
     left remembers it (auto-store, or the explicit save command), the bank being entered sets it again through the
     stock dispatcher.  It is kept outside the stock bank lists (see ID_REL_MODE below).
 
+  * Focus shift end point (b8): two hidden rows of the Focus shift shooting page become "Focus end point" (OK stores the
+    current focus position; the row shows SET / OFF) and "Clear focus end point".  With an end point the No. of shots
+    row shows the estimated number of frames (~N, or -- when the end point is behind the current focus position), the
+    sequence start uses that estimate as the number of shots, and the run ends once focus is at or past the end point
+    (extended frame by frame, up to 300, if the estimate runs out first).  See FS_* below.
+
 The switch lives in the padding byte after the one-byte item 0x12:0x38 of the live movie block, which
 the data store persists with the block and which the bank copy never touches (so it is global, not
 per bank, and 0 = stock behaviour after a factory reset).  Bit 0 = keep stored settings (Z7 style), bit 1 = link
@@ -98,6 +104,48 @@ ITEM_BLOCK_LIVE = 0xA03D5C0DC    # live address of item 0x1238 (type 0, one byte
 SWITCH_RAM = ITEM_BLOCK_LIVE + 1
 SWITCH_ITEM_DEFAULT_OFF = pm.MOVIE_DEFAULTS + (ITEM_BLOCK_LIVE - pm.MOVIE_BLOCK)
 
+# ---- focus shift end point (b8) -------------------------------------------------------------------------------
+# Focus shift shooting (state 0xB1) moves focus by a relative step per frame: 0x40FCE9DC runs after every shot (the
+# remaining-shots counter FS_REMAIN is already decremented; 0 ends the sequence), then 0x40FDEE64(step width) turns
+# the step width into a defocus amount and queues lens request type 4, which the lens service turns into lens pulses
+# (0x40DB47F0 lens coefficients + 0x40DB76B0) and subtracts from the current focus position (0x40DB3F90).
+# The patch remembers one focus position as the end point and
+#   * at the sequence start (0x40FB3AC0 reads "No. of shots" with GetDS at FS_START_SITE) replaces the number of shots
+#     with the estimate ceil(|start - end| / pulses per step) + 1 (at most 300),
+#   * after every shot (FS_FRAME_SITE, the load of the remaining-shots counter) ends the sequence once the lens is at or
+#     past the end point, and adds a frame while it is not there yet and the estimate ran out (at most 300 in total),
+#   * shows the end point state and the estimate on the focus shift page (two hidden stock rows, items 0x2C86 and
+#     0x2C4F, made visible: "Focus end point" and "Clear focus end point").
+# The end point is kept in the four free padding bytes of the bank slots of the carrier item (third padding byte of
+# slots A..D), as position ^ 0x80000000 so that 0 means "no end point".
+FS_END0 = ITEM_BLOCK_LIVE + 3 + REL_SLOT_STEP          # low byte; the next ones follow at +0x2D0 each
+FS_REMAIN, FS_TOTAL_OFF, FS_WIDTH_OFF = 0xA03BC8070, 0xA8, 0xB0   # focus shift run state: remaining, total, step width
+ID_FS_SHOTS, ID_FS_WIDTH = 0x2000530, 0x2000531
+FS_MAX_SHOTS = 300
+F_LENS_POS = 0x40DB3F90                                # current focus position (lens pulses)
+F_PROP, F_RESCALE, F_RATIO = 0x40EC4544, 0x40C78518, 0x40C790DC   # the helpers 0x40FDEE64 uses
+FS_DIV_TABLE = 0xA029C8A84                             # [aperture class 0..3][step width 1..10] divisors
+F_LENS_K, F_DEF2PULSE = 0x40DB47F0, 0x40DB76B0         # lens coefficients; defocus -> pulses * 256
+F_SPRINTF, F_ROW_INDEX, F_ROW_OBJ, F_REDRAW = 0x4127D850, 0x403AF870, 0x40399EF0, 0x403B26C0
+FS_FRAME_SITE, FS_FRAME_STOCK = 0x40FCEA2C, 0xB9400108             # ldr w8,[x8]   (x8 = FS_REMAIN)
+FS_START_SITE, FS_START_STOCK = 0x40FB3B64, 0x94017C48             # bl GetDS      (w0 = 0x2000530)
+FS_HIDE_SITES, FS_HIDE_STOCK, FS_SHOW = (0x405EF0F4, 0x405EF110), 0x320003E2, 0x2A1F03E2   # orr w2,wzr,#1 -> mov w2,wzr
+FS_ROWS, FS_EVPTR, FS_COUNT = 0x43DF8EF0 - BASE, 0x43DF90D8 - BASE, 11
+FS_ROW_SET, FS_ROW_CLEAR, FS_ROW_SHOTS, FS_ROW_RESET = 5, 6, 1, 7
+FS_ITEM_SET, FS_ITEM_CLEAR, FS_ITEM_SHOTS = 0x2C86, 0x2C4F, 0x2C1F
+FS_SLOT_SHOTS, FS_SLOT_SET = 5, 8
+# cursor up / down on the focus shift page (0x405EF4BC) only moves from a row whose item is in the 9-entry table
+# {item u32, up -1, down +1} at 0x42B29ED0 (searched by 0x403EB4D4); 0x2C4F is listed, 0x2C86 is not.  The table is
+# copied with a tenth entry for 0x2C86 and the two instructions that load its address and count are changed.
+FS_NAV_TABLE, FS_NAV_COUNT = 0x42B29ED0, 9
+FS_NAV_SITES = {0x405EF4D0: 0xD293DA16, 0x405EF4D8: 0xF2A85656, 0x405EF4EC: 0x52800121}   # mov x22,#lo; movk x22,#hi; mov w1,#9
+FS_GUI_LIMIT = 0x8A3000                     # global text slots (stock page: 5 shots, 6 step width, 7 interval)
+FS_CALLBACKS = 0xA028E8060 - 0xA02808000 + 0x4B13000   # five pointers of state 0xB1 (data image)
+F_FS_REFRESH, F_FS_TOGGLE = 0x405EF210, 0x4051226C
+FS_TEXT = (b'SET', b'OFF', b'--', b'~%d')             # after STATE_TEXT, same 16-byte slots
+FS_ENGLISH = ('Focus end point', 'Clear focus end point')
+FS_STRING_FIRST, FS_STRING_COUNT = 3143, 2
+
 # ---- new material (same text-gap regions as the ProRes row; this patch does not combine with it) ------------
 # ---- the row lives in the Setup menu (state 0x297), in the slot of its last row "Special shooting" (item 0x3968), which
 # the stock entry callback hides unless internal flag 0x14 is set.  b0..b5 had the row in the Video recording menu.
@@ -173,6 +221,343 @@ def _switch_byte(b, rd):
     """wD = the persistent switch byte (bit 0 keep stored settings, bit 1 link the banks)."""
     b.mov_x64(rd, SWITCH_RAM)
     b.ldrb_w(rd, rd)
+
+
+
+def _r(b, word, text):
+    """Raw instruction with the text Capstone must read back (checked in code())."""
+    if not hasattr(b, 'expect'):
+        b.expect = {}
+    b.expect[len(b.items)] = text
+    b.raw(word)
+
+
+def _norm(text):
+    """Disassembly text with every immediate in hex and single spaces."""
+    import re
+    return re.sub(r'#(-?)(0x[0-9a-f]+|\d+)', lambda m: '#' + m.group(1) + hex(int(m.group(2), 0)), ' '.join(text.replace('#-#', '#-').split()))
+
+
+def _adr_text(b, rd, slot):
+    """adr xD, value text `slot` (16-byte slots after the code, STATE_TEXT then FS_TEXT)."""
+    def make(pc):
+        delta = _imm(b.labels['texts'] + TEXT_SLOT_BYTES * slot - pc, 21, True)
+        return 0x10000000 | (delta & 3) << 29 | (delta >> 2) << 5 | rd
+    b._rel(make)
+
+
+def _focus(b):
+    """Focus shift end point: storage, estimate, per-frame stop, sequence start, page texts and the two row actions."""
+    t_set, t_off, t_dash, t_fmt = (len(STATE_TEXT) + k for k in range(4))
+    # fs_end_get -> w0 = 1 when an end point is stored, w1 = that position; uses x9..x13
+    b.label('fs_end_get')
+    b.mov_x64(9, FS_END0)
+    b.ldrb_w(10, 9)
+    b.ldrb_w(11, 9, REL_SLOT_STEP)
+    b.ldrb_w(12, 9, 2 * REL_SLOT_STEP)
+    b.ldrb_w(13, 9, 3 * REL_SLOT_STEP)
+    _r(b, 0x2A0B214A, 'orr w10, w10, w11, lsl #8')
+    _r(b, 0x2A0C414A, 'orr w10, w10, w12, lsl #16')
+    _r(b, 0x2A0D614A, 'orr w10, w10, w13, lsl #24')
+    b.cmp_wi(10, 0)
+    _r(b, 0x1A9F07E0, 'cset w0, ne')
+    _r(b, 0x52010141, 'eor w1, w10, #0x80000000')
+    b.ret()
+    # fs_end_put(w0 = encoded end point, 0 = none); uses x9
+    b.label('fs_end_put')
+    b.mov_x64(9, FS_END0)
+    for k in range(4):
+        if k:
+            _r(b, 0x53087C00, 'lsr w0, w0, #8')
+        b.strb_w(0, 9, k * REL_SLOT_STEP)
+    b.ret()
+    # fs_pps(w0 = step width 1..10) -> w0 = lens pulses one focus shift step subtracts from the position, 0 = unknown.
+    # The defocus amount is computed exactly as 0x40FDEE64 does, the pulses exactly as lens request type 4 does.
+    b.label('fs_pps')
+    _r(b, 0xD10183FF, 'sub sp, sp, #0x60')
+    b.str_x(20, 31, 0x48)
+    b.stp(19, 30, 0x50)
+    _r(b, 0x51000408, 'sub w8, w0, #1')
+    b.cmp_wi(8, 9)
+    b.b_cond('hi', 'pps_zero')
+    b.mov_wr(19, 0)
+    b.mov_w(0, 0x2103)
+    b.mov_w(1, 8)
+    b.add_xi(2, 31, 0x18)
+    b.bl(F_PROP)
+    b.mov_w(0, 0x2821)
+    b.mov_w(1, 8)
+    b.add_xi(2, 31, 0x8)
+    b.bl(F_PROP)
+    b.ldr_w(0, 31, 0x18)
+    b.add_xi(1, 31, 0x8)
+    b.bl(F_RESCALE)
+    _r(b, 0x294327E8, 'ldp w8, w9, [sp, #0x18]')
+    b.ldr_w(10, 31, 0xC)
+    b.sub_w(9, 9, 10)
+    _r(b, 0x1AC80D2A, 'sdiv w10, w9, w8')
+    b.mov_w(20, 0)                            # aperture class, as 0x40FDEE64: q > 1 -> 0, q == 1 -> 1,
+    b.cmp_wi(10, 1)                           # q < 0 -> 3, q == 0 -> 2 when the difference is positive, else 3
+    b.b_cond('gt', 'pps_class')
+    b.mov_w(20, 1)
+    b.b_cond('eq', 'pps_class')
+    b.mov_w(20, 3)
+    b.cbnz_w(10, 'pps_class')
+    b.cmp_wi(9, 0)
+    b.b_cond('le', 'pps_class')
+    b.mov_w(20, 2)
+    b.label('pps_class')
+    b.add_xi(0, 31, 0x18)
+    b.add_xi(1, 31, 0)
+    b.bl(F_RATIO)
+    _r(b, 0x294033EB, 'ldp w11, w12, [sp]')
+    b.mov_w(8, 0xE800)
+    b.movk_w16(8, 3)
+    _r(b, 0x1B087D68, 'mul w8, w11, w8')
+    _r(b, 0x1ACC0908, 'udiv w8, w8, w12')
+    b.mov_x64(9, FS_DIV_TABLE)
+    b.mov_w(10, 10)
+    b.madd_x(9, 20, 10, 9)
+    _r(b, 0x5100066A, 'sub w10, w19, #1')
+    b.ldrb_idx(10, 9, 10)
+    _r(b, 0x1ACA0D13, 'sdiv w19, w8, w10')  # defocus amount of one step (w8 = the scaled ratio)
+    _r(b, 0xA9027FFF, 'stp xzr, xzr, [sp, #0x20]')
+    b.str_w(31, 31, 0x30)
+    b.add_xi(0, 31, 0x20)
+    b.bl(F_LENS_K)
+    b.mov_w(8, 1000)
+    _r(b, 0x1AC80E61, 'sdiv w1, w19, w8')
+    b.add_xi(0, 31, 0x20)
+    b.add_xi(2, 31, 0x30)
+    b.bl(F_DEF2PULSE)
+    b.ldr_w(8, 31, 0x30)
+    _r(b, 0x1103FD09, 'add w9, w8, #0xff')
+    b.cmp_wi(8, 0)
+    _r(b, 0x1A88B128, 'csel w8, w9, w8, lt')
+    _r(b, 0x13087D00, 'asr w0, w8, #8')
+    b.b('pps_done')
+    b.label('pps_zero')
+    b.mov_w(0, 0)
+    b.label('pps_done')
+    b.ldr_x(20, 31, 0x48)
+    b.ldp(19, 30, 0x50)
+    _r(b, 0x910183FF, 'add sp, sp, #0x60')
+    b.ret()
+    # fs_est(w0 = step width) -> w0 = estimated frames from the current position to the end point (1..300),
+    # 0 = unknown (no end point or no lens data), -1 = the end point is not in the shift direction
+    b.label('fs_est')
+    b.stp_pre(19, 30, -0x20)
+    b.stp(20, 21, 0x10)
+    b.bl('fs_pps')
+    b.mov_wr(19, 0)
+    b.cbz_w(19, 'est_zero')
+    b.bl(F_LENS_POS)
+    b.mov_wr(20, 0)
+    b.bl('fs_end_get')
+    b.cbz_w(0, 'est_zero')
+    _r(b, 0x4B010288, 'sub w8, w20, w1')
+    b.cmp_wi(19, 0)
+    b.b_cond('ge', 'est_dir')
+    _r(b, 0x4B1303F3, 'neg w19, w19')
+    _r(b, 0x4B0803E8, 'neg w8, w8')
+    b.label('est_dir')
+    b.cmp_wi(8, 0)
+    b.b_cond('lt', 'est_bad')
+    _r(b, 0x1AD30909, 'udiv w9, w8, w19')
+    _r(b, 0x1B13A12A, 'msub w10, w9, w19, w8')
+    b.cmp_wi(10, 0)
+    _r(b, 0x1A890529, 'cinc w9, w9, ne')
+    _add_wi(b, 9, 9, 1)
+    b.cmp_wi(9, FS_MAX_SHOTS)
+    b.b_cond('ls', 'est_ok')
+    b.mov_w(9, FS_MAX_SHOTS)
+    b.label('est_ok')
+    b.mov_wr(0, 9)
+    b.b('est_done')
+    b.label('est_bad')
+    _r(b, 0x12800000, 'mov w0, #-1')
+    b.b('est_done')
+    b.label('est_zero')
+    b.mov_w(0, 0)
+    b.label('est_done')
+    b.ldp(20, 21, 0x10)
+    b.ldp_post(19, 30, 0x20)
+    b.ret()
+    # fs_shots(GetDS arguments): the sequence start's read of "No. of shots", replaced by the estimate when an end
+    # point is set; an end point on the wrong side of the start is forgotten (the run then is a stock run)
+    b.label('fs_shots')
+    b.stp_pre(19, 30, -0x10)
+    b.bl(GET_DS)
+    b.mov_wr(19, 0)
+    b.bl('fs_end_get')
+    b.cbz_w(0, 'sh_done')
+    _get(b, ID_FS_WIDTH)
+    b.bl('fs_est')
+    b.cmp_wi(0, 0)
+    b.b_cond('gt', 'sh_use')
+    b.b_cond('eq', 'sh_done')
+    b.mov_w(0, 0)
+    b.bl('fs_end_put')
+    b.b('sh_done')
+    b.label('sh_use')
+    b.mov_wr(19, 0)
+    b.label('sh_done')
+    b.mov_wr(0, 19)
+    b.ldp_post(19, 30, 0x10)
+    b.ret()
+    # fs_remain: replaces `ldr w8,[x8]` (remaining shots) after every shot; returns it in w8, x0..x7 preserved
+    b.label('fs_remain')
+    _r(b, 0xD101C3FF, 'sub sp, sp, #0x70')
+    for k in range(4):
+        b.stp(2 * k, 2 * k + 1, 0x10 * k)
+    b.stp(19, 20, 0x40)
+    b.stp(21, 22, 0x50)
+    b.str_x(30, 31, 0x60)
+    b.mov_x64(19, FS_REMAIN)
+    b.ldr_w(20, 19)
+    b.bl('fs_end_get')
+    b.cbz_w(0, 'rm_out')                      # no end point: stock
+    b.mov_wr(22, 1)
+    b.ldr_w(0, 19, FS_WIDTH_OFF)
+    b.bl('fs_pps')
+    b.cbz_w(0, 'rm_out')                      # no lens data: stock
+    b.mov_wr(21, 0)
+    b.bl(F_LENS_POS)
+    _r(b, 0x4B160008, 'sub w8, w0, w22')
+    b.cmp_wi(21, 0)
+    b.b_cond('ge', 'rm_dir')
+    _r(b, 0x4B0803E8, 'neg w8, w8')
+    b.label('rm_dir')
+    b.cmp_wi(8, 0)
+    b.b_cond('gt', 'rm_more')
+    b.str_w(31, 19)                           # at or past the end point: that was the last frame
+    b.mov_w(20, 0)
+    b.b('rm_out')
+    b.label('rm_more')
+    b.cbnz_w(20, 'rm_out')
+    b.ldr_w(8, 19, FS_TOTAL_OFF)              # estimate used up before the end point: one more frame
+    b.cmp_wi(8, FS_MAX_SHOTS)
+    b.b_cond('hs', 'rm_out')
+    _add_wi(b, 8, 8, 1)
+    b.str_w(8, 19, FS_TOTAL_OFF)
+    b.mov_w(20, 1)
+    b.str_w(20, 19)
+    b.label('rm_out')
+    b.mov_wr(8, 20)
+    for k in range(4):
+        b.ldp(2 * k, 2 * k + 1, 0x10 * k)
+    b.ldp(19, 20, 0x40)
+    b.ldp(21, 22, 0x50)
+    b.ldr_x(30, 31, 0x60)
+    _r(b, 0x9101C3FF, 'add sp, sp, #0x70')
+    b.ret()
+    # fs_row_text(text x0, item w1, state x2, text slot w3): the value text at the right of a focus shift row, as
+    # 0x405EF210 does.  A text slot is one global text resource that a row object is bound to, so every row on the page
+    # needs its own: the stock page uses 5 (No. of shots), 6 (step width), 7 (interval); the end point row uses 8.
+    b.label('fs_row_text')
+    b.stp_pre(19, 30, -0x30)
+    b.stp(20, 21, 0x10)
+    b.str_x(22, 31, 0x20)
+    b.mov_x(19, 2)
+    b.mov_x(20, 0)
+    b.mov_wr(21, 1)
+    b.mov_wr(22, 3)
+    b.mov_x(0, 19)
+    b.bl(F_ROW_INDEX)
+    _cmn_wi(b, 0, 1)
+    b.b_cond('eq', 'rt_done')
+    b.mov_wr(1, 0)
+    b.ldr_x(0, 19, 0x48)
+    b.mov_w(2, 0)
+    b.bl(F_ROW_OBJ)
+    b.cbz_x(0, 'rt_done')
+    b.mov_x(21, 0)
+    b.mov_x(0, 20)
+    b.mov_wr(1, 22)
+    b.mov_w(2, 0x220)
+    b.bl(pm.F_SET_TEXT)
+    b.mov_x(0, 21)
+    b.mov_wr(1, 22)
+    b.bl(pm.F_SET_CONTENT)
+    b.label('rt_done')
+    b.ldr_x(22, 31, 0x20)
+    b.ldp(20, 21, 0x10)
+    b.ldp_post(19, 30, 0x30)
+    b.ret()
+    # fs_texts(state): "SET" / "OFF" on the end point row; with an end point, "~N" (or "--") on the No. of shots row
+    b.label('fs_texts')
+    b.stp_pre(19, 30, -0x30)
+    b.str_x(20, 31, 0x10)
+    b.mov_x(19, 0)
+    b.bl('fs_end_get')
+    b.cbz_w(0, 'tx_off')
+    _adr_text(b, 0, t_set)
+    b.mov_w(1, FS_ITEM_SET)
+    b.mov_x(2, 19)
+    b.mov_w(3, FS_SLOT_SET)
+    b.bl('fs_row_text')
+    _get(b, ID_FS_WIDTH)
+    b.bl('fs_est')
+    b.cmp_wi(0, 0)
+    b.b_cond('le', 'tx_dash')
+    b.mov_wr(2, 0)
+    _adr_text(b, 1, t_fmt)
+    b.add_xi(0, 31, 0x18)
+    b.bl(F_SPRINTF)
+    b.add_xi(0, 31, 0x18)
+    b.b('tx_shots')
+    b.label('tx_dash')
+    _adr_text(b, 0, t_dash)
+    b.label('tx_shots')
+    b.mov_w(1, FS_ITEM_SHOTS)
+    b.mov_x(2, 19)
+    b.mov_w(3, FS_SLOT_SHOTS)
+    b.bl('fs_row_text')
+    b.b('tx_done')
+    b.label('tx_off')
+    _adr_text(b, 0, t_off)
+    b.mov_w(1, FS_ITEM_SET)
+    b.mov_x(2, 19)
+    b.mov_w(3, FS_SLOT_SET)
+    b.bl('fs_row_text')
+    b.label('tx_done')
+    b.ldr_x(20, 31, 0x10)
+    b.ldp_post(19, 30, 0x30)
+    b.ret()
+    # fs_refresh(state): the focus shift page's stock value refresh, then our texts
+    b.label('fs_refresh')
+    b.stp_pre(19, 30, -0x20)
+    b.str_x(20, 31, 0x10)
+    b.mov_x(19, 0)
+    b.bl(F_FS_REFRESH)
+    b.mov_x(20, 0)
+    b.cbz_x(19, 'rf_done')
+    b.mov_x(0, 19)
+    b.bl('fs_texts')
+    b.label('rf_done')
+    b.mov_x(0, 20)
+    b.ldr_x(20, 31, 0x10)
+    b.ldp_post(19, 30, 0x20)
+    b.ret()
+    # row actions (context x0, state = [x0]): set the end point to the current focus position / clear it
+    b.label('fs_set_end')
+    b.stp_pre(19, 30, -0x10)
+    b.ldr_x(19, 0)
+    b.bl(F_LENS_POS)
+    _r(b, 0x52010000, 'eor w0, w0, #0x80000000')
+    b.bl('fs_end_put')
+    b.b('fs_act_tail')
+    b.label('fs_clear_end')
+    b.stp_pre(19, 30, -0x10)
+    b.ldr_x(19, 0)
+    b.mov_w(0, 0)
+    b.bl('fs_end_put')
+    b.label('fs_act_tail')
+    b.mov_x(0, 19)
+    b.bl('fs_refresh')
+    b.mov_x(0, 19)
+    b.ldp_post(19, 30, 0x10)
+    b.b(F_REDRAW)
 
 
 def _hook(b, name, own_id, other_id, stock_thunk, switch_other):
@@ -609,16 +994,22 @@ def code(cs):
     blk.ldr_x(20, 31, 0x10)
     blk.ldp_post(19, 30, 0x20)
     blk.ret()
+    _focus(blk)
     blk.label('texts')
     listing = blk.listing(cs)
-    data = blk.bytes() + b''.join(t.ljust(TEXT_SLOT_BYTES, b'\0') for t in STATE_TEXT)
+    for index, text in getattr(blk, 'expect', {}).items():
+        got = _norm(listing[index][2])
+        if got != _norm(text):
+            raise ValueError(f'raw word {index}: {got!r} != {text!r}')
+    data = blk.bytes() + b''.join(t.ljust(TEXT_SLOT_BYTES, b'\0') for t in STATE_TEXT + FS_TEXT)
     return blk, data, listing
 
 
 def strings(context):
     """English text in every language: the stock string pool has no equivalent wording."""
     ids = context.add('bank-store', [list(ENGLISH) for _ in range(36)])
-    return dict(label_id=ids[0], option_ids=ids[1:1 + N_OPTIONS])
+    fs = context.add('focus-end', [list(FS_ENGLISH) for _ in range(36)])
+    return dict(label_id=ids[0], option_ids=ids[1:1 + N_OPTIONS], fs_set_id=fs[0], fs_clear_id=fs[1])
 
 
 def menu(img, ids, blk):
@@ -704,7 +1095,81 @@ def menu(img, ids, blk):
             'Setup menu value refresh callback -> wrapper')
     return dict(layout=hex(va(layout_at)), rows=hex(va(rows_at)), tables=hex(va(tables_at)),
                 pointers=hex(va(evptr_at)), callbacks=hex(va(callbacks_at)), page=hex(va(page_at)),
-                state=hex(pm.state_ram(pm.STATE_NEW)))
+                state=hex(pm.state_ram(pm.STATE_NEW)), gui_end=at)
+
+
+def focus_menu(img, ids, blk, at):
+    """Focus shift page (state 0xB1): show the two always-hidden rows as "Focus end point" / "Clear focus end point"."""
+    rows = [struct.unpack_from('<11I', img.old, FS_ROWS + 44 * k) for k in range(FS_COUNT)]
+    if rows[FS_ROW_SHOTS][0] != 0xAB0 or rows[FS_ROW_SHOTS][4:7] != (0x101049, 0xFFFF, FS_ITEM_SHOTS) or \
+            rows[FS_ROW_SET][6] != FS_ITEM_SET or rows[FS_ROW_CLEAR][6] != FS_ITEM_CLEAR or \
+            rows[FS_ROW_RESET][0] != 0x8AD or rows[9][4:6] != (0x101040, 0xFFFF):
+        raise ValueError('stock focus shift rows differ')
+    tail = rows[FS_ROW_SHOTS][7:]
+    if rows[FS_ROW_SET][7:] != tail or rows[FS_ROW_CLEAR][7:] != tail:
+        raise ValueError('stock focus shift row tails differ')
+    new_rows = {FS_ROW_SET: (ids['fs_set_id'], 0xFFFF, 0xFFFF, 0, 0x101049, 0xFFFF, FS_ITEM_SET) + tail,
+                FS_ROW_CLEAR: (ids['fs_clear_id'], 0xFFFF, 0xFFFF, 0, 0x101040, 0xFFFF, FS_ITEM_CLEAR) + tail}
+    for k, fields in new_rows.items():
+        img.put(FS_ROWS + 44 * k, struct.pack('<11I', *fields), f'focus shift page row {k}: hidden row -> end point row',
+                expect=struct.pack('<11I', *rows[k]))
+    # transitions: the stock "Focus position auto reset" row's table (an in-place toggle row), with our action
+    source = img.u64(FS_EVPTR + 8 * FS_ROW_RESET) - BASE
+    count = 0
+    while img.u64(source + 32 * count) != 0x3BB:
+        count += 1
+    count += 1
+    pointers = {}
+    at = (at + 7) & ~7
+    for k, action in ((FS_ROW_SET, 'fs_set_end'), (FS_ROW_CLEAR, 'fs_clear_end')):
+        hits = []
+
+        def change(e, a, g, t, hits=hits, target=blk.labels[action]):
+            if a == F_FS_TOGGLE:
+                hits.append(e)
+                return e, target, g, t
+            return e, a, g, t
+        table = pm.events(img, source, count, change)
+        if hits != [0x286, 0x28B, 0x2AE]:
+            raise ValueError(f'unexpected transitions of the stock auto-reset row: {hits}')
+        img.put(at, table, f'focus shift page row {k}: transition table', expect_zero=True)
+        old = img.u64(FS_EVPTR + 8 * k)
+        img.put(FS_EVPTR + 8 * k, struct.pack('<Q', va(at)), f'focus shift page row {k}: transition table pointer',
+                expect=struct.pack('<Q', old))
+        pointers[k] = hex(va(at))
+        at += len(table)
+    # cursor navigation table with the end point row added
+    nav = [struct.unpack_from('<IHH', img.old, FS_NAV_TABLE - BASE + 8 * k) for k in range(FS_NAV_COUNT)]
+    if [e[0] for e in nav] != [0x2C1E, FS_ITEM_SHOTS, 0x2C52, 0x2C20, 0x2C85, FS_ITEM_CLEAR, 0x2E04, 0x2E29, 0x2C21] or \
+            any(e[1:] != (0xFFFF, 1) for e in nav):
+        raise ValueError('stock focus shift cursor table differs')
+    nav.append((FS_ITEM_SET, 0xFFFF, 1))
+    nav_at = at
+    img.put(nav_at, b''.join(struct.pack('<IHH', *e) for e in nav), 'focus shift page cursor table (+ end point row)',
+            expect_zero=True)
+    at += 8 * len(nav)
+    if at > FS_GUI_LIMIT:
+        raise ValueError('GUI area too small for the focus shift tables')
+    if struct.unpack_from('<2I', img.old, 0x405EF4DC - BASE) != (0xF2C00016, 0xF2E00016):
+        raise ValueError('stock focus shift cursor table load is not the expected four-instruction constant')
+    for site, word in FS_NAV_SITES.items():
+        if struct.unpack_from('<I', img.old, site - BASE)[0] != word:
+            raise ValueError(f'stock focus shift cursor code differs at {site:#x}')
+    nav_va = va(nav_at)
+    if nav_va >> 32 or (nav_va >> 16) & 0xFFFF != 0x40A0:
+        raise ValueError('cursor table address does not fit the two-instruction load')
+    new_words = {0x405EF4D0: 0xD2800016 | (nav_va & 0xFFFF) << 5, 0x405EF4D8: 0xF2A00016 | (nav_va >> 16 & 0xFFFF) << 5,
+                 0x405EF4EC: 0x52800001 | len(nav) << 5}
+    for site, word in new_words.items():
+        img.put(site - BASE, struct.pack('<I', word), f'focus shift cursor code {site:#x}: copied table / 10 entries',
+                expect=struct.pack('<I', FS_NAV_SITES[site]))
+    for site in FS_HIDE_SITES:
+        img.put(site - BASE, struct.pack('<I', FS_SHOW), f'focus shift page entry: show the row instead of hiding it ({site:#x})',
+                expect=struct.pack('<I', FS_HIDE_STOCK))
+    if img.u64(FS_CALLBACKS + 32) != F_FS_REFRESH:
+        raise ValueError('stock focus shift refresh callback differs')
+    img.put(FS_CALLBACKS + 32, struct.pack('<Q', blk.labels['fs_refresh']), 'focus shift page value refresh callback -> wrapper')
+    return dict(tables=pointers, cursor_table=hex(nav_va), gui_end=hex(at))
 
 
 def build_main(eg, strings_context):
@@ -754,7 +1219,33 @@ def build_main(eg, strings_context):
     img.put(BKT_HANDLER - BASE, struct.pack('<I', 0x14000000 | ((delta // 4) & 0x3FFFFFF)),
             'Bracketing burst button handler entry -> wrapper (bracketing on while held)',
             expect=struct.pack('<I', BKT_HANDLER_STOCK))
-    return img, dict(strings=ids, menu=where,
+    # ---- focus shift end point ------------------------------------------------------------------------------------
+    require(struct.unpack_from('<2I', eg, 0x405EF0E4 - BASE) == (0x528590C1, 0xAA1303E0) and
+            struct.unpack_from('<I', eg, 0x405EF100 - BASE)[0] == 0x528589E1 and
+            all(struct.unpack_from('<I', eg, a - BASE)[0] == FS_HIDE_STOCK for a in FS_HIDE_SITES) and
+            all(struct.unpack_from('<I', eg, a + 8 - BASE)[0] == 0x97F70B75 - (a - 0x405EF0F4) // 4 for a in FS_HIDE_SITES),
+            'stock focus shift page entry callback differs')
+    fs_where = focus_menu(img, ids, blk, where.pop('gui_end'))
+    require(struct.unpack_from('<I', eg, FS_FRAME_SITE - BASE)[0] == FS_FRAME_STOCK and
+            struct.unpack_from('<6I', eg, 0x40FCEA1C - BASE)[:1] == (0xD2900E08,), 'stock focus shift frame code differs')
+    require(struct.unpack_from('<I', eg, FS_START_SITE - BASE)[0] == FS_START_STOCK and
+            FS_START_SITE + 4 * (FS_START_STOCK & 0x3FFFFFF) == GET_DS and
+            struct.unpack_from('<I', eg, 0x40FB3B58 - BASE)[0] == 0x2A1503E0 and
+            struct.unpack_from('<I', eg, 0x40FB3B80 - BASE)[0] == 0xB90002E0, 'stock focus shift start code differs')
+    for site, stock, label, what in ((FS_FRAME_SITE, FS_FRAME_STOCK, 'fs_remain', 'focus shift: remaining-shots load'),
+                                     (FS_START_SITE, FS_START_STOCK, 'fs_shots', 'focus shift start: No. of shots read')):
+        delta = blk.labels[label] - site
+        img.put(site - BASE, struct.pack('<I', 0x94000000 | ((delta // 4) & 0x3FFFFFF)), f'{what} -> {label}',
+                expect=struct.pack('<I', stock))
+    require(struct.unpack_from('<I', eg, 0x40FDEF08 - BASE)[0] == 0xD291508A and
+            struct.unpack_from('<I', eg, 0x40DAD924 - BASE)[0] == 0x94001BB3 and
+            struct.unpack_from('<I', eg, 0x40DAD94C - BASE)[0] == 0x94002759 and
+            struct.unpack_from('<I', eg, 0x40FCEAE4 - BASE)[0] == 0x940040E0 and
+            struct.unpack_from('<I', eg, 0x40FB4418 - BASE)[0] == 0xB9000109, 'stock focus shift step code differs')
+    return img, dict(strings=ids, menu=where, focus_end=dict(fs_where, end_bytes=[hex(FS_END0 + REL_SLOT_STEP * k) for k in range(4)],
+                                                     frame_site=hex(FS_FRAME_SITE), start_site=hex(FS_START_SITE),
+                                                     remain=hex(blk.labels['fs_remain']), shots=hex(blk.labels['fs_shots']),
+                                                     pps=hex(blk.labels['fs_pps']), estimate=hex(blk.labels['fs_est'])),
                      hook=dict(site=hex(COPY_API), gate=hex(blk.labels['gate']), native=hex(blk.labels['native']),
                                save=hex(blk.labels['save'])),
                      link=dict(menu_site=hex(DISPATCH_MENU_SITE), custom_site=hex(DISPATCH_CUSTOM_SITE),
