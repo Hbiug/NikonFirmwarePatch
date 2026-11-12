@@ -41,9 +41,11 @@ FS_HIDE_SITES = (0x405EF0F4, 0x405EF110)
 FS_FRAME_SITE, FS_START_SITE = 0x40FCEA2C, 0x40FB3B64
 FS_ROWS, FS_EVPTR = 0x43DF8EF0 - BASE, 0x43DF90D8 - BASE
 FS_CALLBACKS = 0xA028E8060 - 0xA02808000 + 0x4B13000
-FS_TEXTS = (b'SET', b'OFF', b'--', b'~%d')
+FS_TEXTS = (b'SET', b'OFF', b'--', b'~%d', b'%d')
 FS_STOCK_CALLS = {0x40EC4544, 0x40C78518, 0x40C790DC, 0x40DB47F0, 0x40DB76B0, 0x40DB3F90, 0x4127D850, 0x403AF870,
-                  0x40399EF0, 0x405EF210, 0x403B26C0}
+                  0x40399EF0, 0x405EF210, 0x403B26C0, 0x4039E810, 0x405F6A68, 0x403F621C}
+SL_ARROWS = 0x405F6A64
+SL_LAYOUT_EDITS = {0x43DF951C: 4, 0x43DF9534: 8, 0x43DF9560: 4, 0x43DF9578: 8, 0x43DF9754: 8, 0x43DF9798: 8}
 
 
 def windows(version, tag, n, stock):
@@ -66,6 +68,8 @@ def windows(version, tag, n, stock):
         'focus shift cursor table address (low half)': (0x405EF4D0 - BASE, 4),
         'focus shift cursor table address (high half)': (0x405EF4D8 - BASE, 4),
         'focus shift cursor table count': (0x405EF4EC - BASE, 4),
+        'focus step width slider: arrow update entry': (SL_ARROWS - BASE, 4),
+        **{f'focus step width slider layout {a:#x}': (a - BASE, n) for a, n in SL_LAYOUT_EDITS.items()},
         'Setup menu row 43': (SETUP_ROWS + 44 * 43, 44),
         'reused Setup row transition table (59 events)': (row_table, 59 * 32),
         'Setup menu refresh callback': (SETUP_CALLBACKS + 32, 8),
@@ -153,7 +157,7 @@ def verify(stock_raw, out_raw, version, tag):
                'shared string tables', 'focus shift page entry: show row 5', 'focus shift page entry: show row 6',
                'focus shift per-frame remaining-shots load', 'focus shift start: No. of shots read',
                'focus shift cursor table address (low half)', 'focus shift cursor table address (high half)',
-               'focus shift cursor table count'}
+               'focus shift cursor table count', 'focus step width slider: arrow update entry'}
     for r in report:
         if r['start'] < CODE_REGION_END and not set(r['windows']) <= code_ok:
             raise ValueError(f'unexpected code-region change: {r}')
@@ -168,7 +172,8 @@ def verify(stock_raw, out_raw, version, tag):
     rows_all = disasm(code_all, BASE + 0x8A0000)
     by_addr = {a: (m, o) for a, m, o in rows_all}
     require(by_addr[gate][0] == 'cbnz', 'gate does not start with the source-slot test')
-    native = [a for a, (m, o) in by_addr.items() if struct.unpack_from('<I', eg1, a - BASE)[0] == 0xF81E0FF4]
+    native = [a for a, (m, o) in by_addr.items() if struct.unpack_from('<I', eg1, a - BASE)[0] == 0xF81E0FF4 and
+              a + 4 in by_addr and by_addr[a + 4][0] == 'b' and int(by_addr[a + 4][1], 16) == 0x41013A18]
     require(len(native) == 1, 'expected exactly one displaced-instruction copy')
     nb = by_addr[native[0] + 4]
     require(nb[0] == 'b' and int(nb[1], 16) == 0x41013A18, 'native entry must continue at the copy routine body')
@@ -306,6 +311,18 @@ def verify(stock_raw, out_raw, version, tag):
     require(struct.unpack_from('<I', eg1, 0x405EF4EC - BASE)[0] == 0x52800141, 'focus shift cursor table count is not 10')
     stock_nav = eg0[0x42B29ED0 - BASE:0x42B29ED0 - BASE + 72]
     require(eg1[nav - BASE:nav - BASE + 80] == stock_nav + struct.pack('<IHH', 0x2C86, 0xFFFF, 1), 'focus shift cursor table content')
+    # focus step width slider: entry branch to a wrapper that calls the displaced-entry copy once, then writes the line
+    require(struct.unpack_from('<I', eg0, SL_ARROWS - BASE)[0] == 0xF81E0FF4, 'stock slider arrow routine entry')
+    w = struct.unpack_from('<I', eg1, SL_ARROWS - BASE)[0]
+    require(w >> 26 == 0b000101, 'slider hook is not an unconditional branch')
+    d = w & 0x3FFFFFF
+    sl_wrap = SL_ARROWS + ((d - (1 << 26) if d & (1 << 25) else d) << 2)
+    require(BASE + 0x8A0000 <= sl_wrap < limit and by_addr[sl_wrap][0] == 'stp', 'slider wrapper outside the new code')
+    sn = [a for a in addrs if struct.unpack_from('<I', eg1, a - BASE)[0] == 0xF81E0FF4 and
+          by_addr[a + 4][0] == 'b' and int(by_addr[a + 4][1], 16) == SL_ARROWS + 4]
+    require(len(sn) == 1, 'displaced slider arrow entry differs')
+    body = code_rows[addrs.index(sl_wrap):addrs.index(sl_wrap) + 8]
+    require([int(o.split()[-1], 16) for a, m, o in body if m == 'bl'][:1] == [sn[0]], 'slider wrapper must call the stock routine first')
     # link banks: the two dispatcher calls
 
     def bl_target(site):

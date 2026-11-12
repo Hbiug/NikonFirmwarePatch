@@ -211,11 +211,11 @@ static int k_val, k_ok;                        /* lens coefficient model: pulses
 static int lens_pos;
 static int fs_calls_refresh, fs_calls_redraw;
 static u64 fs_last_state;
-struct shown { u32 item, slot; char text[16]; };
+struct shown { u32 item, slot, style; char text[48]; };
 static struct shown shown[8];
 static int nshown;
-static char pending[16];
-static u32 pending_slot;
+static char pending[48];
+static u32 pending_slot, pending_style;
 __attribute__((section(".s_prop"), noinline, used)) u32 st_prop(u32 id, u32 size, int *buf) {
     if (size != 8) return 0;
     if (id == 0x2103) { buf[0] = p_a0; buf[1] = p_a1; }
@@ -243,14 +243,13 @@ __attribute__((section(".s_rowindex"), noinline, used)) int st_rowindex(u64 stat
 __attribute__((section(".s_rowobj"), noinline, used)) u64 st_rowobj(u64 rows, int idx, u32 z) { (void)z; return rows ? 0x500000UL + (u64)idx : 0; }
 __attribute__((section(".s_settext"), noinline, used)) void st_settext(const char *t, u32 slot, u32 style) {
     int i = 0;
-    for (; i < 15 && t[i]; i++) pending[i] = t[i];
+    for (; i < 47 && t[i]; i++) pending[i] = t[i];
     pending[i] = 0;
-    pending_slot = slot;
-    if (style != 0x220) pending[0] = '!';
+    pending_slot = slot; pending_style = style;
 }
 __attribute__((section(".s_setcontent"), noinline, used)) void st_setcontent(u64 obj, u32 slot) {
-    if (nshown < 8) { shown[nshown].item = (u32)(obj - 0x500000UL) | (slot == pending_slot ? 0 : 0x80000000u); shown[nshown].slot = slot;
-                      for (int i = 0; i < 16; i++) shown[nshown].text[i] = pending[i]; nshown++; }
+    if (nshown < 8) { shown[nshown].item = (u32)(obj - 0x500000UL) | (slot == pending_slot ? 0 : 0x80000000u); shown[nshown].slot = slot; shown[nshown].style = pending_style;
+                      for (int i = 0; i < 48; i++) shown[nshown].text[i] = pending[i]; nshown++; }
 }
 __attribute__((section(".s_sprintf"), noinline, used)) int st_sprintf(char *buf, const char *fmt, int v) {
     char *o = buf;
@@ -265,6 +264,36 @@ __attribute__((section(".s_sprintf"), noinline, used)) int st_sprintf(char *buf,
     }
     *o = 0;
     return (int)(o - buf);
+}
+static int nshown_at_arrows;
+
+/* slider page: element lookup and the stock arrow routine (body after its first instruction) */
+static int elem_missing, arrows_calls, hidden_ten;
+__attribute__((section(".s_visible"), noinline, used)) void st_visible(u64 obj, u32 on) { if (obj == 0x500000UL + 0x4DF) hidden_ten = on ? 0 : 1; }
+static u64 arrows_state;
+__attribute__((section(".s_element"), noinline, used)) u64 st_element(u32 id, u64 ctx) { (void)ctx; return elem_missing ? 0 : 0x500000UL + id; }
+__attribute__((noinline, used)) void c_arrows(u64 state) { arrows_calls++; arrows_state = state; nshown_at_arrows = nshown; }
+__asm__(".section .s_arrows,\"ax\"\n"
+        "    b hook_sl_wrap\n"
+        "    str x30, [sp, #0x18]\n"
+        "    bl c_arrows\n"
+        "    ldr x30, [sp, #0x18]\n"
+        "    ldr x20, [sp], #0x20\n"
+        "    ret\n"
+        ".text\n");
+extern char hook_sl_wrap[], hook_sl_text[];
+#define SLV (*(volatile short *)SL_VALUE)
+static int sl_is(const char *mid, int n1, int n2) {
+    char e[48]; int k = 0;
+    e[k++] = '1'; for (int i = 0; i < n1; i++) e[k++] = ' ';
+    for (int i = 0; mid[i]; i++) e[k++] = mid[i];
+    for (int i = 0; i < n2; i++) e[k++] = ' ';
+    e[k++] = '1'; e[k++] = '0'; e[k] = 0;
+    if (nshown < 1) return 0;
+    struct shown *s = &shown[nshown - 1];
+    if (s->item != 0x4DE || s->slot != 0 || s->style != 0x55) return 0;
+    for (int i = 0; i <= k; i++) if (s->text[i] != e[i]) { puts_("    got '"); puts_(s->text); puts_("'\n"); return 0; }
+    return 1;
 }
 extern char hook_fs_end_get[], hook_fs_pps[], hook_fs_est[], hook_fs_shots[], hook_fs_remain[], hook_fs_refresh[];
 extern char hook_fs_set_end[], hook_fs_clear_end[];
@@ -297,7 +326,7 @@ static void fs_lens(int a0, int a1, int b0, int b1, u32 num, u32 den, int k) {
     p_a0 = a0; p_a1 = a1; p_b0 = b0; p_b1 = b1; r_num = num; r_den = den; k_val = k; k_ok = 1;
 }
 static int shown_is(int i, u32 item, const char *t) {
-    if (i >= nshown || shown[i].item != item || shown[i].slot != (item == FS_ITEM_SHOTS ? 5u : 8u)) return 0;
+    if (i >= nshown || shown[i].item != item || shown[i].slot != (item == FS_ITEM_SHOTS ? 5u : 8u) || shown[i].style != 0x220) return 0;
     for (int j = 0; j < 16; j++) { if (shown[i].text[j] != t[j]) return 0; if (!t[j]) return 1; }
     return 1;
 }
@@ -427,6 +456,39 @@ static void focus_tests(void) {
     st[9] = 0x1000;
     nshown = 0; call(hook_fs_refresh, 0, 0, 0, 0);
     check(nshown == 0, "focus page: no state -> stock refresh only");
+
+    /* ---------------- focus step width slider ---------------- */
+    u64 sst[0x20]; for (int i = 0; i < 0x20; i++) sst[i] = 0;
+    fs_lens(10, 56, 10, 40, 500, 100, 5000); p = ref_pps(5);
+    lens_pos = 30000; ds_fsshots = 100; elem_missing = 0;
+    fs_set(0, 0); SLV = 5; nshown = 0; arrows_calls = 0; hidden_ten = 0;
+    call((void *)0x405F6A64, (u64)sst, 0, 0, 0);
+    check(hidden_ten == 1, "slider: the separate 10 label is hidden");
+    check(arrows_calls == 1 && arrows_state == (u64)sst && nshown_at_arrows == 0 && nshown == 1 && sl_is("100", 12, 10),
+          "slider: stock arrow update first, then the line; no end point -> No. of shots (100), 3-character spacing");
+    ds_fsshots = 5; nshown = 0; call(hook_sl_text, (u64)sst, 0, 0, 0);
+    check(sl_is("5", 12, 12), "slider: 1-character middle -> 12 / 12 spaces");
+    ds_fsshots = 50; nshown = 0; call(hook_sl_text, (u64)sst, 0, 0, 0);
+    check(sl_is("50", 12, 11), "slider: 2-character middle -> 12 / 11 spaces");
+    fs_set(1, 30000 - 41 * ref_pps(5)); SLV = 5; nshown = 0; call(hook_sl_text, (u64)sst, 0, 0, 0);
+    check(sl_is("~42", 12, 10), "slider: end point -> ~42 for the slider's width");
+    SLV = 9; nshown = 0; call(hook_sl_text, (u64)sst, 0, 0, 0);
+    { int q = ref_pps(9); int dist = 41 * ref_pps(5); int est = dist / q + (dist % q != 0) + 1; char m[8]; int k = 0;
+      m[k++] = '~'; if (est >= 100) m[k++] = '0' + est / 100; if (est >= 10) m[k++] = '0' + est / 10 % 10; m[k++] = '0' + est % 10; m[k] = 0;
+      check(est != 42 && sl_is(m, k >= 4 ? 11 : 12, k >= 3 ? 10 : 13 - k), "slider: the estimate follows the slider value, not the saved width"); }
+    fs_set(1, 30000 - 7 * ref_pps(1)); SLV = 1; nshown = 0; call(hook_sl_text, (u64)sst, 0, 0, 0);
+    check(sl_is("~8", 12, 11), "slider: 2-character estimate (~8)");
+    fs_set(1, 30000 - 141 * ref_pps(1)); nshown = 0; call(hook_sl_text, (u64)sst, 0, 0, 0);
+    check(sl_is("~142", 11, 10), "slider: 4-character estimate (~142) -> 11 / 10 spaces");
+    fs_set(1, 30000 - 5000 * ref_pps(1)); nshown = 0; call(hook_sl_text, (u64)sst, 0, 0, 0);
+    check(sl_is("~300", 11, 10), "slider: capped estimate ~300");
+    fs_set(1, 30001); nshown = 0; call(hook_sl_text, (u64)sst, 0, 0, 0);
+    check(sl_is("--", 12, 11), "slider: end point behind the current position -> --");
+    fs_set(1, 0); k_ok = 0; nshown = 0; call(hook_sl_text, (u64)sst, 0, 0, 0);
+    check(sl_is("--", 12, 11), "slider: no lens data -> --");
+    k_ok = 1; elem_missing = 1; nshown = 0; call(hook_sl_text, (u64)sst, 0, 0, 0);
+    check(nshown == 0, "slider: label element not found -> nothing written");
+    elem_missing = 0; fs_set(0, 0);
 }
 
 void main_(void) {

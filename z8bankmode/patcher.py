@@ -139,12 +139,35 @@ FS_SLOT_SHOTS, FS_SLOT_SET = 5, 8
 # copied with a tenth entry for 0x2C86 and the two instructions that load its address and count are changed.
 FS_NAV_TABLE, FS_NAV_COUNT = 0x42B29ED0, 9
 FS_NAV_SITES = {0x405EF4D0: 0xD293DA16, 0x405EF4D8: 0xF2A85656, 0x405EF4EC: 0x52800121}   # mov x22,#lo; movk x22,#hi; mov w1,#9
-FS_GUI_LIMIT = 0x8A3000                     # global text slots (stock page: 5 shots, 6 step width, 7 interval)
+FS_GUI_LIMIT = 0x8A3000
+# ---- focus step width slider (state 0xB3, b9): the estimate on the slider page itself -----------------------------
+# The page has two dynamic labels, "1" (element 0x4DE, text slot 0) and "10" (0x4DF, slot 1), style 0x55, both CENTRED in
+# their layout box and clipped to it; every element paints its box background, so a box must not overlap another
+# element's text.  The routine 0x405F6A64(state) that shows / hides the two arrows runs when the page opens and after
+# every left / right / touch change (slider value: s16 at RAM 0xA03378E38).  It is wrapped: after the stock routine,
+# the "1" label becomes one centred line "1 <spaces> N <spaces> 10" spanning the whole scale, and the "10" element is
+# hidden (its box is also shrunk; a zero-size box alone does not clip its text, found in the emulator).  The spacing (emulator-tuned) keeps "1" and "10" on their stock positions for 1..4 characters in the
+# middle.  The "Narrow" label (element 0x4DB, string 0x7AC) becomes the static line "Narrow  Est. shots  Wide" across
+# both old boxes and the "Wide" element is emptied and shrunk.  N = "~estimate" with an end point, "--" when there is no
+# estimate, and the No. of shots setting (what a stock series takes) without an end point.
+SL_ARROWS, SL_ARROWS_STOCK = 0x405F6A64, 0xF81E0FF4                 # first instruction: str x20,[sp,#-0x20]!
+SL_VALUE = 0xA03378E38
+F_ELEMENT = 0x4039E810                                             # element(id, state + 0x18) -> object
+SL_ELEM_ONE, SL_SLOT_ONE, SL_STYLE, SL_ELEM_TEN = 0x4DE, 0, 0x55, 0x4DF
+F_VISIBLE = 0x403F621C                                             # visible(object, 0 / 1), used by the stock arrow routine
+SL_LAYOUT = 0x43DF9450 - BASE
+SL_ONE_RECT, SL_TEN_RECT = 0x43DF9754 - BASE, 0x43DF9798 - BASE      # {y1 << 16 | x1, y2 << 16 | x2}
+SL_NARROW_STR, SL_NARROW_RECT = 0x43DF951C - BASE, 0x43DF9534 - BASE
+SL_WIDE_STR, SL_WIDE_RECT = 0x43DF9560 - BASE, 0x43DF9578 - BASE
+SL_RECTS_STOCK = {SL_ONE_RECT: (0xDF00AE, 0xF700DE), SL_TEN_RECT: (0xDF01F2, 0xF70222),
+                  SL_NARROW_RECT: (0xB5005C, 0xDD0124), SL_WIDE_RECT: (0xB501AC, 0xDD0274)}
+SL_RECTS_NEW = {SL_ONE_RECT: (0xDF00AE, 0xF70222), SL_TEN_RECT: (0xDF0222, 0xDF0222),
+                SL_NARROW_RECT: (0xB5005C, 0xDD0274), SL_WIDE_RECT: (0xB50274, 0xB50274)}                     # global text slots (stock page: 5 shots, 6 step width, 7 interval)
 FS_CALLBACKS = 0xA028E8060 - 0xA02808000 + 0x4B13000   # five pointers of state 0xB1 (data image)
 F_FS_REFRESH, F_FS_TOGGLE = 0x405EF210, 0x4051226C
-FS_TEXT = (b'SET', b'OFF', b'--', b'~%d')             # after STATE_TEXT, same 16-byte slots
-FS_ENGLISH = ('Focus end point', 'Clear focus end point')
-FS_STRING_FIRST, FS_STRING_COUNT = 3143, 2
+FS_TEXT = (b'SET', b'OFF', b'--', b'~%d', b'%d')      # after STATE_TEXT, same 16-byte slots
+FS_ENGLISH = ('Focus end point', 'Clear focus end point', 'Narrow' + ' ' * 4 + 'Est. shots' + ' ' * 6 + 'Wide ', '')
+FS_STRING_FIRST, FS_STRING_COUNT = 3143, 4
 
 # ---- new material (same text-gap regions as the ProRes row; this patch does not combine with it) ------------
 # ---- the row lives in the Setup menu (state 0x297), in the slot of its last row "Special shooting" (item 0x3968), which
@@ -558,6 +581,121 @@ def _focus(b):
     b.mov_x(0, 19)
     b.ldp_post(19, 30, 0x10)
     b.b(F_REDRAW)
+
+    # ---- focus step width slider ------------------------------------------------------------------------------------
+    t_dec = len(STATE_TEXT) + 4                    # "%d"
+    b.label('sl_native')
+    b.raw(SL_ARROWS_STOCK)
+    b.b(SL_ARROWS + 4)
+    # sl_wrap(state): the stock arrow update, then the scale line
+    b.label('sl_wrap')
+    b.stp_pre(19, 30, -0x10)
+    b.mov_x(19, 0)
+    b.bl('sl_native')
+    b.mov_x(0, 19)
+    b.bl('sl_text')
+    b.ldp_post(19, 30, 0x10)
+    b.ret()
+    # sl_text(state): "1" + n1 spaces + N + n2 spaces + "10" into the "1" label (buffer: sp+0x20, 48 bytes; N at sp+0x10)
+    b.label('sl_text')
+    b.stp_pre(19, 30, -0x60)
+    b.stp(20, 21, 0x50)
+    b.mov_x(21, 0)
+    b.add_xi(1, 0, 0x18)
+    b.mov_w(0, SL_ELEM_ONE)
+    b.bl(F_ELEMENT)
+    b.mov_x(19, 0)
+    b.cbz_x(19, 'sl_done')                     # page not built: nothing to write
+    b.bl('fs_end_get')
+    b.cbz_w(0, 'sl_stock')
+    b.mov_x64(8, SL_VALUE)
+    _r(b, 0x79C00100, 'ldrsh w0, [x8]')
+    b.bl('fs_est')
+    b.cmp_wi(0, 0)
+    b.b_cond('le', 'sl_dash')
+    b.mov_wr(2, 0)
+    _adr_text(b, 1, len(STATE_TEXT) + 3)       # "~%d"
+    b.b('sl_fmt')
+    b.label('sl_stock')
+    _get(b, ID_FS_SHOTS)
+    b.mov_wr(2, 0)
+    _adr_text(b, 1, t_dec)                     # "%d"
+    b.label('sl_fmt')
+    b.add_xi(0, 31, 0x10)
+    b.bl(F_SPRINTF)
+    b.b('sl_build')
+    b.label('sl_dash')
+    _adr_text(b, 9, len(STATE_TEXT) + 2)       # "--"
+    b.ldrh_w(10, 9)
+    b.strh_w(10, 31, 0x10)
+    b.strb_w(31, 31, 0x12)
+    b.label('sl_build')
+    # c = length of N (at most 8 characters are used)
+    b.mov_w(20, 0)
+    b.label('sl_len')
+    b.add_xi(9, 31, 0x10)
+    b.ldrb_idx(10, 9, 20)
+    b.cbz_w(10, 'sl_lenok')
+    _add_wi(b, 20, 20, 1)
+    b.cmp_wi(20, 8)
+    b.b_cond('lo', 'sl_len')
+    b.label('sl_lenok')
+    # n1 = 12, or 11 from 4 characters on; n2 = 13 - c, at least 10
+    b.mov_w(8, 12)
+    b.cmp_wi(20, 4)
+    b.b_cond('lo', 'sl_n1')
+    b.mov_w(8, 11)
+    b.label('sl_n1')
+    b.mov_w(9, 13)
+    b.sub_w(9, 9, 20)
+    b.cmp_wi(9, 10)
+    b.b_cond('ge', 'sl_n2')
+    b.mov_w(9, 10)
+    b.label('sl_n2')
+    b.add_xi(10, 31, 0x20)                    # write pointer
+    b.mov_w(11, ord('1'))
+    b.strb_post(11, 10, 1)
+    b.mov_w(11, ord(' '))
+    b.label('sl_sp1')
+    b.strb_post(11, 10, 1)
+    b.subs_wi(8, 8, 1)
+    b.b_cond('ne', 'sl_sp1')
+    b.add_xi(12, 31, 0x10)
+    b.mov_wr(13, 20)
+    b.cbz_w(13, 'sl_mid_done')
+    b.label('sl_mid')
+    b.ldrb_post(14, 12, 1)
+    b.strb_post(14, 10, 1)
+    b.subs_wi(13, 13, 1)
+    b.b_cond('ne', 'sl_mid')
+    b.label('sl_mid_done')
+    b.label('sl_sp2')
+    b.strb_post(11, 10, 1)
+    b.subs_wi(9, 9, 1)
+    b.b_cond('ne', 'sl_sp2')
+    b.mov_w(11, ord('1'))
+    b.strb_post(11, 10, 1)
+    b.mov_w(11, ord('0'))
+    b.strb_post(11, 10, 1)
+    b.strb_w(31, 10)
+    b.add_xi(0, 31, 0x20)
+    b.mov_w(1, SL_SLOT_ONE)
+    b.mov_w(2, SL_STYLE)
+    b.bl(pm.F_SET_TEXT)
+    b.mov_x(0, 19)
+    b.mov_w(1, SL_SLOT_ONE)
+    b.bl(pm.F_SET_CONTENT)
+    # the "10" label: the stock entry wrote and showed it; a zero-size box does not clip, so hide the element
+    b.add_xi(1, 21, 0x18)
+    b.mov_w(0, SL_ELEM_TEN)
+    b.bl(F_ELEMENT)
+    b.cbz_x(0, 'sl_done')
+    b.mov_w(1, 0)
+    b.bl(F_VISIBLE)
+    b.label('sl_done')
+    b.ldp(20, 21, 0x50)
+    b.ldp_post(19, 30, 0x60)
+    b.ret()
 
 
 def _hook(b, name, own_id, other_id, stock_thunk, switch_other):
@@ -1009,7 +1147,8 @@ def strings(context):
     """English text in every language: the stock string pool has no equivalent wording."""
     ids = context.add('bank-store', [list(ENGLISH) for _ in range(36)])
     fs = context.add('focus-end', [list(FS_ENGLISH) for _ in range(36)])
-    return dict(label_id=ids[0], option_ids=ids[1:1 + N_OPTIONS], fs_set_id=fs[0], fs_clear_id=fs[1])
+    return dict(label_id=ids[0], option_ids=ids[1:1 + N_OPTIONS], fs_set_id=fs[0], fs_clear_id=fs[1],
+                sl_top_id=fs[2], sl_empty_id=fs[3])
 
 
 def menu(img, ids, blk):
@@ -1172,6 +1311,29 @@ def focus_menu(img, ids, blk, at):
     return dict(tables=pointers, cursor_table=hex(nav_va), gui_end=hex(at))
 
 
+def slider_layout(img, ids):
+    """Focus step width slider page: the "1" label spans the scale, the "10" box is shrunk away, "Narrow" becomes the
+    combined top line and "Wide" is emptied and shrunk (static layout data of state 0xB3)."""
+    if img.u64(0x4C04030) != 0xA028CF4A0 or img.u64(0x4BDA4A8) != BASE + SL_LAYOUT:
+        raise ValueError('stock slider page record differs')
+    for at, (a, b) in SL_RECTS_STOCK.items():
+        if struct.unpack_from('<2I', img.old, at) != (a, b):
+            raise ValueError(f'stock slider layout box at {at:#x} differs')
+    if img.u32(SL_ONE_RECT + 0x20) != SL_ELEM_ONE or img.u32(SL_TEN_RECT + 0x20) != 0x4DF or \
+            img.u32(SL_NARROW_STR) != 0x7AC or img.u32(SL_WIDE_STR) != 0x7AD:
+        raise ValueError('stock slider layout elements differ')
+    names = {SL_ONE_RECT: '"1" label: box across the scale', SL_TEN_RECT: '"10" label: empty box',
+             SL_NARROW_RECT: '"Narrow" label: box across Narrow..Wide', SL_WIDE_RECT: '"Wide" label: empty box'}
+    for at, (a, b) in SL_RECTS_NEW.items():
+        img.put(at, struct.pack('<2I', a, b), 'focus step width slider: ' + names[at],
+                expect=struct.pack('<2I', *SL_RECTS_STOCK[at]))
+    img.put(SL_NARROW_STR, struct.pack('<I', ids['sl_top_id']), 'focus step width slider: "Narrow  Est. shots  Wide" line',
+            expect=struct.pack('<I', 0x7AC))
+    img.put(SL_WIDE_STR, struct.pack('<I', ids['sl_empty_id']), 'focus step width slider: "Wide" label emptied',
+            expect=struct.pack('<I', 0x7AD))
+    return dict(top_string=ids['sl_top_id'], empty_string=ids['sl_empty_id'])
+
+
 def build_main(eg, strings_context):
     """Return the edited Image and review metadata for the stock EG image."""
     from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
@@ -1242,7 +1404,20 @@ def build_main(eg, strings_context):
             struct.unpack_from('<I', eg, 0x40DAD94C - BASE)[0] == 0x94002759 and
             struct.unpack_from('<I', eg, 0x40FCEAE4 - BASE)[0] == 0x940040E0 and
             struct.unpack_from('<I', eg, 0x40FB4418 - BASE)[0] == 0xB9000109, 'stock focus shift step code differs')
-    return img, dict(strings=ids, menu=where, focus_end=dict(fs_where, end_bytes=[hex(FS_END0 + REL_SLOT_STEP * k) for k in range(4)],
+    # ---- focus step width slider: estimate on the slider page ------------------------------------------------------
+    require(struct.unpack_from('<2I', eg, SL_ARROWS - BASE) == (SL_ARROWS_STOCK, 0xA9017BF3) and
+            sorted(a for a, k in [(0x405F6A1C, 'bl'), (0x405F6BE4, 'bl'), (0x405F6D7C, 'bl')]
+                   if struct.unpack_from('<I', eg, a - BASE)[0] == 0x94000000 | (((SL_ARROWS - a) // 4) & 0x3FFFFFF)) ==
+            [0x405F6A1C, 0x405F6BE4, 0x405F6D7C], 'stock slider arrow routine differs')
+    require(struct.unpack_from('<4I', eg, 0x405F68BC - BASE)[:2] == (0xD29FF000, 0xF2A89740) and
+            struct.unpack_from('<I', eg, 0x405F68CC - BASE)[0] == 0x52800AA2, 'stock slider "1" label code differs')
+    sl_where = slider_layout(img, ids)
+    delta = blk.labels['sl_wrap'] - SL_ARROWS
+    img.put(SL_ARROWS - BASE, struct.pack('<I', 0x14000000 | ((delta // 4) & 0x3FFFFFF)),
+            'focus step width slider: arrow update entry -> wrapper (estimate line)', expect=struct.pack('<I', SL_ARROWS_STOCK))
+    return img, dict(strings=ids, menu=where, slider=dict(sl_where, wrapper=hex(blk.labels['sl_wrap']),
+                                                          text=hex(blk.labels['sl_text'])),
+                     focus_end=dict(fs_where, end_bytes=[hex(FS_END0 + REL_SLOT_STEP * k) for k in range(4)],
                                                      frame_site=hex(FS_FRAME_SITE), start_site=hex(FS_START_SITE),
                                                      remain=hex(blk.labels['fs_remain']), shots=hex(blk.labels['fs_shots']),
                                                      pps=hex(blk.labels['fs_pps']), estimate=hex(blk.labels['fs_est'])),

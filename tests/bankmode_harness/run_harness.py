@@ -62,6 +62,8 @@ MUTATIONS = {
     'fs-no-extend': lambda d, L, b: struct.pack_into('<I', d, L['rm_more'] - b, 0x14000000 | ((L['rm_out'] - L['rm_more']) // 4)),
     # focus shift: the direction of the step is ignored (negative pulses per step)
     'fs-no-direction': lambda d, L, b: _nop_first(d, L['fs_est'], L['est_dir'], b, 0xFFFFFFFF, 0x4B0803E8),
+    # slider: the text routine always uses the 2-character spacing
+    'sl-fixed-spacing': lambda d, L, b: _nop_first(d, L['sl_lenok'], L['sl_n1'], b, 0xFF00001F, 0x54000003),
     # the gate no longer looks at the keep bit: live->bank stores are always skipped
     'gate-always-skips': lambda d, L, b: _nop_first(d, L['gate'], L['native'], b, 0xFF000000, 0x36000000),
 }
@@ -94,11 +96,11 @@ def main():
         f'#define SWITCH_ADDR {P.SWITCH_RAM:#x}UL',
         f'#define FS_END0 {P.FS_END0:#x}UL', f'#define FS_REMAIN {P.FS_REMAIN:#x}UL', f'#define FS_DIV_TABLE {P.FS_DIV_TABLE:#x}UL',
         f'#define ID_FS_SHOTS {P.ID_FS_SHOTS:#x}u', f'#define ID_FS_WIDTH {P.ID_FS_WIDTH:#x}u',
-        f'#define FS_ITEM_SET {P.FS_ITEM_SET:#x}u', f'#define FS_ITEM_SHOTS {P.FS_ITEM_SHOTS:#x}u',
+        f'#define FS_ITEM_SET {P.FS_ITEM_SET:#x}u', f'#define SL_VALUE {P.SL_VALUE:#x}UL', f'#define FS_ITEM_SHOTS {P.FS_ITEM_SHOTS:#x}u',
         f'#define THUNK_MENU {th(P.THUNK_MENU_WORDS)}', f'#define THUNK_CUSTOM {th(P.THUNK_CUSTOM_WORDS)}', '']))
     defs = [f'--defsym=hook_{n}={L[n]:#x}' for n in ('gate', 'save', 'has_prev', 'hook_menu', 'hook_custom', 'link_sync', 'texts', 'post_wrap', 'bkt_wrap',
                                                  'fs_end_get', 'fs_pps', 'fs_est', 'fs_shots', 'fs_remain', 'fs_refresh',
-                                                 'fs_set_end', 'fs_clear_end')]
+                                                 'fs_set_end', 'fs_clear_end', 'sl_wrap', 'sl_text')]
     obj = a.out / 'harness.o'
     run = lambda *c: subprocess.run(c, check=True)
     run('clang', '--target=aarch64-none-elf', '-O1', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
