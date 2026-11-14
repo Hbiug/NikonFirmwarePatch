@@ -224,7 +224,7 @@ static int lens_pos;
 static int fs_calls_refresh, fs_calls_redraw;
 static u64 fs_last_state;
 struct shown { u32 item, slot, style; char text[48]; };
-static struct shown shown[8];
+static struct shown shown[24];
 static int nshown;
 static char pending[48];
 static u32 pending_slot, pending_style;
@@ -260,22 +260,44 @@ __attribute__((section(".s_settext"), noinline, used)) void st_settext(const cha
     pending_slot = slot; pending_style = style;
 }
 __attribute__((section(".s_setcontent"), noinline, used)) void st_setcontent(u64 obj, u32 slot) {
-    if (nshown < 8) { shown[nshown].item = (u32)(obj - 0x500000UL) | (slot == pending_slot ? 0 : 0x80000000u); shown[nshown].slot = slot; shown[nshown].style = pending_style;
+    if (nshown < 24) { shown[nshown].item = (u32)(obj - 0x500000UL) | (slot == pending_slot ? 0 : 0x80000000u); shown[nshown].slot = slot; shown[nshown].style = pending_style;
                       for (int i = 0; i < 48; i++) shown[nshown].text[i] = pending[i]; nshown++; }
 }
-__attribute__((section(".s_sprintf"), noinline, used)) int st_sprintf(char *buf, const char *fmt, int v) {
-    char *o = buf;
+__attribute__((section(".s_sprintf"), noinline, used)) int st_sprintf(char *buf, const char *fmt, int v, int w) {
+    char *o = buf; int arg = 0;
     for (; *fmt; fmt++) {
-        if (fmt[0] == '%' && fmt[1] == 'd') {
-            char tmp[12]; int n = 0; u32 u = v < 0 ? (u32)-v : (u32)v;
-            if (v < 0) *o++ = '-';
+        int width = 0, conv = 0;
+        if (fmt[0] == '%' && fmt[1] == '0' && fmt[2] == '2' && fmt[3] == 'd') { width = 2; conv = 1; fmt += 3; }
+        else if (fmt[0] == '%' && fmt[1] == 'd') { conv = 1; fmt += 1; }
+        if (conv) {
+            int x = arg++ ? w : v;
+            char tmp[12]; int n = 0; u32 u = x < 0 ? (u32)-x : (u32)x;
+            if (x < 0) *o++ = '-';
             do { tmp[n++] = '0' + u % 10; u /= 10; } while (u);
+            while (n < width) tmp[n++] = '0';
             while (n) *o++ = tmp[--n];
-            fmt++;
         } else *o++ = *fmt;
     }
     *o = 0;
     return (int)(o - buf);
+}
+/* c5 lens stubs: parameter getter (by id) and status decode */
+static u32 lens_param_id[24], lens_param_val[24]; static int nparam_set; static int lens_param_calls;
+static int st34, st38, st2c, status_valid = 1;
+__attribute__((section(".s_lensparam"), noinline, used)) u32 st_lensparam(u32 id) {
+    lens_param_calls++;
+    for (int i = 0; i < nparam_set; i++) if (lens_param_id[i] == id) return lens_param_val[i];
+    return 0;
+}
+__attribute__((section(".s_lensstatus"), noinline, used)) u32 st_lensstatus(u8 *out) {
+    if (!status_valid) return 0;
+    *(volatile int *)(out + 0x2C) = st2c; *(volatile int *)(out + 0x34) = st34; *(volatile int *)(out + 0x38) = st38;
+    *(volatile int *)(out + 0x3C) = 0x77;      /* last field the real decoder writes */
+    return 1;
+}
+static void param(u32 id, u32 v) {
+    for (int i = 0; i < nparam_set; i++) if (lens_param_id[i] == id) { lens_param_val[i] = v; return; }
+    lens_param_id[nparam_set] = id; lens_param_val[nparam_set++] = v;
 }
 static int nshown_at_arrows;
 
@@ -533,6 +555,65 @@ static void focus_tests(void) {
     elem_missing = 0; fs_set(0, 0);
 }
 
+
+/* ---- c5: Focus end point sub-page distances and lens diagnostics (second code block) -------------------------------- */
+extern char lens_fs_end_ok2[], lens_fs_dist_text[], lens_fs_end_refresh[], lens_fs_val[];
+#define DIST (*(volatile unsigned short *)FS_DIST_RAM)
+static int streq(const char *a, const char *b) { for (; *a && *a == *b; a++, b++); return *a == *b; }
+static const struct { u32 raw; const char *text; } dist_cases[] = DIST_CASES;
+static const u32 info_items[] = INFO_ITEMS;
+static const struct { u32 id, val; } diag_params[] = DIAG_PARAMS;
+static const char *diag_expect_a[] = DIAG_EXPECT_A, *diag_expect_d[] = DIAG_EXPECT_D;
+static int shown_row(int i, u32 item, u32 slot, const char *t) {
+    return i < nshown && shown[i].item == item && shown[i].slot == slot && shown[i].style == 0x220 && streq(shown[i].text, t);
+}
+static void lens_tests(void) {
+    char buf[64]; int bad = 0;
+    for (u32 c = 0; c < sizeof dist_cases / sizeof dist_cases[0]; c++) {
+        for (int j = 0; j < 64; j++) buf[j] = 0x55;
+        call(lens_fs_dist_text, dist_cases[c].raw, (u64)buf, 0, 0);
+        if (!streq(buf, dist_cases[c].text)) { bad++; puts_("    raw "); puthex(dist_cases[c].raw); puts_(" got "); puts_(buf);
+                                               puts_(" want "); puts_(dist_cases[c].text); putc_('\n'); }
+    }
+    check(!bad, "c5 distance text: 2^(raw/2048 - 10) m, every case as the reference (incl. 0.35 / 1.58 / 17.4 m)");
+    /* OK action: set stores the position and the lens distance; clear forgets both */
+    static u8 erows[2 * 0x2C]; static u64 epage[4]; static u8 eobj[0x60]; static u64 ectx[1];
+    for (u32 i = 0; i < 2; i++) *(volatile u32 *)(erows + i * 0x2C + 0x18) = FS_ITEM_END0 + i;
+    epage[2] = (u64)erows; *(volatile u64 *)(eobj + 0x50) = (u64)epage; ectx[0] = (u64)eobj;
+    nparam_set = 0; param(P_DISTANCE, 21840); lens_pos = 777; DIST = 0xFFFF;
+    EROW(0); call(lens_fs_end_ok2, (u64)ectx, 0, 0, 0);
+    check(call(hook_fs_end_get, 0, 0, 0, 0) == 1 && fs_raw() == (777u ^ 0x80000000u) && DIST == 21840,
+          "c5 Set end point: position stored as before, plus the lens distance (parameter 0x117)");
+    param(P_DISTANCE, 0); EROW(0); call(lens_fs_end_ok2, (u64)ectx, 0, 0, 0);
+    check(call(hook_fs_end_get, 0, 0, 0, 0) == 1 && DIST == 0, "c5 Set end point without lens distance: distance 0 (unknown)");
+    DIST = 0x1234; EROW(1); call(lens_fs_end_ok2, (u64)ectx, 0, 0, 0);
+    check(call(hook_fs_end_get, 0, 0, 0, 0) == 0 && DIST == 0, "c5 Clear end point: position and distance forgotten");
+    /* refresh: end point distance, current distance, 13 diagnostic rows */
+    u64 st[0x20]; for (int i = 0; i < 0x20; i++) st[i] = 0; st[9] = 0x1000;
+    nparam_set = 0;
+    for (u32 i = 0; i < sizeof diag_params / sizeof diag_params[0]; i++) param(diag_params[i].id, diag_params[i].val);
+    param(P_DISTANCE, 17378); lens_pos = -7361; st2c = 2; st34 = -5; st38 = 123456; status_valid = 1;
+    param(P_DISTANCE, 21840); lens_pos = 777; EROW(0); call(lens_fs_end_ok2, (u64)ectx, 0, 0, 0);
+    param(P_DISTANCE, 17378); lens_pos = -7361;
+    nshown = 0;
+    long r = call(lens_fs_end_refresh, (u64)st, 0, 0, 0);
+    int ok = r == (long)(u64)st && nshown == (int)(sizeof info_items / sizeof info_items[0]);
+    ok &= shown_row(0, info_items[0], FS_INFO_SLOT0, "~1.58 m") && shown_row(1, info_items[1], FS_INFO_SLOT0 + 1, "~0.35 m");
+    for (int k = 0; k < N_DIAG; k++) ok &= shown_row(2 + k, info_items[2 + k], FS_INFO_SLOT0 + 2 + k, diag_expect_a[k]);
+    check(ok, "c5 sub-page refresh: end point ~1.58 m, current ~0.35 m, 13 diagnostic rows (two values each) in their slots");
+    if (!ok) for (int i = 0; i < nshown; i++) { puts_("    "); puthex(shown[i].item); puts_(" "); puthex(shown[i].slot); puts_(" "); puts_(shown[i].text); putc_('\n'); }
+    DIST = 0; nshown = 0; call(lens_fs_end_refresh, (u64)st, 0, 0, 0);
+    check(shown_row(0, info_items[0], FS_INFO_SLOT0, "SET"), "c5 sub-page refresh: end point without a known distance shows SET");
+    EROW(1); call(lens_fs_end_ok2, (u64)ectx, 0, 0, 0); param(P_DISTANCE, 0); status_valid = 0;
+    nshown = 0; call(lens_fs_end_refresh, (u64)st, 0, 0, 0);
+    ok = shown_row(0, info_items[0], FS_INFO_SLOT0, "--") && shown_row(1, info_items[1], FS_INFO_SLOT0 + 1, "--");
+    for (int k = 0; k < N_DIAG; k++) ok &= shown_row(2 + k, info_items[2 + k], FS_INFO_SLOT0 + 2 + k, diag_expect_d[k]);
+    check(ok, "c5 sub-page refresh: no end point / no lens distance -> --; no status record -> its fields read 0");
+    nshown = 0; lens_param_calls = 0;
+    check(call(lens_fs_end_refresh, 0, 0, 0, 0) == 0 && nshown == 0 && lens_param_calls == 0, "c5 sub-page refresh: no state -> nothing");
+    status_valid = 1; nparam_set = 0;
+}
+
 void main_(void) {
     u32 r;
     /* ---------------- link off: the stock path ---------------- */
@@ -782,6 +863,7 @@ save_done:
     check(call(hook_has_prev, 5, (u64)&T, 0, 0) == 0, "has_prev: empty transaction");
 
     focus_tests();
+    lens_tests();
     check(canary_bad == 0, "callee-saved registers x19..x29 and sp preserved by every routine called");
     if (canary_bad) { puts_("    canary mask "); puthex(canary_bad); putc_('\n'); }
     puts_("checks "); puthex(checks); puts_(" failures "); puthex(failures); putc_('\n');

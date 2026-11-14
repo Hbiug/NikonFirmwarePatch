@@ -30,6 +30,8 @@ SECTIONS {
   .s_mode        0x40FBC66C : { *(.s_mode) }
   .s_getds       0x41012C84 : { *(.s_getds) }
   .s_copyentry   0x41013A14 : { *(.s_copyentry) *(.s_copybody) }
+  .s_lensstatus  0x41068D8C : { *(.s_lensstatus) }
+  .s_lensparam   0x4109E130 : { *(.s_lensparam) }
   .s_setitem     0x410D61D0 : { *(.s_setitem) }
   .s_post        0x410DC874 : { *(.s_post) }
   .s_smenu       0x410DD1EC : { *(.s_smenu) }

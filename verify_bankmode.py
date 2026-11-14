@@ -45,6 +45,12 @@ FS_TEXTS = (b'SET', b'OFF', b'--', b'~%d', b'%d')
 FS_STOCK_CALLS = {0x40EC4544, 0x40C78518, 0x40C790DC, 0x40DB47F0, 0x40DB76B0, 0x40DB3F90, 0x4127D850, 0x403AF870,
                   0x40399EF0, 0x405EF210, 0x403B26C0, 0x4039E810, 0x405F6A68, 0x403F621C, 0x40FBC66C}
 SL_ARROWS = 0x405F6A64
+# c5: Focus end point sub-page with distances and lens diagnostics; second code block in the GUI area
+FS_INFO_ITEMS = (0x38D3, 0x38D4, 0x38D5, 0x38D6, 0x38D7, 0x38DA, 0x38DD, 0x38DE, 0x38E1, 0x38E2, 0x38E3, 0x38E5,
+                 0x38E7, 0x38E9, 0x38C5)
+FS_DIAG_CODES = 13
+FS_GUI_END = 0x8A2F00
+LENS_STOCK_CALLS = {0x4109E130, 0x41068D8C, 0x40DB3F90, 0x4127D850}
 SL_LAYOUT_EDITS = {0x43DF951C: 4, 0x43DF9534: 8, 0x43DF9560: 4, 0x43DF9578: 8, 0x43DF9754: 8, 0x43DF9798: 8}
 
 
@@ -316,18 +322,75 @@ def verify(stock_raw, out_raw, version, tag):
     require(BASE + 0x8A1000 <= cb < BASE + 0x8A3000 and BASE + 0x8A1000 <= page < BASE + 0x8A3000, 'state 0xB5 material outside the new material')
     entry = struct.unpack_from('<Q', eg1, cb - BASE)[0]
     require(BASE + 0x8A0000 <= entry < limit and by_addr[entry][0] == 'stp', 'end point sub-page entry')
-    require(struct.unpack_from('<4Q', eg1, cb - BASE + 8) == tuple(pm.NRAW_CALLBACKS[1:]), 'end point sub-page: stock option-page callbacks')
-    nrows = struct.unpack_from('<H', eg1, page - BASE + 0x20)[0]
-    require(nrows == 2, 'end point sub-page row count')
-    evp = struct.unpack_from('<Q', eg1, page - BASE + 0x18)[0]
+    cbs = struct.unpack_from('<4Q', eg1, cb - BASE + 8)
+    require(cbs[:3] == tuple(pm.NRAW_CALLBACKS[1:4]), 'end point sub-page: stock option-page callbacks')
+    refresh = cbs[3]
+    # c5: the page is the focus shift page's own record and layout with new rows (title changed)
+    fs_page = 0xA028CF400 - 0xA02808000 + 0x4B13000
+    stock_page, new_page = eg0[fs_page:fs_page + 0x50], eg1[page - BASE:page - BASE + 0x50]
+    require(new_page[:8] == stock_page[:8] and new_page[0x22:] == stock_page[0x22:] and
+            new_page[0x20:0x22] == struct.pack('<H', 2 + FS_DIAG_CODES + 2), 'end point sub-page record')
+    lay, rows_at, evp = struct.unpack_from('<3Q', new_page, 8)
+    stock_lay = eg0[0x43DF8D58 - BASE:0x43DF8EF0 - BASE]
+    new_lay = eg1[lay - BASE:lay - BASE + len(stock_lay)]
+    require(new_lay[:0x44] == stock_lay[:0x44] and new_lay[0x48:0xCC] == stock_lay[0x48:0xCC] and
+            new_lay[0xD0:] == stock_lay[0xD0:] and struct.unpack_from('<I', stock_lay, 0x44)[0] == 0x561 and
+            struct.unpack_from('<I', stock_lay, 0xCC)[0] == 0xA4C,
+            'end point sub-page layout (only the title and the "Interrupt after start" guide string change)')
+    nrows = struct.unpack_from('<H', new_page, 0x20)[0]
+    require(nrows == 4 + FS_DIAG_CODES, 'end point sub-page row count')
+    tail = struct.unpack_from('<11I', eg0, FS_ROWS + 44)[7:]
+    items = [0x35BA, 0x35BB] + list(FS_INFO_ITEMS[:nrows - 2])
+    for row in range(nrows):
+        r = struct.unpack_from('<11I', eg1, rows_at - BASE + 44 * row)
+        require(r[1:4] == (0xFFFF, 0xFFFF, 0) and r[4] == (0x101000 if row < 2 else 0x101009) and r[5] == 0xFFFF and
+                r[6] == items[row] and r[7:] == tail, f'end point sub-page row {row}')
+    # the second code block (GUI area): from the OK action up to its 2^x table
+    ok_action = struct.unpack_from('<4Q', eg1, struct.unpack_from('<Q', eg1, evp - BASE)[0] - BASE + 32 * [
+        j for j in range(14) if struct.unpack_from('<4Q', eg0, pm.NRAW_EVENTS + 32 * j)[1] == pm.NRAW_OK][0])[1]
+    exp = b''.join(struct.pack('<I', round(65536 * 2 ** (i / 32))) for i in range(33))
+    lens_lo = ok_action
+    lens_hi = BASE + eg1.find(exp, lens_lo - BASE)
+    require(BASE + 0x8A1000 <= lens_lo < lens_hi < BASE + FS_GUI_END and (lens_hi - lens_lo) % 4 == 0,
+            'second code block outside the GUI area')
+    lens_rows = disasm(eg1[lens_lo - BASE:lens_hi - BASE], lens_lo)
+    lens_by = {a: (m, o) for a, m, o in lens_rows}
+    require(lens_by[lens_lo][0] == 'stp' and refresh in lens_by and lens_by[refresh] == ('sub', 'sp, sp, #0xd0'),
+            'second code block: OK action / refresh entries')
+    main_ok = {a for a in addrs}
+    lens_calls = set()
+    for a, m, o in lens_rows:
+        if m in ('b', 'bl') or m.startswith('b.') or m in ('cbz', 'cbnz', 'tbz', 'tbnz'):
+            tgt = int(o.split()[-1], 16)
+            if not lens_lo <= tgt < lens_hi:
+                require(tgt in main_ok or tgt in LENS_STOCK_CALLS, f'second code block: branch at {a:#x} to {tgt:#x}')
+                lens_calls.add(tgt)
+    require(LENS_STOCK_CALLS <= lens_calls, 'second code block: expected stock calls missing')
+    # its only store to memory outside the stack: the end point distance halfword in the zero gap (RW alias)
+    stores = [(a, m, o) for a, m, o in lens_rows if m.startswith('st') and 'sp' not in o]
+    require(len(stores) == 1 and stores[0][1] == 'strh', 'second code block: unexpected store')
+    require(not any(eg1[0x8A2F00:0x8A2F10]) and not any(eg0[0x8A2F00:0x8A2F10]), 'distance halfword is not in the zero gap')
+    consts, cur = [], None
+    for a, m, o in lens_rows:
+        if m == 'mov' and o.startswith('x9, #'):
+            cur = int(o.split('#')[1], 16)
+        elif m == 'movk' and o.startswith('x9, #') and cur is not None:
+            parts = o.split('#')
+            cur |= int(parts[1].split(',')[0], 16) << int(parts[2])
+            if '#48' in o:
+                consts.append(cur)
+                cur = None
+    require(consts == [0xA10002F00] * 2 and 0xA10002F00 == BASE + 0x8A2F00 + 0xA0F800000 - 0x40200000,
+            f'second code block: distance address {[hex(c) for c in consts]}')
     for row in range(nrows):
         tbl = struct.unpack_from('<Q', eg1, evp - BASE + 8 * row)[0]
         for j in range(14):
             e, a, g, tg = struct.unpack_from('<4Q', eg1, tbl - BASE + 32 * j)
             e0, a0, g0, t0 = struct.unpack_from('<4Q', eg0, pm.NRAW_EVENTS + 32 * j)
-            if a0 == pm.NRAW_OK:
-                require(BASE + 0x8A0000 <= a < limit and by_addr[a][0] == 'stp' and (e, g, tg) == (e0, g0, 0x68D),
-                        f'end point sub-page row {row}: OK -> our action, back')
+            if a0 == pm.NRAW_OK and row < 2:
+                require(a == ok_action and (e, g, tg) == (e0, g0, 0x68D), f'end point sub-page row {row}: OK -> our action, back')
+            elif a0 == pm.NRAW_OK:
+                require((e, a, g, tg) == (e0, 0, g0, 0x68C), f'end point sub-page row {row}: OK stays')
             else:
                 require((e, a, g, tg) == (e0, a0, g0, t0), f'end point sub-page row {row}: transition {e0:#x} changed')
     # standby: the only mode-0xC request calls a hook that forgets the end point and tail-calls the request

@@ -139,7 +139,7 @@ FS_SLOT_SHOTS, FS_SLOT_SET = 5, 8
 # copied with a tenth entry for 0x2C86 and the two instructions that load its address and count are changed.
 FS_NAV_TABLE, FS_NAV_COUNT = 0x42B29ED0, 9
 FS_NAV_SITES = {0x405EF4D0: 0xD293DA16, 0x405EF4D8: 0xF2A85656, 0x405EF4EC: 0x52800121}   # mov x22,#lo; movk x22,#hi; mov w1,#9
-FS_GUI_LIMIT = 0x8A3000
+FS_GUI_LIMIT = 0x8A2F00                                # c5: the end point distance lives at 0x8A2F00
 # ---- focus step width slider (state 0xB3, b9): the estimate on the slider page itself -----------------------------
 # The page has two dynamic labels, "1" (element 0x4DE, text slot 0) and "10" (0x4DF, slot 1), style 0x55, both CENTRED in
 # their layout box and clipped to it; every element paints its box background, so a box must not overlap another
@@ -166,9 +166,37 @@ SL_RECTS_NEW = {SL_ONE_RECT: (0xDF00AE, 0xF70222), SL_TEN_RECT: (0xDF0222, 0xDF0
 FS_CALLBACKS = 0xA028E8060 - 0xA02808000 + 0x4B13000   # five pointers of state 0xB1 (data image)
 F_FS_REFRESH, F_FS_TOGGLE = 0x405EF210, 0x4051226C
 FS_TEXT = (b'SET', b'OFF', b'--', b'~%d', b'%d')      # after STATE_TEXT, same 16-byte slots
+# ---- c5: distances and lens diagnostics on the Focus end point sub-page -------------------------------------------
+# The lens module keeps the lens's data packets in RAM; 0x4109E130(id) reads one parameter from them (table 0xA02A147F8,
+# id * 0x28: packet / offset for each protocol layout, reader, size; pure memory reads).  0x4107B704, which fills the lens
+# block of every shot's MakerNote (found with an emulator write watch), takes FocusDistance from parameter 0x117 (packet
+# 0xC +0x2E, u16) and FocusStepsFromInfinity from 0xF8 (packet 0xD +0xB).  Distance in metres = 2^(raw / 2048 - 10)
+# (fits the user's ExifTool values 0.35 / 1.58 / 17.4 m exactly: raw 17378 / 21840 / 28922).  0x41068D8C(out) decodes
+# the newest lens status record (position, drive-end bits, two unknown 32-bit fields).
+F_LENS_PARAM, F_LENS_STATUS = 0x4109E130, 0x41068D8C
+P_DISTANCE = 0x117
+# distance of the stored end point (u16 raw, 0 = unknown): zero gap after the GUI material, written through the text RW
+# alias (as the toolkit does for its own state); the loader copies the gap from the image at every boot, so it is 0 then.
+FS_DIST_OFF = 0x8A2F00
+FS_DIST_RAM = FS_DIST_OFF + 0x40160000 + 0xA0F800000 - 0x40200000      # 0xA10002F00
+# sub-page rows after Set / Clear: two distance rows, then diagnostic rows of two raw values each (temporary, c5).
+# Codes: lens parameter ids, or 0x8000 position, 0x8001 drive-end bits, 0x8002 / 0x8003 the status record's two
+# unknown 32-bit fields (decoded +0x34 / +0x38).
+FS_INFO_ITEMS = (0x38D3, 0x38D4, 0x38D5, 0x38D6, 0x38D7, 0x38DA, 0x38DD, 0x38DE, 0x38E1, 0x38E2, 0x38E3, 0x38E5,
+                 0x38E7, 0x38E9, 0x38C5)                    # unused row item ids (no row, no code constant)
+FS_INFO_SLOT0 = 9                                         # text slots 9.. (the focus shift page uses 5..8)
+FS_DIAG = ((0x8000, 0xF8), (P_DISTANCE, 0x8001), (0x111, 0x112), (0xEC, 0xED), (0xF9, 0x115), (0xB0, 0xAF),
+           (0xAE, 0x102), (0x103, 0x143), (0xB5, 0xB6), (0xB7, 0xB8), (0x8002, 0x8003), (0x4, 0x5), (0xA6, 0xA7))
+FS_DIAG_LABELS = ('D1 pos / steps', 'D2 dist / end', 'D3 111 / 112', 'D4 EC / ED', 'D5 F9 / 115', 'D6 B0 / AF',
+                  'D7 AE / 102', 'D8 103 / 143', 'D9 B5 / B6', 'D10 B7 / B8', 'D11 S34 / S38', 'D12 4 / 5',
+                  'D13 A6 / A7')
+FS_PAGE = 0xA028CF400 - 0xA02808000 + 0x4B13000             # page record of the focus shift page (state 0xB1)
+FS_LAYOUT, FS_LAYOUT_BYTES = 0x43DF8D58 - BASE, 0x198
+FS_GUIDE_STRING, FS_GUIDE_AT = 0xA4C, 0xCC              # "Interrupt after start ->" guide of the focus shift layout
+FS_VALUE_ROW = 0x101009                                # row kind: text value, no arrow (emulator: 0x1x01 / 0x1x05 kinds show a picture)
 FS_ENGLISH = ('Focus end point', 'Clear end point', 'Narrow' + ' ' * 4 + 'Est. shots' + ' ' * 6 + 'Wide ', '',
-              'Set end point')
-FS_STRING_FIRST, FS_STRING_COUNT = 3143, 5
+              'Set end point', 'End point', 'Current focus') + FS_DIAG_LABELS
+FS_STRING_FIRST, FS_STRING_COUNT = 3143, len(FS_ENGLISH)
 # Focus end point sub-page (c3): the end point row opens state 0xB5, the stock child page of that (formerly hidden) row,
 # rebuilt from the N-RAW option page: "Set end point" / "Clear end point"; OK runs fs_end_ok and goes back.
 STATE_FS_END = 0xB5
@@ -736,6 +764,198 @@ def _focus(b):
     b.ret()
 
 
+FS_EXP_TABLE = tuple(round(65536 * 2 ** (i / 32)) for i in range(33))   # 2^(i/32) in Q16
+FS_DIST_TEXT = (b'--', b'SET', b'~%d.%02d m', b'~%d.%d m', b'~%d m', b'%d / %d')
+
+
+def lens_code(cs, at, main):
+    """Second code block (GUI area, executable): the Focus end point sub-page's OK action and value refresh, the metre
+    text and the diagnostic values.  `main` = labels of the main code block (absolute addresses)."""
+    b = Block(at)
+    # fs_end_ok2(context): the c3 action (set / clear), then remember the lens distance of the new end point
+    b.label('fs_end_ok2')
+    b.stp_pre(19, 30, -0x10)
+    b.bl(main['fs_end_ok'])
+    b.bl(main['fs_end_get'])
+    b.mov_w(19, 0)
+    b.cbz_w(0, 'ok2_put')                     # cleared: distance unknown
+    b.mov_w(0, P_DISTANCE)
+    b.bl(F_LENS_PARAM)
+    b.mov_wr(19, 0)
+    b.label('ok2_put')
+    b.mov_x64(9, FS_DIST_RAM)
+    b.strh_w(19, 9)
+    b.ldp_post(19, 30, 0x10)
+    b.ret()
+    # fs_dist_text(w0 = raw distance, x1 = buffer): "~0.35 m", "~1.58 m", "~17.4 m", "~120 m"
+    b.label('fs_dist_text')
+    b.stp_pre(19, 30, -0x10)
+    b.mov_x(19, 1)
+    _r(b, 0x530B7C09, 'lsr w9, w0, #11')        # e = raw >> 11
+    _r(b, 0x1200280A, 'and w10, w0, #0x7ff')    # f = raw & 2047
+    _r(b, 0x53067D4B, 'lsr w11, w10, #6')       # table index
+    _r(b, 0x1200154C, 'and w12, w10, #0x3f')    # interpolation weight /64
+    b.adr(13, 'exp')
+    _r(b, 0xB86B59AE, 'ldr w14, [x13, w11, uxtw #2]')
+    _add_wi(b, 11, 11, 1)
+    _r(b, 0xB86B59AF, 'ldr w15, [x13, w11, uxtw #2]')
+    b.sub_w(15, 15, 14)
+    _r(b, 0x1B0C7DEF, 'mul w15, w15, w12')
+    _r(b, 0x0B4F19CE, 'add w14, w14, w15, lsr #6')   # m = 2^(f/2048) in Q16
+    b.mov_w(15, 100)
+    _r(b, 0x9BAF7DCE, 'umull x14, w14, w15')
+    _r(b, 0x9AC921CE, 'lsl x14, x14, x9')
+    _r(b, 0xD2A0400F, 'mov x15, #0x2000000')
+    _r(b, 0x8B0F01CE, 'add x14, x14, x15')
+    _r(b, 0xD35AFDCE, 'lsr x14, x14, #26')       # centimetres = round(100 * 2^(raw/2048) / 1024)
+    b.mov_w(8, 100)
+    b.cmp_wi(14, 1000)
+    b.b_cond('hs', 'dt_dm')
+    _r(b, 0x1AC809C2, 'udiv w2, w14, w8')
+    _r(b, 0x1B08B843, 'msub w3, w2, w8, w14')
+    b.adr(1, 'fmt_cm')
+    b.b('dt_print')
+    b.label('dt_dm')
+    _add_wi(b, 14, 14, 5)
+    b.mov_w(8, 10)
+    _r(b, 0x1AC809CE, 'udiv w14, w14, w8')       # decimetres
+    b.cmp_wi(14, 1000)
+    b.b_cond('hs', 'dt_m')
+    _r(b, 0x1AC809C2, 'udiv w2, w14, w8')
+    _r(b, 0x1B08B843, 'msub w3, w2, w8, w14')
+    b.adr(1, 'fmt_dm')
+    b.b('dt_print')
+    b.label('dt_m')
+    _add_wi(b, 14, 14, 5)
+    _r(b, 0x1AC809C2, 'udiv w2, w14, w8')
+    b.adr(1, 'fmt_m')
+    b.label('dt_print')
+    b.mov_x(0, 19)
+    b.bl(F_SPRINTF)
+    b.ldp_post(19, 30, 0x10)
+    b.ret()
+    # fs_val(w0 = code, x1 = decoded lens status) -> w0: a lens parameter, or 0x8000 position / 0x8001 drive-end bits /
+    # 0x8002, 0x8003 the status record's two unknown fields
+    b.label('fs_val')
+    b.tbz_w(0, 15, 'val_param')
+    _r(b, 0x12001C08, 'and w8, w0, #0xff')
+    b.cbz_w(8, 'val_pos')
+    b.ldr_w(0, 1, 0x2C)
+    b.cmp_wi(8, 1)
+    b.b_cond('eq', 'val_ret')
+    b.ldr_w(0, 1, 0x34)
+    b.cmp_wi(8, 2)
+    b.b_cond('eq', 'val_ret')
+    b.ldr_w(0, 1, 0x38)
+    b.label('val_ret')
+    b.ret()
+    b.label('val_pos')
+    b.b(F_LENS_POS)
+    b.label('val_param')
+    b.b(F_LENS_PARAM)
+    # fs_end_refresh(state): value refresh of the sub-page (the N-RAW page's is an empty `ret`): end point and current
+    # focus distance, then the diagnostic rows.  Frame: text buffer sp+0, lens status sp+0x40 (0x50 bytes).
+    b.label('fs_end_refresh')
+    _r(b, 0xD10343FF, 'sub sp, sp, #0xd0')
+    b.stp(19, 20, 0x90)
+    b.stp(21, 22, 0xA0)
+    b.stp(23, 24, 0xB0)
+    b.str_x(30, 31, 0xC0)
+    b.mov_x(19, 0)
+    b.cbz_x(19, 'er_done')
+    for k in range(5):
+        _r(b, 0xA9007FFF | ((0x40 + 0x10 * k) // 8) << 15, f'stp xzr, xzr, [sp, #{0x40 + 0x10 * k:#x}]')
+    b.add_xi(0, 31, 0x40)
+    b.bl(F_LENS_STATUS)
+    # end point row
+    b.bl(main['fs_end_get'])
+    b.cbz_w(0, 'er_end_dash')
+    b.mov_x64(9, FS_DIST_RAM)
+    b.ldrh_w(0, 9)
+    b.cbz_w(0, 'er_end_set')
+    b.add_xi(1, 31, 0)
+    b.bl('fs_dist_text')
+    b.add_xi(0, 31, 0)
+    b.b('er_end_show')
+    b.label('er_end_set')
+    b.adr(0, 'txt_set')
+    b.b('er_end_show')
+    b.label('er_end_dash')
+    b.adr(0, 'txt_dash')
+    b.label('er_end_show')
+    b.mov_w(1, FS_INFO_ITEMS[0])
+    b.mov_x(2, 19)
+    b.mov_w(3, FS_INFO_SLOT0)
+    b.bl(main['fs_row_text'])
+    # current focus row
+    b.mov_w(0, P_DISTANCE)
+    b.bl(F_LENS_PARAM)
+    b.cbz_w(0, 'er_now_dash')
+    b.add_xi(1, 31, 0)
+    b.bl('fs_dist_text')
+    b.add_xi(0, 31, 0)
+    b.b('er_now_show')
+    b.label('er_now_dash')
+    b.adr(0, 'txt_dash')
+    b.label('er_now_show')
+    b.mov_w(1, FS_INFO_ITEMS[1])
+    b.mov_x(2, 19)
+    b.mov_w(3, FS_INFO_SLOT0 + 1)
+    b.bl(main['fs_row_text'])
+    # diagnostic rows: {u16 item, u16 slot, u16 code a, u16 code b}
+    b.adr(20, 'diag')
+    b.mov_w(21, len(FS_DIAG))
+    b.label('er_diag')
+    b.ldrh_w(0, 20, 4)
+    b.add_xi(1, 31, 0x40)
+    b.bl('fs_val')
+    b.mov_wr(22, 0)
+    b.ldrh_w(0, 20, 6)
+    b.add_xi(1, 31, 0x40)
+    b.bl('fs_val')
+    b.mov_wr(3, 0)
+    b.mov_wr(2, 22)
+    b.adr(1, 'fmt_pair')
+    b.add_xi(0, 31, 0)
+    b.bl(F_SPRINTF)
+    b.add_xi(0, 31, 0)
+    b.ldrh_w(1, 20, 0)
+    b.mov_x(2, 19)
+    b.ldrh_w(3, 20, 2)
+    b.bl(main['fs_row_text'])
+    b.add_xi(20, 20, 8)
+    b.subs_wi(21, 21, 1)
+    b.b_cond('ne', 'er_diag')
+    b.label('er_done')
+    b.mov_x(0, 19)
+    b.ldp(19, 20, 0x90)
+    b.ldp(21, 22, 0xA0)
+    b.ldp(23, 24, 0xB0)
+    b.ldr_x(30, 31, 0xC0)
+    _r(b, 0x910343FF, 'add sp, sp, #0xd0')
+    b.ret()
+    # ---- data (read-only) ---------------------------------------------------------------------------------------
+    names = ('txt_dash', 'txt_set', 'fmt_cm', 'fmt_dm', 'fmt_m', 'fmt_pair')
+    code_len = len(b.items) * 4
+    data = b''
+    labels = {}
+    exp = b''.join(struct.pack('<I', v) for v in FS_EXP_TABLE)
+    labels['exp'] = len(data); data += exp
+    for name, text in zip(names, FS_DIST_TEXT):
+        labels[name] = len(data); data += text.ljust(16, b'\0')
+    labels['diag'] = len(data)
+    for k, (a, c) in enumerate(FS_DIAG):
+        data += struct.pack('<4H', FS_INFO_ITEMS[2 + k], FS_INFO_SLOT0 + 2 + k, a, c)
+    for name, off in labels.items():
+        b.labels[name] = at + code_len + off
+    listing = b.listing(cs)
+    for index, text in getattr(b, 'expect', {}).items():
+        got = _norm(listing[index][2])
+        if got != _norm(text):
+            raise ValueError(f'lens code raw word {index}: {got!r} != {text!r}')
+    return b, b.bytes() + data, listing
+
+
 def _hook(b, name, own_id, other_id, stock_thunk, switch_other):
     """Wrapper for one dispatcher call site: the stock handler, then (link on) the same switch on the other bank type.
 
@@ -1186,7 +1406,7 @@ def strings(context):
     ids = context.add('bank-store', [list(ENGLISH) for _ in range(36)])
     fs = context.add('focus-end', [list(FS_ENGLISH) for _ in range(36)])
     return dict(label_id=ids[0], option_ids=ids[1:1 + N_OPTIONS], fs_set_id=fs[0], fs_clear_id=fs[1],
-                sl_top_id=fs[2], sl_empty_id=fs[3], fs_end_ids=(fs[4], fs[1]))
+                sl_top_id=fs[2], sl_empty_id=fs[3], fs_end_ids=(fs[4], fs[1]), fs_info_ids=tuple(fs[5:]))
 
 
 def menu(img, ids, blk):
@@ -1275,7 +1495,7 @@ def menu(img, ids, blk):
                 state=hex(pm.state_ram(pm.STATE_NEW)), gui_end=at)
 
 
-def focus_menu(img, ids, blk, at):
+def focus_menu(img, ids, blk, at, cs):
     """Focus shift page (state 0xB1): show the two always-hidden rows as "Focus end point" / "Clear focus end point"."""
     rows = [struct.unpack_from('<11I', img.old, FS_ROWS + 44 * k) for k in range(FS_COUNT)]
     if rows[FS_ROW_SHOTS][0] != 0xAB0 or rows[FS_ROW_SHOTS][4:7] != (0x101049, 0xFFFF, FS_ITEM_SHOTS) or \
@@ -1343,50 +1563,92 @@ def focus_menu(img, ids, blk, at):
     site = FS_HIDE_SITES[0]
     img.put(site - BASE, struct.pack('<I', FS_SHOW), f'focus shift page entry: show the end point row instead of hiding it ({site:#x})',
             expect=struct.pack('<I', FS_HIDE_STOCK))
-    sub = end_menu(img, ids, blk, at)
+    at = (at + 15) & ~15
+    lens, lens_bytes, lens_listing = lens_code(cs, va(at), blk.labels)
+    img.put(at, lens_bytes, 'code (GUI area): end point OK + distance, sub-page refresh, metre text, diagnostics, data',
+            expect_zero=True)
+    lens_at = at
+    at += len(lens_bytes)
+    sub = end_menu(img, ids, blk, lens, at)
     at = int(sub.pop('gui_end'), 16)
+    sub['lens_code'] = dict(at=hex(va(lens_at)), bytes=len(lens_bytes),
+                            labels={k: hex(v) for k, v in lens.labels.items()},
+                            listing=[dict(va=hex(x), word=w, text=t) for x, w, t in lens_listing])
     if img.u64(FS_CALLBACKS + 32) != F_FS_REFRESH:
         raise ValueError('stock focus shift refresh callback differs')
     img.put(FS_CALLBACKS + 32, struct.pack('<Q', blk.labels['fs_refresh']), 'focus shift page value refresh callback -> wrapper')
     return dict(tables=pointers, cursor_table=hex(nav_va), sub_page=sub, gui_end=hex(at))
 
 
-def end_menu(img, ids, blk, at):
-    """Focus end point sub-page in state 0xB5 (N-RAW option page template, as menu() does for the bank page):
-    "Set end point" / "Clear end point", OK -> fs_end_ok, then back to the focus shift page (stock option-page OK)."""
-    layout = bytearray(img.old[pm.NRAW_LAYOUT:pm.NRAW_LAYOUT + 0x110])
-    if struct.unpack_from('<I', layout, 0x44)[0] != 0x8A6:
-        raise ValueError('stock layout: title id not where expected')
+def end_menu(img, ids, blk, lens, at):
+    """Focus end point sub-page in state 0xB5, built on the focus shift page's own layout and page record (full-width
+    rows with a value text at the right): "Set end point" / "Clear end point" (OK -> fs_end_ok2, then back to the focus
+    shift page), then value rows that OK leaves alone: end point distance, current focus distance and the temporary
+    lens diagnostic rows.  Values are written by fs_end_refresh (the page's value-refresh callback)."""
+    layout = bytearray(img.old[FS_LAYOUT:FS_LAYOUT + FS_LAYOUT_BYTES])
+    if struct.unpack_from('<I', layout, 0x44)[0] != 0x561 or img.u64(FS_PAGE + 8) != BASE + FS_LAYOUT or \
+            img.u64(FS_PAGE + 0x10) != BASE + FS_ROWS or struct.unpack_from('<H', img.old, FS_PAGE + 0x20)[0] != FS_COUNT or \
+            FS_LAYOUT + FS_LAYOUT_BYTES != FS_ROWS:
+        raise ValueError('stock focus shift page record or layout differs')
     struct.pack_into('<I', layout, 0x44, ids['fs_set_id'])
-    stock_row = struct.unpack_from('<11I', img.old, pm.NRAW_ROWS)
-    n = len(ids['fs_end_ids'])
-    rows = b''.join(struct.pack('<11I', ids['fs_end_ids'][i], *stock_row[1:6], FS_ITEM_END0 + i, *stock_row[7:])
-                    for i in range(n))
-    ok = blk.labels['fs_end_ok']
-    table = pm.events(img, pm.NRAW_EVENTS, 14, lambda e, a, g, t: (e, ok if a == pm.NRAW_OK else a, g, t))
-    if table.count(struct.pack('<QQQ', ok, 0, 0x68D)) != 3:
+    # the focus shift page's "Interrupt after start -> OK" guide (string 0xA4C) gets the empty string
+    guide = [k for k in range(0, len(layout), 4) if struct.unpack_from('<I', layout, k)[0] == FS_GUIDE_STRING]
+    if guide != [FS_GUIDE_AT]:
+        raise ValueError(f'stock focus shift layout: guide string at {guide}')
+    struct.pack_into('<I', layout, FS_GUIDE_AT, ids['sl_empty_id'])
+    tail = struct.unpack_from('<11I', img.old, FS_ROWS + 44 * FS_ROW_SHOTS)[7:]
+    plain = struct.unpack_from('<11I', img.old, FS_ROWS)[4]
+    if plain != 0x101000:
+        raise ValueError('stock focus shift row types differ')
+    value = FS_VALUE_ROW                    # text value at the right, no arrow (0x101040 is an arrow only)
+    info = ids['fs_info_ids']
+    if len(info) != 2 + len(FS_DIAG) or len(FS_INFO_ITEMS) < len(info):
+        raise ValueError('focus end point sub-page: strings / items do not match the rows')
+    spec = [(ids['fs_end_ids'][i], plain, FS_ITEM_END0 + i, 0) for i in range(2)] + \
+           [(info[k], value, FS_INFO_ITEMS[k], 1) for k in range(len(info))]
+    n = len(spec)
+    rows = b''.join(struct.pack('<11I', label, 0xFFFF, 0xFFFF, 0, kind, 0xFFFF, item, *tail)
+                    for label, kind, item, _ in spec)
+    ok = lens.labels['fs_end_ok2']
+    act = pm.events(img, pm.NRAW_EVENTS, 14, lambda e, a, g, t: (e, ok if a == pm.NRAW_OK else a, g, t))
+    if act.count(struct.pack('<QQQ', ok, 0, 0x68D)) != 3:
         raise ValueError('expected three OK transitions (back) in the stock option table')
+    hits = []
+
+    def to_stay(e, a, g, t):
+        if a == pm.NRAW_OK:
+            hits.append((e, t))
+            return e, 0, g, 0x68C
+        return e, a, g, t
+    stay = pm.events(img, pm.NRAW_EVENTS, 14, to_stay)
+    if [t for e, t in hits] != [0x68D] * 3:
+        raise ValueError(f'expected three OK transitions (back) to turn into stay: {hits}')
     at = (at + 15) & ~15
     layout_at = at; at += len(layout)
     rows_at = at; at += len(rows)
     at = (at + 7) & ~7
-    table_at = at; at += len(table)
+    act_at = at; at += len(act)
+    stay_at = at; at += len(stay)
     evptr_at = at; at += n * 8
     callbacks_at = at; at += 5 * 8
     page_at = at; at += 0x50
     if at > FS_GUI_LIMIT:
         raise ValueError('GUI area too small for the end point sub-page')
-    page = bytearray(img.old[pm.NRAW_PAGE:pm.NRAW_PAGE + 0x50])
+    page = bytearray(img.old[FS_PAGE:FS_PAGE + 0x50])
     struct.pack_into('<3Q', page, 8, va(layout_at), va(rows_at), va(evptr_at))
     struct.pack_into('<H', page, 0x20, n)
-    img.put(layout_at, layout, 'focus end point sub-page layout (N-RAW layout, title "Focus end point")', expect_zero=True)
-    img.put(rows_at, rows, 'focus end point sub-page rows', expect_zero=True)
-    img.put(table_at, table, 'focus end point sub-page transition table (shared by both rows)', expect_zero=True)
-    img.put(evptr_at, struct.pack(f'<{n}Q', *([va(table_at)] * n)), 'focus end point sub-page transition table pointers',
+    img.put(layout_at, layout, 'focus end point sub-page layout (focus shift layout, title "Focus end point")',
             expect_zero=True)
-    img.put(callbacks_at, struct.pack('<5Q', blk.labels['fs_end_entry'], *pm.NRAW_CALLBACKS[1:]),
-            'focus end point sub-page callbacks', expect_zero=True)
-    img.put(page_at, page, 'focus end point sub-page page record', expect_zero=True)
+    img.put(rows_at, rows, f'focus end point sub-page rows ({n}: set, clear, 2 distances, {len(FS_DIAG)} diagnostics)',
+            expect_zero=True)
+    img.put(act_at, act, 'focus end point sub-page transition table: set / clear (OK -> action, back)', expect_zero=True)
+    img.put(stay_at, stay, 'focus end point sub-page transition table: value rows (OK stays)', expect_zero=True)
+    img.put(evptr_at, struct.pack(f'<{n}Q', *[va(stay_at if s[3] else act_at) for s in spec]),
+            'focus end point sub-page transition table pointers', expect_zero=True)
+    img.put(callbacks_at, struct.pack('<5Q', blk.labels['fs_end_entry'], *pm.NRAW_CALLBACKS[1:4],
+                                      lens.labels['fs_end_refresh']),
+            'focus end point sub-page callbacks (entry, value refresh)', expect_zero=True)
+    img.put(page_at, page, 'focus end point sub-page page record (focus shift page record, new rows)', expect_zero=True)
     record = pm.STATE_TABLE + pm.STATE_SIZE * STATE_FS_END
     st = struct.unpack_from('<HHI11Q', img.old, record)
     nraw_state = struct.unpack_from('<HHI11Q', img.old, pm.STATE_TABLE + pm.STATE_SIZE * pm.STATE_NRAW)
@@ -1397,7 +1659,8 @@ def end_menu(img, ids, blk, at):
             expect=struct.pack('<Q', STATE_FS_END_STOCK[0]))
     img.put(record + 0x50, struct.pack('<Q', va(page_at)), 'state 0xB5: page record -> focus end point sub-page',
             expect=struct.pack('<Q', STATE_FS_END_STOCK[1]))
-    return dict(page=hex(va(page_at)), callbacks=hex(va(callbacks_at)), table=hex(va(table_at)), gui_end=hex(at))
+    return dict(page=hex(va(page_at)), callbacks=hex(va(callbacks_at)), table=hex(va(act_at)),
+                stay_table=hex(va(stay_at)), rows=n, gui_end=hex(at))
 
 
 def slider_layout(img, ids):
@@ -1476,7 +1739,7 @@ def build_main(eg, strings_context):
             all(struct.unpack_from('<I', eg, a - BASE)[0] == FS_HIDE_STOCK for a in FS_HIDE_SITES) and
             all(struct.unpack_from('<I', eg, a + 8 - BASE)[0] == 0x97F70B75 - (a - 0x405EF0F4) // 4 for a in FS_HIDE_SITES),
             'stock focus shift page entry callback differs')
-    fs_where = focus_menu(img, ids, blk, where.pop('gui_end'))
+    fs_where = focus_menu(img, ids, blk, where.pop('gui_end'), cs)
     require(struct.unpack_from('<I', eg, FS_FRAME_SITE - BASE)[0] == FS_FRAME_STOCK and
             struct.unpack_from('<6I', eg, 0x40FCEA1C - BASE)[:1] == (0xD2900E08,), 'stock focus shift frame code differs')
     require(struct.unpack_from('<I', eg, FS_START_SITE - BASE)[0] == FS_START_STOCK and
