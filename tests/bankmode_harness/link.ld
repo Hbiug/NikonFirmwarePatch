@@ -27,6 +27,7 @@ SECTIONS {
   .s_lensk       0x40DB47F0 : { *(.s_lensk) }
   .s_def2pulse   0x40DB76B0 : { *(.s_def2pulse) }
   .s_prop        0x40EC4544 : { *(.s_prop) }
+  .s_mode        0x40FBC66C : { *(.s_mode) }
   .s_getds       0x41012C84 : { *(.s_getds) }
   .s_copyentry   0x41013A14 : { *(.s_copyentry) *(.s_copybody) }
   .s_setitem     0x410D61D0 : { *(.s_setitem) }

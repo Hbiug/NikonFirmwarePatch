@@ -174,6 +174,7 @@ FS_STRING_FIRST, FS_STRING_COUNT = 3143, 5
 STATE_FS_END = 0xB5
 STATE_FS_END_STOCK = (0xA028E8100, 0xA028CF540)        # its stock callbacks and page record pointers
 FS_ITEM_END0 = pm.ITEM_OPTION0 + 5                     # 0x35BA / 0x35BB: Set / Clear
+F_MODE_REQUEST, WAKE_SITE, WAKE_STOCK = 0x40FBC66C, 0x40FADB58, 0x94003AC5   # shooting-control mode request; bl of mode 0xC (standby)
 
 # ---- new material (same text-gap regions as the ProRes row; this patch does not combine with it) ------------
 # ---- the row lives in the Setup menu (state 0x297), in the slot of its last row "Special shooting" (item 0x3968), which
@@ -571,6 +572,17 @@ def _focus(b):
     b.ldr_x(20, 31, 0x10)
     b.ldp_post(19, 30, 0x20)
     b.ret()
+    # fs_wake(mode, reason, data): the only request of shooting-control mode 0xC (0x40FADB58: the standby timer puts the
+    # camera to sleep; modes 0xE / 0xD follow).  The lens position counter restarts across the sleep, so a stored end
+    # point would point elsewhere afterwards: forget it, then make the stock request.
+    b.label('fs_wake')
+    b.stp_pre(0, 30, -0x20)
+    b.stp(1, 2, 0x10)
+    b.mov_w(0, 0)
+    b.bl('fs_end_put')
+    b.ldp(1, 2, 0x10)
+    b.ldp_post(0, 30, 0x20)
+    b.b(F_MODE_REQUEST)
     # fs_end_entry(state): the Focus end point sub-page opens with the cursor on "Set end point"
     b.label('fs_end_entry')
     b.stp_pre(19, 30, -0x10)
@@ -1481,6 +1493,14 @@ def build_main(eg, strings_context):
             struct.unpack_from('<I', eg, 0x40DAD94C - BASE)[0] == 0x94002759 and
             struct.unpack_from('<I', eg, 0x40FCEAE4 - BASE)[0] == 0x940040E0 and
             struct.unpack_from('<I', eg, 0x40FB4418 - BASE)[0] == 0xB9000109, 'stock focus shift step code differs')
+    # ---- forget the end point when the camera goes to standby -----------------------------------------------------
+    require(struct.unpack_from('<I', eg, WAKE_SITE - BASE)[0] == WAKE_STOCK and
+            WAKE_SITE + 4 * (WAKE_STOCK & 0x3FFFFFF) == F_MODE_REQUEST and
+            struct.unpack_from('<3I', eg, WAKE_SITE - 12 - BASE) == (0x321E07E0, 0x321F03E1, 0xAA1F03E2) and
+            struct.unpack_from('<I', eg, F_MODE_REQUEST - BASE)[0] == 0xD10183FF, 'stock standby (mode 0xC) request differs')
+    delta = blk.labels['fs_wake'] - WAKE_SITE
+    img.put(WAKE_SITE - BASE, struct.pack('<I', 0x94000000 | ((delta // 4) & 0x3FFFFFF)),
+            'standby (mode 0xC request) -> forget the focus end point first', expect=struct.pack('<I', WAKE_STOCK))
     # ---- focus step width slider: estimate on the slider page ------------------------------------------------------
     require(struct.unpack_from('<2I', eg, SL_ARROWS - BASE) == (SL_ARROWS_STOCK, 0xA9017BF3) and
             sorted(a for a, k in [(0x405F6A1C, 'bl'), (0x405F6BE4, 'bl'), (0x405F6D7C, 'bl')]

@@ -43,7 +43,7 @@ FS_ROWS, FS_EVPTR = 0x43DF8EF0 - BASE, 0x43DF90D8 - BASE
 FS_CALLBACKS = 0xA028E8060 - 0xA02808000 + 0x4B13000
 FS_TEXTS = (b'SET', b'OFF', b'--', b'~%d', b'%d')
 FS_STOCK_CALLS = {0x40EC4544, 0x40C78518, 0x40C790DC, 0x40DB47F0, 0x40DB76B0, 0x40DB3F90, 0x4127D850, 0x403AF870,
-                  0x40399EF0, 0x405EF210, 0x403B26C0, 0x4039E810, 0x405F6A68, 0x403F621C}
+                  0x40399EF0, 0x405EF210, 0x403B26C0, 0x4039E810, 0x405F6A68, 0x403F621C, 0x40FBC66C}
 SL_ARROWS = 0x405F6A64
 SL_LAYOUT_EDITS = {0x43DF951C: 4, 0x43DF9534: 8, 0x43DF9560: 4, 0x43DF9578: 8, 0x43DF9754: 8, 0x43DF9798: 8}
 
@@ -79,6 +79,7 @@ def windows(version, tag, n, stock):
         'focus shift page entry: show row 5': (FS_HIDE_SITES[0] - BASE, 4),
         'focus shift per-frame remaining-shots load': (FS_FRAME_SITE - BASE, 4),
         'focus shift start: No. of shots read': (FS_START_SITE - BASE, 4),
+        'standby: mode 0xC request call': (0x40FADB58 - BASE, 4),
         'focus shift page row 5': (FS_ROWS + 44 * 5, 44),
         'focus shift page row 5 transition pointer': (FS_EVPTR + 8 * 5, 8),
         'state 0xB5 callbacks pointer': (pm.STATE_TABLE + pm.STATE_SIZE * 0xB5 + 0x28, 8),
@@ -156,7 +157,7 @@ def verify(stock_raw, out_raw, version, tag):
                'change-notice routine entry (second notice for linked switches)', 'Bracketing burst handler entry',
                'Setup menu hide site', 'new code, sub-page, state material', 'shared strings text',
                'shared string tables', 'focus shift page entry: show row 5',
-               'focus shift per-frame remaining-shots load', 'focus shift start: No. of shots read',
+               'focus shift per-frame remaining-shots load', 'focus shift start: No. of shots read', 'standby: mode 0xC request call',
                'focus shift cursor table address (low half)', 'focus shift cursor table address (high half)',
                'focus shift cursor table count', 'focus step width slider: arrow update entry'}
     for r in report:
@@ -329,6 +330,11 @@ def verify(stock_raw, out_raw, version, tag):
                         f'end point sub-page row {row}: OK -> our action, back')
             else:
                 require((e, a, g, tg) == (e0, a0, g0, t0), f'end point sub-page row {row}: transition {e0:#x} changed')
+    # standby: the only mode-0xC request calls a hook that forgets the end point and tail-calls the request
+    wake = bl_into(0x40FADB58, 0x94003AC5, 'standby mode request')
+    wbody = code_rows[addrs.index(wake):addrs.index(wake) + 8]
+    require([m for a, m, o in wbody[:1]] == ['stp'] and any(m == 'b' and o.split()[-1] == '0x40fbc66c' for a, m, o in wbody) and
+            sum(1 for a, m, o in wbody if m == 'bl') == 1, 'standby hook must store the end point once and tail-call 0x40FBC66C')
     # focus shift cursor table: the stock nine entries plus the end point row, loaded by the patched mov/movk/mov
     require(struct.unpack_from('<3I', eg0, 0x405EF4D0 - BASE)[::2] == (0xD293DA16, 0xF2A85656) and
             struct.unpack_from('<I', eg0, 0x405EF4EC - BASE)[0] == 0x52800121, 'stock focus shift cursor code')

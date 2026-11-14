@@ -112,6 +112,10 @@ __attribute__((noinline, used)) void c_cursor(u64 st, u32 item) { logrec(K_CURSO
 __asm__(".section .s_guard,\"ax\"\n    b c_guard\n"
         ".section .s_cursor,\"ax\"\n    b c_cursor\n"
         ".text\n");
+/* ---- shooting-control mode request (the standby hook calls it after forgetting the end point) ---- */
+enum { K_MODE = 32 };
+__attribute__((noinline, used)) void c_mode(u32 mode, u32 reason, u64 data) { logrec(K_MODE, mode, reason, data, 0); }
+__asm__(".section .s_mode,\"ax\"\n    b c_mode\n.text\n");
 /* the stock change-notice routine (body after its first instruction): which bank type is announced */
 __attribute__((noinline, used)) void c_post(struct txn *t) { logrec(K_POST, MARK(t), MARKTYPE(t), t->count, 0); }
 __asm__(".section .s_post,\"ax\"\n"
@@ -304,7 +308,7 @@ static int sl_is(const char *mid, int n1, int n2) {
     return 1;
 }
 extern char hook_fs_end_get[], hook_fs_pps[], hook_fs_est[], hook_fs_shots[], hook_fs_remain[], hook_fs_refresh[];
-extern char hook_fs_end_ok[], hook_fs_end_entry[];
+extern char hook_fs_end_ok[], hook_fs_end_entry[], hook_fs_wake[];
 extern void call_remain(u64 *io);
 #define FSB(k) (*(volatile u8 *)(FS_END0 + 0x2D0UL * (k)))
 #define FS_REM (*(volatile u32 *)FS_REMAIN)
@@ -374,6 +378,11 @@ static void focus_tests(void) {
     call(hook_fs_end_entry, 0x4321, 0, 0, 0);
     check(nlog == 1 && L[0].kind == K_GUARD, "focus end sub-page entry: the stock guard's early exit is honoured");
     guard_result = 0; nlog = 0;
+    lens_pos = 4242; SET_END(); nlog = 0;
+    call(hook_fs_wake, 0xC, 2, 0x77, 0);
+    check(fs_raw() == 0 && call(hook_fs_end_get, 0, 0, 0, 0) == 0 && nlog == 1 && L[0].kind == K_MODE && L[0].a == 0xC && L[0].b == 2 && L[0].c == 0x77,
+          "going to standby (mode 0xC): the end point is forgotten, then the stock mode request runs with its arguments");
+    nlog = 0;
     /* pulses per step: the stock arithmetic, every width and aperture class */
     int bad = 0;
     int cls_cases[4][4] = { {10, 56, 10, 30}, {10, 56, 10, 40}, {10, 56, 10, 50}, {10, 40, 10, 56} };   /* q=2, 1, 0+, <0 */
