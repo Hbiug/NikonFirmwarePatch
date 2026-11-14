@@ -44,7 +44,7 @@ def _always(data, lo, hi, base, cond_word):
 
 MUTATIONS = {
     # bracketing is switched on even when it is already on (the press test of the shot number is gone)
-    'bkt-always-on': lambda d, L, b: _nop_first(d, L['bkt_wrap'] + 0x44, L['bw_call'], b, 0xFF000000, 0x35000000),
+    'bkt-always-on': lambda d, L, b: _nop_first(d, L['arm_none'] + 0xC, L['bw_call'], b, 0xFF000000, 0x35000000),
     # the second change notice for a linked switch is never sent (the b3/b4 defect)
     'single-notice': lambda d, L, b: _nop_first(d, L['post_wrap'], L['pw_done'], b, 0xFF000000, 0x36000000) or struct.pack_into('<I', d, L['pw_both'] - b, 0x14000000 | ((L['pw_done'] - L['pw_both']) // 4)),
     # the link wrapper no longer tests the link bit: it links even when the link is off
@@ -64,6 +64,10 @@ MUTATIONS = {
     'fs-no-direction': lambda d, L, b: _nop_first(d, L['fs_est'], L['est_dir'], b, 0xFFFFFFFF, 0x4B0803E8),
     # slider: the text routine always uses the 2-character spacing
     'sl-fixed-spacing': lambda d, L, b: _nop_first(d, L['sl_lenok'], L['sl_n1'], b, 0xFF00001F, 0x54000003),
+    # focus shift arm: an armed press starts the series but does not disarm (the arm would never clear after use)
+    'fs-arm-sticky': lambda d, L, b: _nop_first(d, L['arm_go'], L['arm_rel'], b, 0xFFC00000, 0x39000000),
+    # focus shift arm: the release of the armed press is not swallowed (the stock release handler runs)
+    'fs-release-leak': lambda d, L, b: _nop_first(d, L['arm_rel'], L['arm_zero'], b, 0xFFC00000, 0x39000000) or struct.pack_into('<I', d, L['arm_rel'] - b, 0x14000000 | ((L['arm_none'] - L['arm_rel']) // 4)),
     # the gate no longer looks at the keep bit: live->bank stores are always skipped
     'gate-always-skips': lambda d, L, b: _nop_first(d, L['gate'], L['native'], b, 0xFF000000, 0x36000000),
 }
@@ -97,10 +101,11 @@ def main():
         f'#define FS_END0 {P.FS_END0:#x}UL', f'#define FS_REMAIN {P.FS_REMAIN:#x}UL', f'#define FS_DIV_TABLE {P.FS_DIV_TABLE:#x}UL',
         f'#define ID_FS_SHOTS {P.ID_FS_SHOTS:#x}u', f'#define ID_FS_WIDTH {P.ID_FS_WIDTH:#x}u',
         f'#define FS_ITEM_SET {P.FS_ITEM_SET:#x}u', f'#define SL_VALUE {P.SL_VALUE:#x}UL', f'#define FS_ITEM_SHOTS {P.FS_ITEM_SHOTS:#x}u',
+        f'#define FS_ARM_RW {P.FS_ARM_RW:#x}UL', f'#define FS_ITEM_START0 {P.FS_ITEM_START0:#x}u',
         f'#define THUNK_MENU {th(P.THUNK_MENU_WORDS)}', f'#define THUNK_CUSTOM {th(P.THUNK_CUSTOM_WORDS)}', '']))
     defs = [f'--defsym=hook_{n}={L[n]:#x}' for n in ('gate', 'save', 'has_prev', 'hook_menu', 'hook_custom', 'link_sync', 'texts', 'post_wrap', 'bkt_wrap',
                                                  'fs_end_get', 'fs_pps', 'fs_est', 'fs_shots', 'fs_remain', 'fs_refresh',
-                                                 'fs_set_end', 'fs_clear_end', 'sl_wrap', 'sl_text')]
+                                                 'fs_set_end', 'fs_clear_end', 'sl_wrap', 'sl_text', 'fs_go', 'fs_sub_entry', 'fs_sub_ok')]
     obj = a.out / 'harness.o'
     run = lambda *c: subprocess.run(c, check=True)
     run('clang', '--target=aarch64-none-elf', '-O1', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',

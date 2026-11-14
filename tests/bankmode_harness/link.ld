@@ -9,14 +9,21 @@ SECTIONS {
   . = 0x40100000;
   .data   : { *(.data*) }
   .bss    : { *(.bss*) *(COMMON) }
-  .s_rowobj      0x40399EF0 : { *(.s_rowobj) } :menu
+  .s_apppost     0x403878F8 : { *(.s_apppost) } :menu
+  .s_rowobj      0x40399EF0 : { *(.s_rowobj) }
   .s_element     0x4039E810 : { *(.s_element) }
+  .s_guard       0x403AE0F8 : { *(.s_guard) }
   .s_rowindex    0x403AF870 : { *(.s_rowindex) }
+  .s_cursor      0x403B0048 : { *(.s_cursor) }
   .s_redraw      0x403B26C0 : { *(.s_redraw) }
+  .s_evobj       0x403DBA3C : { *(.s_evobj) }
+  .s_evclear     0x403DBA60 : { *(.s_evclear) }
   .s_settext     0x403F2920 : { *(.s_settext) }
   .s_visible     0x403F621C : { *(.s_visible) }
   .s_setcontent  0x403F645C : { *(.s_setcontent) }
+  .s_app         0x405088FC : { *(.s_app) }
   .s_fsrefresh   0x405EF210 : { *(.s_fsrefresh) }
+  .s_fsstart     0x405EF5E4 : { *(.s_fsstart) }
   .s_arrows      0x405F6A64 : { *(.s_arrows) }
   .s_rescale     0x40C78518 : { *(.s_rescale) } :high
   .s_ratio       0x40C790DC : { *(.s_ratio) }
@@ -25,6 +32,7 @@ SECTIONS {
   .s_lensk       0x40DB47F0 : { *(.s_lensk) }
   .s_def2pulse   0x40DB76B0 : { *(.s_def2pulse) }
   .s_prop        0x40EC4544 : { *(.s_prop) }
+  .s_fsmod       0x40FB3A68 : { *(.s_fsmod) }
   .s_getds       0x41012C84 : { *(.s_getds) }
   .s_copyentry   0x41013A14 : { *(.s_copyentry) *(.s_copybody) }
   .s_setitem     0x410D61D0 : { *(.s_setitem) }
