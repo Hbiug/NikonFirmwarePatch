@@ -189,6 +189,27 @@ FS_DIST_RAM = FS_DIST_OFF + 0x40160000 + 0xA0F800000 - 0x40200000      # 0xA1000
 # "First-frame exposure lock": the page's 11 row records and transition pointers are reordered (rows are found by item).
 # c5 / c6 had these values on the sub-page (c5 also 13 diagnostic rows, which found the lens's infinity position).
 FS_ROW_CURRENT, FS_ITEM_CURRENT, FS_SLOT_CURRENT = 6, 0x2C4F, 9
+# c8: the i menu's "Focus shift shooting" item starts the series.  OK on an i-menu item runs the live view handler
+# 0x4044EF98: action code 0x85 (jump tables 0x42AEBE90 / 0x42AEBF78) loads menu state 0xB1 (the focus shift page) at
+# 0x4044F2C8, stores it as the menu's requested state (0x40387E04, return marker 0x2923) and starts the menu, whose entry
+# 0x405076F4 opens it through 0x405EF088 (state 0xBC, the "Off" page, while a series is running: 0x403971AC).  The
+# instruction becomes a branch to fs_im_arm, which arms a flag unless a series is already running.  When the menu
+# has opened, mn_tick (menu event 0xA) clears the flag and, on the focus shift page, calls the stock Start action
+# 0x405EF5E4 (what OK on "Start" does, in the same menu context).  The photo shooting menu row (state 0x19, row 43, table 0x43E26400: four events open the page
+# through 0x405EF0B4) clears the flag first, so the page opened from the menus never starts a series by itself.
+IM_SITE, IM_SITE_STOCK, IM_NEXT_STOCK, IM_RESUME = 0x4044F2C8, 0x52801620, 0x14000004, 0x4044F2DC   # mov w0,#0xb1; b
+IM_JUMPS = ((0x42AEBE90, 0x78), (0x42AEBF78, 0x82))     # handler jump tables (first action code); code 0x85 -> IM_SITE
+IM_CODE = 0x85
+F_FS_BUSY, F_FS_START, F_FS_OPEN = 0x403971AC, 0x405EF5E4, 0x405EF0B4
+FS_MENU_EVPTR, FS_MENU_ROW, FS_MENU_ITEM = 0x43DCFFA8, 43, 0x2C1D   # photo shooting menu transition pointers / row
+FS_MENU_EVENTS = [0x286, 0x28B, 0x29F, 0x2AE]
+FS_MENU_PAGE = 0x4BD7480                               # its page record (data image offset)
+FS_ARM_RAM = FS_DIST_RAM + 2                            # u8, zero at boot (same gap as the distance)
+# the start itself runs in the menu app's event-0xA case (it runs once the menu has opened; c1 used the same hook):
+# calling Start from inside the page's refresh (during the page show) made the emulator's stock refusal dialog end in
+# "Error. Turn camera off and then on again", while Start from an event handler (OK on Start, c1's hook) does not.
+MENU_EVENTS, MENU_EV_TICK, MENU_EV_TICK_STOCK = 0x42B086D8, 0xA, 0x40508260  # menu app's event switch, event 0xA case
+MENU_TOP = 0x403DBDB4                                   # top of the menu stack (state record, u16 state at +2)
 FS_ORDER = (0, 1, 2, 3, FS_ROW_SET, FS_ROW_CURRENT, 4, 7, 8, 9, 10)   # new position k shows stock row FS_ORDER[k]
 FS_VALUE_ROW = 0x101009                                # row kind: text value, no arrow (emulator: 0x1x01 / 0x1x05 kinds show a picture)
 FS_PAGE = 0xA028CF400 - 0xA02808000 + 0x4B13000             # page record of the focus shift page (state 0xB1)
@@ -899,6 +920,40 @@ def lens_code(cs, at, main):
     b.ldr_x(20, 31, 0x10)
     b.ldp_post(19, 30, 0x60)
     b.ret()
+    # fs_im_arm (c8): replaces "mov w0, #0xB1" of the i-menu handler (x30 is saved by the handler); arm the start
+    # unless a series is running (the menu then opens the stock "Off" page), then the stock path with w0 = 0xB1
+    b.label('fs_im_arm')
+    b.bl(F_FS_BUSY)
+    b.tbz_w(0, 0, 'ia_arm')
+    b.b('ia_open')
+    b.label('ia_arm')
+    b.mov_x64(9, FS_ARM_RAM)
+    b.mov_w(10, 1)
+    b.strb_w(10, 9)
+    b.label('ia_open')
+    b.mov_w(0, 0xB1)
+    b.b(IM_RESUME)
+    # fs_menu_open (c8): the photo shooting menu row's open action: disarm, then the stock action (x0 kept)
+    b.label('fs_menu_open')
+    b.mov_x64(9, FS_ARM_RAM)
+    b.strb_w(31, 9)
+    b.b(F_FS_OPEN)
+    # mn_tick (c8): the menu app's event-0xA case (0x40508260, entered by the switch in 0x40508038 with its frame set
+    # up; it runs once when the menu has opened).  If armed: disarm; if the menu is on the focus shift page, run the
+    # stock Start action there (GUI task, after the page is shown, as an OK press on Start does); then the stock case.
+    b.label('mn_tick')
+    b.mov_x64(9, FS_ARM_RAM)
+    b.ldrb_w(10, 9)
+    b.cbz_w(10, 'mn_stock')
+    b.strb_w(31, 9)                            # one use
+    b.bl(MENU_TOP)
+    b.cbz_x(0, 'mn_stock')
+    b.ldrh_w(8, 0, 2)
+    b.cmp_wi(8, 0xB1)
+    b.b_cond('ne', 'mn_stock')
+    b.bl(F_FS_START)                           # stock Start: waits for the series, then closes the menu / result
+    b.label('mn_stock')
+    b.b(MENU_EV_TICK_STOCK)
     # ---- data (read-only) ---------------------------------------------------------------------------------------
     code_len = len(b.items) * 4
     data = b''.join(struct.pack('<I', v) for v in FS_EXP_TABLE)
@@ -1541,8 +1596,55 @@ def focus_menu(img, ids, blk, at, cs):
         raise ValueError('stock focus shift refresh callback differs')
     img.put(FS_CALLBACKS + 32, struct.pack('<Q', lens.labels['fs_page_refresh']),
             'focus shift page value refresh callback -> wrapper (texts, distances)')
+    # c8: i-menu "Focus shift shooting" starts the series; the photo shooting menu row disarms
+    for table, first in IM_JUMPS:
+        if img.u64(table - BASE + 8 * (IM_CODE - first)) != IM_SITE:
+            raise ValueError('stock i-menu handler jump table differs')
+    if struct.unpack_from('<2I', img.old, IM_SITE - BASE) != (IM_SITE_STOCK, IM_NEXT_STOCK):
+        raise ValueError('stock i-menu focus shift case differs')
+    img.put(IM_SITE - BASE, struct.pack('<I', _b_word(IM_SITE, lens.labels['fs_im_arm'])),
+            'i-menu handler, focus shift item: branch to fs_im_arm (start the series)', expect=struct.pack('<I', IM_SITE_STOCK))
+    mrow = struct.unpack_from('<11I', img.old, menu_rows_photo(img) + 44 * FS_MENU_ROW)
+    mtable = img.u64(FS_MENU_EVPTR - BASE + 8 * FS_MENU_ROW)
+    if mrow[0] != 0x561 or mrow[6] != FS_MENU_ITEM:
+        raise ValueError('stock photo shooting menu focus shift row differs')
+    opens = []
+    k = 0
+    while img.u64(mtable - BASE + 32 * k) != 0x3BB:
+        if img.u64(mtable - BASE + 32 * k + 8) == F_FS_OPEN:
+            opens.append(img.u64(mtable - BASE + 32 * k))
+            img.put(mtable - BASE + 32 * k + 8, struct.pack('<Q', lens.labels['fs_menu_open']),
+                    f'photo shooting menu, focus shift row: event {opens[-1]:#x} -> fs_menu_open (disarm)',
+                    expect=struct.pack('<Q', F_FS_OPEN))
+        k += 1
+    if opens != FS_MENU_EVENTS:
+        raise ValueError(f'unexpected focus shift open events in the photo shooting menu: {opens}')
+    entry = MENU_EVENTS + 8 * MENU_EV_TICK - BASE
+    if img.u64(entry) != MENU_EV_TICK_STOCK or struct.unpack_from('<2I', img.old, MENU_EV_TICK_STOCK - BASE) != (0x528004A0, 0xF90007FF) \
+            or struct.unpack_from('<I', img.old, 0x4050804C - BASE)[0] != 0x7100581F:
+        raise ValueError('stock menu event switch differs')
+    img.put(entry, struct.pack('<Q', lens.labels['mn_tick']), 'menu event 0xA case -> i-menu start hook',
+            expect=struct.pack('<Q', MENU_EV_TICK_STOCK))
     return dict(row_order=list(FS_ORDER), tables={k: hex(pointers[k]) for k in (FS_ROW_SET, FS_ROW_CURRENT)},
+                imenu_start=dict(site=hex(IM_SITE), arm=hex(lens.labels['fs_im_arm']), menu_table=hex(mtable),
+                                 menu_action=hex(lens.labels['fs_menu_open']), menu_hook=hex(lens.labels['mn_tick']),
+                                 flag=hex(FS_ARM_RAM)),
                 cursor_table=hex(nav_va), sub_page=sub, gui_end=hex(at))
+
+
+def _b_word(at, to):
+    off = (to - at) // 4
+    if not -(1 << 25) <= off < (1 << 25):
+        raise ValueError('branch out of range')
+    return 0x14000000 | (off & 0x3FFFFFF)
+
+
+def menu_rows_photo(img):
+    """Row records of the photo shooting menu page (state 0x19): the page record before its transition pointers."""
+    page = FS_MENU_PAGE
+    if img.u64(page + 0x18) != FS_MENU_EVPTR or struct.unpack_from('<H', img.old, page + 0x20)[0] != 47:
+        raise ValueError('stock photo shooting menu page record differs')
+    return img.u64(page + 0x10) - BASE
 
 
 def end_menu(img, ids, blk, lens, at):

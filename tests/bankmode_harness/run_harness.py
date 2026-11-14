@@ -89,6 +89,14 @@ LENS_MUTATIONS = {
 }
 # focus shift page: the end point row keeps SET instead of the end point's distance
 LENS_MUTATIONS['page-no-end-distance'] = lambda d, L, b: _nop_first(d, L['fs_page_refresh'], L['pr_now'], b, 0xFC000000, 0x94000000, skip=2)
+# c8: the i-menu arm ignores a running series
+LENS_MUTATIONS['imenu-no-busy'] = lambda d, L, b: _nop_first(d, L['fs_im_arm'], L['fs_menu_open'], b, 0xFC000000, 0x14000000)
+# c8: the menu hook does not consume the armed start (every menu opening on the page starts a series)
+LENS_MUTATIONS['tick-no-consume'] = lambda d, L, b: _nop_first(d, L['mn_tick'], L['exp'], b, 0xFFFFFFFF, 0x3900013F)
+# c8: the menu hook starts wherever the menu opened (no focus shift page test)
+LENS_MUTATIONS['tick-any-page'] = lambda d, L, b: _nop_first(d, L['mn_tick'], L['exp'], b, 0xFF00001F, 0x54000001)
+# c8: the photo shooting menu row no longer disarms
+LENS_MUTATIONS['menu-no-disarm'] = lambda d, L, b: _nop_first(d, L['fs_menu_open'], L['mn_tick'], b, 0xFFFFFFFF, 0x3900013F)
 # without an end point the run no longer aims at the lens's infinity position (c5 behaviour)
 MUTATIONS['fs-no-infinity'] = lambda d, L, b: _cb_always(d, L['fs_target_get'], L['tg_done'], b)
 
@@ -179,7 +187,7 @@ def main():
     defs = [f'--defsym=hook_{n}={L[n]:#x}' for n in ('gate', 'save', 'has_prev', 'hook_menu', 'hook_custom', 'link_sync', 'texts', 'post_wrap', 'bkt_wrap',
                                                  'fs_end_get', 'fs_pps', 'fs_est', 'fs_shots', 'fs_remain', 'fs_refresh',
                                                  'fs_end_ok', 'fs_end_entry', 'fs_wake', 'sl_wrap', 'sl_text', 'fs_target_get')]
-    defs += [f'--defsym=lens_{n}={lens.labels[n]:#x}' for n in ('fs_end_ok2', 'fs_dist_text', 'fs_page_refresh')]
+    defs += [f'--defsym=lens_{n}={lens.labels[n]:#x}' for n in ('fs_end_ok2', 'fs_dist_text', 'fs_page_refresh', 'fs_im_arm', 'fs_menu_open', 'mn_tick')]
     obj = a.out / 'harness.o'
     run = lambda *c: subprocess.run(c, check=True)
     run('clang', '--target=aarch64-none-elf', '-O1', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',

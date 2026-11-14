@@ -50,6 +50,11 @@ SL_ARROWS = 0x405F6A64
 FS_ORDER = (0, 1, 2, 3, 5, 6, 4, 7, 8, 9, 10)
 FS_GUI_END = 0x8A2F00
 LENS_STOCK_CALLS = {0x4109E130, 0x4127D850}          # lens parameter getter, sprintf
+# c8: the i menu's focus shift item starts the series (handler case 0x4044F2C8; photo shooting menu row disarms)
+IM_SITE, IM_SITE_STOCK, IM_RESUME = 0x4044F2C8, 0x52801620, 0x4044F2DC
+FS_MENU_TABLE, FS_OPEN, FS_START, FS_BUSY = 0x43E26400, 0x405EF0B4, 0x405EF5E4, 0x403971AC
+FS_ARM = 0xA10002F02
+MENU_EV_ENTRY, MENU_EV_STOCK, MENU_TOP = 0x42B086D8 + 8 * 0xA, 0x40508260, 0x403DBDB4   # menu app event 0xA case
 SL_LAYOUT_EDITS = {0x43DF951C: 4, 0x43DF9534: 8, 0x43DF9560: 4, 0x43DF9578: 8, 0x43DF9754: 8, 0x43DF9798: 8}
 
 
@@ -91,7 +96,15 @@ def windows(version, tag, n, stock):
         'state 0xB5 callbacks pointer': (pm.STATE_TABLE + pm.STATE_SIZE * 0xB5 + 0x28, 8),
         'state 0xB5 page record pointer': (pm.STATE_TABLE + pm.STATE_SIZE * 0xB5 + 0x50, 8),
         'focus shift page refresh callback': (FS_CALLBACKS + 32, 8),
+        'i-menu handler: focus shift case': (IM_SITE - BASE, 4),
+        'menu app event 0xA case (i-menu start hook)': (MENU_EV_ENTRY - BASE, 8),
     }
+    for k in range(64):
+        e, a = struct.unpack_from('<2Q', stock, FS_MENU_TABLE - BASE + 32 * k)
+        if e == 0x3BB:
+            break
+        if a == FS_OPEN:
+            w[f'photo shooting menu focus shift row: event {e:#x} action'] = (FS_MENU_TABLE - BASE + 32 * k + 8, 8)
     return w
 
 
@@ -165,7 +178,8 @@ def verify(stock_raw, out_raw, version, tag):
                'shared string tables', 'focus shift page entry: show row 5', 'focus shift page entry: show row 6',
                'focus shift per-frame remaining-shots load', 'focus shift start: No. of shots read', 'standby: mode 0xC request call',
                'focus shift cursor table address (low half)', 'focus shift cursor table address (high half)',
-               'focus shift cursor table count', 'focus step width slider: arrow update entry'}
+               'focus shift cursor table count', 'focus step width slider: arrow update entry',
+               'i-menu handler: focus shift case'}
     for r in report:
         if r['start'] < CODE_REGION_END and not set(r['windows']) <= code_ok:
             raise ValueError(f'unexpected code-region change: {r}')
@@ -372,12 +386,15 @@ def verify(stock_raw, out_raw, version, tag):
         if m in ('b', 'bl') or m.startswith('b.') or m in ('cbz', 'cbnz', 'tbz', 'tbnz'):
             tgt = int(o.split()[-1], 16)
             if not lens_lo <= tgt < lens_hi:
-                require(tgt in main_ok or tgt in LENS_STOCK_CALLS, f'second code block: branch at {a:#x} to {tgt:#x}')
+                require(tgt in main_ok or tgt in LENS_STOCK_CALLS or tgt in (FS_START, FS_BUSY, FS_OPEN, IM_RESUME, MENU_TOP, MENU_EV_STOCK),
+                        f'second code block: branch at {a:#x} to {tgt:#x}')
                 lens_calls.add(tgt)
-    require(LENS_STOCK_CALLS <= lens_calls, 'second code block: expected stock calls missing')
-    # its only store to memory outside the stack: the end point distance halfword in the zero gap (RW alias)
+    require(LENS_STOCK_CALLS | {FS_START, FS_BUSY, FS_OPEN, IM_RESUME, MENU_TOP, MENU_EV_STOCK} <= lens_calls, 'second code block: expected stock calls missing')
+    # its only stores outside the stack: the end point distance halfword and (c8) the i-menu start byte, both in the
+    # zero gap (RW alias): strh distance; strb w10 (armed), strb wzr (disarmed by the menu row), strb wzr (consumed)
     stores = [(a, m, o) for a, m, o in lens_rows if m.startswith('st') and 'sp' not in o]
-    require(len(stores) == 1 and stores[0][1] == 'strh', 'second code block: unexpected store')
+    require([(m, o.split(',')[0]) for a, m, o in stores] == [('strh', 'w19'), ('strb', 'w10'), ('strb', 'wzr'), ('strb', 'wzr')] and
+            all(o.endswith('[x9]') for a, m, o in stores), 'second code block: unexpected store')
     require(not any(eg1[0x8A2F00:0x8A2F10]) and not any(eg0[0x8A2F00:0x8A2F10]), 'distance halfword is not in the zero gap')
     consts, cur = [], None
     for a, m, o in lens_rows:
@@ -389,8 +406,49 @@ def verify(stock_raw, out_raw, version, tag):
             if '#48' in o:
                 consts.append(cur)
                 cur = None
-    require(consts == [0xA10002F00] * 2 and 0xA10002F00 == BASE + 0x8A2F00 + 0xA0F800000 - 0x40200000,
+    require(consts == [0xA10002F00] * 2 + [FS_ARM] * 3 and 0xA10002F00 == BASE + 0x8A2F00 + 0xA0F800000 - 0x40200000,
             f'second code block: distance address {[hex(c) for c in consts]}')
+    # c8: the i-menu handler's focus shift case branches to the arm routine: busy test, store 1, w0 = 0xB1, back
+    require(struct.unpack_from('<I', eg0, IM_SITE - BASE)[0] == IM_SITE_STOCK, 'stock i-menu focus shift case')
+    w = struct.unpack_from('<I', eg1, IM_SITE - BASE)[0]
+    require(w >> 26 == 0b000101, 'i-menu focus shift case is not a branch')
+    d = w & 0x3FFFFFF
+    arm = IM_SITE + ((d - (1 << 26) if d & (1 << 25) else d) << 2)
+    arm_rows = [r for r in lens_rows if arm <= r[0] < arm + 11 * 4]
+    require(lens_lo <= arm < lens_hi and [m for a, m, o in arm_rows] ==
+            ['bl', 'tbz', 'b', 'mov', 'movk', 'movk', 'movk', 'mov', 'strb', 'mov', 'b'] and
+            int(arm_rows[0][2].split()[-1], 16) == FS_BUSY and arm_rows[9][2] == 'w0, #0xb1' and
+            int(arm_rows[10][2].split()[-1], 16) == IM_RESUME and arm_rows[7][2] == 'w10, #0x1', 'i-menu arm routine')
+    # the photo shooting menu row's open events: disarm (store zero), then the stock open action
+    opens = []
+    for k in range(64):
+        e, a0 = struct.unpack_from('<2Q', eg0, FS_MENU_TABLE - BASE + 32 * k)
+        a1 = struct.unpack_from('<Q', eg1, FS_MENU_TABLE - BASE + 32 * k + 8)[0]
+        if e == 0x3BB:
+            break
+        if a0 == FS_OPEN:
+            opens.append((e, a1))
+        else:
+            require(a1 == a0, 'photo shooting menu focus shift row: other transition changed')
+    require([e for e, _ in opens] == [0x286, 0x28B, 0x29F, 0x2AE] and len({a for _, a in opens}) == 1, 'photo shooting menu open events')
+    disarm = opens[0][1]
+    dis_rows = [r for r in lens_rows if disarm <= r[0] < disarm + 6 * 4]
+    require(lens_lo <= disarm < lens_hi and [m for a, m, o in dis_rows] == ['mov', 'movk', 'movk', 'movk', 'strb', 'b'] and
+            dis_rows[4][2] == 'wzr, [x9]' and int(dis_rows[5][2].split()[-1], 16) == FS_OPEN, 'photo shooting menu disarm wrapper')
+    # the menu's event-0xA case: consume the byte; Start only on the focus shift page; always the stock case after
+    require(struct.unpack_from('<Q', eg0, MENU_EV_ENTRY - BASE)[0] == MENU_EV_STOCK, 'stock menu event 0xA case')
+    tick = struct.unpack_from('<Q', eg1, MENU_EV_ENTRY - BASE)[0]
+    tick_rows = [r for r in lens_rows if tick <= r[0] < tick + 15 * 4]
+    tgt = lambda r: int(r[2].split()[-1], 16)
+    tick_rows = tick_rows[:14]
+    require(lens_lo <= tick < lens_hi and [m for a, m, o in tick_rows] ==
+            ['mov', 'movk', 'movk', 'movk', 'ldrb', 'cbz', 'strb', 'bl', 'cbz', 'ldrh', 'cmp', 'b.ne', 'bl', 'b'],
+            'menu event 0xA hook shape')
+    require(tgt(tick_rows[7]) == MENU_TOP and tick_rows[10][2] == 'w8, #0xb1' and tgt(tick_rows[12]) == FS_START and
+            tgt(tick_rows[13]) == MENU_EV_STOCK and tgt(tick_rows[5]) == tick_rows[13][0] and tgt(tick_rows[8]) == tick_rows[13][0] and
+            tgt(tick_rows[11]) == tick_rows[13][0] and tick_rows[6][2] == 'wzr, [x9]', 'menu event 0xA hook')
+    starts = [r for r in lens_rows if r[1] == 'bl' and tgt(r) == FS_START]
+    require(len(starts) == 1, 'second code block: Start called once')
     for row in range(2):
         tbl = struct.unpack_from('<Q', eg1, evp - BASE + 8 * row)[0]
         for j in range(14):

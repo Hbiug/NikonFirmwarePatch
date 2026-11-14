@@ -644,6 +644,59 @@ static void lens_tests(void) {
     nparam_set = 0;
 }
 
+/* ---- c8: the i menu's focus shift item arms a start; the menu's event-0xA case (menu opened) consumes it ------------ */
+extern char lens_fs_im_arm[], lens_fs_menu_open[], lens_mn_tick[];
+#define ARM (*(volatile u8 *)(FS_DIST_RAM + 2))
+static int fs_busy, busy_calls, start_calls, open_calls, top_calls, tick_calls; static u64 open_x0;
+u64 im_saved_lr; u32 im_w0;
+static unsigned short top_rec[4]; static int top_null;
+__attribute__((section(".s_fsbusy"), noinline, used)) u32 st_fsbusy(void) { busy_calls++; return fs_busy ? 0x101 : 0x100; }
+__attribute__((section(".s_fsstart"), noinline, used)) void st_fsstart(void) { start_calls++; }
+__attribute__((section(".s_fsopen"), noinline, used)) void st_fsopen(u64 x0) { open_calls++; open_x0 = x0; }
+__attribute__((section(".s_menutop"), noinline, used)) u64 st_menutop(void) { top_calls++; return top_null ? 0 : (u64)top_rec; }
+void tick_mark(void) { tick_calls++; }
+/* stock continuations reached by a plain branch from code entered in the middle of a stock function (its x30 is saved
+   by that function): record, then return to whoever entered our routine */
+__attribute__((section(".s_imresume"), naked, used)) void st_imresume(void) {
+    __asm__ volatile("adrp x9, im_w0\n add x9, x9, :lo12:im_w0\n str w0, [x9]\n"
+                     "adrp x9, im_saved_lr\n add x9, x9, :lo12:im_saved_lr\n ldr x30, [x9]\n ret");
+}
+__attribute__((section(".s_menutick"), naked, used)) void st_menutick(void) {
+    __asm__ volatile("bl tick_mark\n adrp x9, im_saved_lr\n add x9, x9, :lo12:im_saved_lr\n ldr x30, [x9]\n ret");
+}
+__attribute__((naked, used)) void im_enter(void) {
+    __asm__ volatile("adrp x9, im_saved_lr\n add x9, x9, :lo12:im_saved_lr\n str x30, [x9]\n b lens_fs_im_arm");
+}
+__attribute__((naked, used)) void tick_enter(void) {
+    __asm__ volatile("adrp x9, im_saved_lr\n add x9, x9, :lo12:im_saved_lr\n str x30, [x9]\n b lens_mn_tick");
+}
+static void imenu_tests(void) {
+    ARM = 0; fs_busy = 0; busy_calls = 0; im_w0 = 0;
+    call((void *)im_enter, 0x55, 0, 0, 0);
+    check(ARM == 1 && im_w0 == 0xB1 && busy_calls == 1, "i menu, focus shift item: start armed, the stock path goes on with state 0xB1");
+    ARM = 0; fs_busy = 1; im_w0 = 0;
+    call((void *)im_enter, 0x55, 0, 0, 0);
+    check(ARM == 0 && im_w0 == 0xB1, "i menu, focus shift item during a series: not armed (the menu opens the stock Off page)");
+    /* menu opened (event 0xA) */
+    ARM = 1; top_null = 0; top_rec[1] = 0xB1; start_calls = tick_calls = top_calls = 0;
+    call((void *)tick_enter, 0, 0, 0, 0);
+    check(ARM == 0 && start_calls == 1 && tick_calls == 1, "menu opened on the focus shift page, armed: the stock Start action once, then the stock case");
+    call((void *)tick_enter, 0, 0, 0, 0);
+    check(start_calls == 1 && tick_calls == 2 && top_calls == 1, "next menu opening: nothing armed, stock case only");
+    ARM = 1; top_rec[1] = 0x19; call((void *)tick_enter, 0, 0, 0, 0);
+    check(ARM == 0 && start_calls == 1 && tick_calls == 3, "armed but the menu opened elsewhere: disarmed, no start");
+    ARM = 1; top_null = 1; call((void *)tick_enter, 0, 0, 0, 0);
+    check(ARM == 0 && start_calls == 1 && tick_calls == 4, "armed, no menu state: disarmed, no start");
+    top_null = 0;
+    ARM = 1; open_calls = 0; open_x0 = 0;
+    call(lens_fs_menu_open, 0x1234, 0, 0, 0);
+    check(ARM == 0 && open_calls == 1 && open_x0 == 0x1234, "photo shooting menu row: disarms, then the stock open action with the same argument");
+    u64 st[0x20]; for (int i = 0; i < 0x20; i++) st[i] = 0; st[9] = 0x1000;
+    ARM = 1; start_calls = 0; call(lens_fs_page_refresh, (u64)st, 0, 0, 0);
+    check(start_calls == 0 && ARM == 1, "focus shift page refresh never starts a series");
+    ARM = 0;
+}
+
 void main_(void) {
     u32 r;
     /* ---------------- link off: the stock path ---------------- */
@@ -894,6 +947,7 @@ save_done:
 
     focus_tests();
     lens_tests();
+    imenu_tests();
     check(canary_bad == 0, "callee-saved registers x19..x29 and sp preserved by every routine called");
     if (canary_bad) { puts_("    canary mask "); puthex(canary_bad); putc_('\n'); }
     puts_("checks "); puthex(checks); puts_(" failures "); puthex(failures); putc_('\n');
