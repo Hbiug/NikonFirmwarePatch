@@ -104,6 +104,14 @@ __asm__(".section .s_bkt,\"ax\"\n"
         "    ldr x30, [sp, #0x28]\n"
         "    ldr x22, [sp], #0x30\n"
         "    ret\n");
+/* ---- focus end point sub-page: menu-engine routines its entry callback calls ---- */
+enum { K_GUARD = 30, K_CURSOR };
+static int guard_result;
+__attribute__((noinline, used)) int c_guard(u64 st) { logrec(K_GUARD, st, 0, 0, 0); return guard_result; }
+__attribute__((noinline, used)) void c_cursor(u64 st, u32 item) { logrec(K_CURSOR, st, item, 0, 0); }
+__asm__(".section .s_guard,\"ax\"\n    b c_guard\n"
+        ".section .s_cursor,\"ax\"\n    b c_cursor\n"
+        ".text\n");
 /* the stock change-notice routine (body after its first instruction): which bank type is announced */
 __attribute__((noinline, used)) void c_post(struct txn *t) { logrec(K_POST, MARK(t), MARKTYPE(t), t->count, 0); }
 __asm__(".section .s_post,\"ax\"\n"
@@ -296,7 +304,7 @@ static int sl_is(const char *mid, int n1, int n2) {
     return 1;
 }
 extern char hook_fs_end_get[], hook_fs_pps[], hook_fs_est[], hook_fs_shots[], hook_fs_remain[], hook_fs_refresh[];
-extern char hook_fs_set_end[], hook_fs_clear_end[];
+extern char hook_fs_end_ok[], hook_fs_end_entry[];
 extern void call_remain(u64 *io);
 #define FSB(k) (*(volatile u8 *)(FS_END0 + 0x2D0UL * (k)))
 #define FS_REM (*(volatile u32 *)FS_REMAIN)
@@ -337,22 +345,35 @@ static void focus_tests(void) {
     fs_set(0, 0);
     check(call(hook_fs_end_get, 0, 0, 0, 0) == 0, "focus end: nothing stored -> no end point");
     u64 st[0x20]; for (int i = 0; i < 0x20; i++) st[i] = 0; st[9] = 0x1000;     /* state; +0x48 = row container */
-    u64 ctx[1] = { (u64)st };
+    /* the end point sub-page: a state object whose cursor row carries the item, as the menu engine passes it */
+    static u8 erows[2 * 0x2C]; static u64 epage[4]; static u8 eobj[0x60]; static u64 ectx[1];
+    for (u32 i = 0; i < 2; i++) *(volatile u32 *)(erows + i * 0x2C + 0x18) = FS_ITEM_END0 + i;
+    epage[2] = (u64)erows; *(volatile u64 *)(eobj + 0x50) = (u64)epage; ectx[0] = (u64)eobj;
+#define EROW(r) (*(volatile unsigned short *)(eobj + 0x58) = 0, *(volatile unsigned short *)(eobj + 0x32) = (r))
+#define SET_END() (EROW(0), call(hook_fs_end_ok, (u64)ectx, 0, 0, 0))
+#define CLEAR_END() (EROW(1), call(hook_fs_end_ok, (u64)ectx, 0, 0, 0))
     lens_pos = -12345; fs_calls_refresh = fs_calls_redraw = 0; nshown = 0;
-    call(hook_fs_set_end, (u64)ctx, 0, 0, 0);
+    SET_END();
     check(fs_raw() == ((u32)-12345 ^ 0x80000000u) && call(hook_fs_end_get, 0, 0, 0, 0) == 1,
-          "focus end: the action stores the current position (four padding bytes, position ^ 0x80000000)");
-    check(fs_calls_refresh == 1 && fs_calls_redraw == 1 && fs_last_state == (u64)st, "focus end: the action refreshes the page and redraws it");
-    lens_pos = 0; call(hook_fs_set_end, (u64)ctx, 0, 0, 0);
+          "focus end sub-page, Set: stores the current position (four padding bytes, position ^ 0x80000000)");
+    check(fs_calls_refresh == 0 && fs_calls_redraw == 0, "focus end sub-page: the action leaves the redraw to the return to the focus shift page");
+    lens_pos = 0; SET_END();
     check(call(hook_fs_end_get, 0, 0, 0, 0) == 1, "focus end: position 0 is a valid end point");
-    call(hook_fs_clear_end, (u64)ctx, 0, 0, 0);
-    check(fs_raw() == 0 && call(hook_fs_end_get, 0, 0, 0, 0) == 0 && fs_calls_redraw == 3, "focus end: clear forgets it and redraws");
+    CLEAR_END();
+    check(fs_raw() == 0 && call(hook_fs_end_get, 0, 0, 0, 0) == 0, "focus end sub-page, Clear: forgets the end point");
     u8 relb[8]; for (int b = 0; b < 4; b++) { REL(b)[0] = (u8)(0x91 + b); REL(b)[1] = (u8)~(0x91 + b); relb[2 * b] = REL(b)[0]; relb[2 * b + 1] = REL(b)[1]; }
     u8 sw0 = SWITCH, bk0 = BKTFLAG;
-    lens_pos = 0x7F00FF01; call(hook_fs_set_end, (u64)ctx, 0, 0, 0); call(hook_fs_clear_end, (u64)ctx, 0, 0, 0); lens_pos = -1; call(hook_fs_set_end, (u64)ctx, 0, 0, 0);
+    lens_pos = 0x7F00FF01; SET_END(); CLEAR_END(); lens_pos = -1; SET_END();
     int same = SWITCH == sw0 && BKTFLAG == bk0;
     for (int b = 0; b < 4; b++) same &= REL(b)[0] == relb[2 * b] && REL(b)[1] == relb[2 * b + 1];
     check(same && call(hook_fs_end_get, 0, 0, 0, 0) == 1, "focus end: switch, bracketing and release-mode bytes untouched by the end point");
+    nlog = 0; guard_result = 0;
+    call(hook_fs_end_entry, 0x4321, 0, 0, 0);
+    check(nlog == 2 && L[0].kind == K_GUARD && L[1].kind == K_CURSOR && L[1].a == 0x4321 && L[1].b == FS_ITEM_END0, "focus end sub-page entry: cursor on Set end point");
+    nlog = 0; guard_result = 1;
+    call(hook_fs_end_entry, 0x4321, 0, 0, 0);
+    check(nlog == 1 && L[0].kind == K_GUARD, "focus end sub-page entry: the stock guard's early exit is honoured");
+    guard_result = 0; nlog = 0;
     /* pulses per step: the stock arithmetic, every width and aperture class */
     int bad = 0;
     int cls_cases[4][4] = { {10, 56, 10, 30}, {10, 56, 10, 40}, {10, 56, 10, 50}, {10, 40, 10, 56} };   /* q=2, 1, 0+, <0 */
@@ -376,9 +397,11 @@ static void focus_tests(void) {
     int p = ref_pps(5);
     lens_pos = 100000;
     fs_set(1, 100000 - 10 * p - 5);
-    check(call(hook_fs_est, 5, 0, 0, 0) == 12, "focus estimate: 10 steps and a bit -> 12 frames (last frame at or past the end)");
+    check(call(hook_fs_est, 5, 0, 0, 0) == 11, "focus estimate: 10 steps and a bit -> 11 frames (frames at 0..10 steps, the last within one step before the end)");
     fs_set(1, 100000 - 10 * p);
-    check(call(hook_fs_est, 5, 0, 0, 0) == 11, "focus estimate: exactly 10 steps -> 11 frames");
+    check(call(hook_fs_est, 5, 0, 0, 0) == 11, "focus estimate: exactly 10 steps -> 11 frames (the last one at the end point)");
+    fs_set(1, 100000 - 10 * p + 5);
+    check(call(hook_fs_est, 5, 0, 0, 0) == 10, "focus estimate: a bit less than 10 steps -> 10 frames");
     fs_set(1, 100000);
     check(call(hook_fs_est, 5, 0, 0, 0) == 1, "focus estimate: end point = start -> 1 frame");
     fs_set(1, 100001);
@@ -418,13 +441,23 @@ static void focus_tests(void) {
     check((u32)io[8] == 5 && FS_REM == 5 && FS_TOTAL == 10 && REGS_OK(), "focus frame: end point ahead -> keep going");
     lens_pos = 1000 - 3 * p;
     REMAIN_CALL();
-    check((u32)io[8] == 0 && FS_REM == 0 && REGS_OK(), "focus frame: at the end point -> that was the last frame");
+    check((u32)io[8] == 5 && FS_REM == 5 && REGS_OK(), "focus frame: exactly at the end point (lens maybe not moved yet) -> the count decides");
     lens_pos = 1000 - 3 * p - 1; FS_REM = 5;
     REMAIN_CALL();
     check((u32)io[8] == 0 && FS_REM == 0, "focus frame: past the end point -> stop");
     lens_pos = 1000; FS_REM = 0; FS_TOTAL = 12;
     REMAIN_CALL();
-    check((u32)io[8] == 1 && FS_REM == 1 && FS_TOTAL == 13 && REGS_OK(), "focus frame: estimate used up before the end point -> one more frame");
+    check((u32)io[8] == 1 && FS_REM == 1 && FS_TOTAL == 13 && REGS_OK(), "focus frame: estimate used up, more than one step left -> one more frame");
+    lens_pos = 1000 - 3 * p + p; FS_REM = 0; FS_TOTAL = 12;
+    REMAIN_CALL();
+    check((u32)io[8] == 0 && FS_REM == 0 && FS_TOTAL == 12, "focus frame: estimate used up, exactly one step left (lens not moved yet) -> done");
+    lens_pos = 1000 - 3 * p + p / 2; FS_REM = 0;
+    REMAIN_CALL();
+    check((u32)io[8] == 0 && FS_TOTAL == 12, "focus frame: estimate used up, less than one step left -> done");
+    lens_pos = 1000 - 3 * p + p + 1; FS_REM = 0;
+    REMAIN_CALL();
+    check((u32)io[8] == 1 && FS_TOTAL == 13, "focus frame: estimate used up, one step and a bit left -> one more frame");
+    lens_pos = 1000; FS_REM = 0; FS_TOTAL = 12;
     FS_REM = 0; FS_TOTAL = 300;
     REMAIN_CALL();
     check((u32)io[8] == 0 && FS_REM == 0 && FS_TOTAL == 300, "focus frame: never beyond 300 frames");
@@ -473,7 +506,7 @@ static void focus_tests(void) {
     fs_set(1, 30000 - 41 * ref_pps(5)); SLV = 5; nshown = 0; call(hook_sl_text, (u64)sst, 0, 0, 0);
     check(sl_is("~42", 12, 10), "slider: end point -> ~42 for the slider's width");
     SLV = 9; nshown = 0; call(hook_sl_text, (u64)sst, 0, 0, 0);
-    { int q = ref_pps(9); int dist = 41 * ref_pps(5); int est = dist / q + (dist % q != 0) + 1; char m[8]; int k = 0;
+    { int q = ref_pps(9); int dist = 41 * ref_pps(5); int est = dist / q + 1; char m[8]; int k = 0;
       m[k++] = '~'; if (est >= 100) m[k++] = '0' + est / 100; if (est >= 10) m[k++] = '0' + est / 10 % 10; m[k++] = '0' + est % 10; m[k] = 0;
       check(est != 42 && sl_is(m, k >= 4 ? 11 : 12, k >= 3 ? 10 : 13 - k), "slider: the estimate follows the slider value, not the saved width"); }
     fs_set(1, 30000 - 7 * ref_pps(1)); SLV = 1; nshown = 0; call(hook_sl_text, (u64)sst, 0, 0, 0);

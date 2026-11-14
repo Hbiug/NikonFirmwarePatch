@@ -166,8 +166,14 @@ SL_RECTS_NEW = {SL_ONE_RECT: (0xDF00AE, 0xF70222), SL_TEN_RECT: (0xDF0222, 0xDF0
 FS_CALLBACKS = 0xA028E8060 - 0xA02808000 + 0x4B13000   # five pointers of state 0xB1 (data image)
 F_FS_REFRESH, F_FS_TOGGLE = 0x405EF210, 0x4051226C
 FS_TEXT = (b'SET', b'OFF', b'--', b'~%d', b'%d')      # after STATE_TEXT, same 16-byte slots
-FS_ENGLISH = ('Focus end point', 'Clear focus end point', 'Narrow' + ' ' * 4 + 'Est. shots' + ' ' * 6 + 'Wide ', '')
-FS_STRING_FIRST, FS_STRING_COUNT = 3143, 4
+FS_ENGLISH = ('Focus end point', 'Clear end point', 'Narrow' + ' ' * 4 + 'Est. shots' + ' ' * 6 + 'Wide ', '',
+              'Set end point')
+FS_STRING_FIRST, FS_STRING_COUNT = 3143, 5
+# Focus end point sub-page (c3): the end point row opens state 0xB5, the stock child page of that (formerly hidden) row,
+# rebuilt from the N-RAW option page: "Set end point" / "Clear end point"; OK runs fs_end_ok and goes back.
+STATE_FS_END = 0xB5
+STATE_FS_END_STOCK = (0xA028E8100, 0xA028CF540)        # its stock callbacks and page record pointers
+FS_ITEM_END0 = pm.ITEM_OPTION0 + 5                     # 0x35BA / 0x35BB: Set / Clear
 
 # ---- new material (same text-gap regions as the ProRes row; this patch does not combine with it) ------------
 # ---- the row lives in the Setup menu (state 0x297), in the slot of its last row "Special shooting" (item 0x3968), which
@@ -386,10 +392,7 @@ def _focus(b):
     b.label('est_dir')
     b.cmp_wi(8, 0)
     b.b_cond('lt', 'est_bad')
-    _r(b, 0x1AD30909, 'udiv w9, w8, w19')
-    _r(b, 0x1B13A12A, 'msub w10, w9, w19, w8')
-    b.cmp_wi(10, 0)
-    _r(b, 0x1A890529, 'cinc w9, w9, ne')
+    _r(b, 0x1AD30909, 'udiv w9, w8, w19')      # frames at 0, s, 2s, ... up to the end point: floor(d / s) + 1
     _add_wi(b, 9, 9, 1)
     b.cmp_wi(9, FS_MAX_SHOTS)
     b.b_cond('ls', 'est_ok')
@@ -451,13 +454,19 @@ def _focus(b):
     b.b_cond('ge', 'rm_dir')
     _r(b, 0x4B0803E8, 'neg w8, w8')
     b.label('rm_dir')
+    # w8 = distance still to go (negative: past the end point).  The position read here may be the one of the frame
+    # just taken or already the next one (the lens may not have moved yet), so both tests allow for one step.
     b.cmp_wi(8, 0)
-    b.b_cond('gt', 'rm_more')
-    b.str_w(31, 19)                           # at or past the end point: that was the last frame
+    b.b_cond('ge', 'rm_more')
+    b.str_w(31, 19)                           # past the end point: that was the last frame
     b.mov_w(20, 0)
     b.b('rm_out')
     b.label('rm_more')
-    b.cbnz_w(20, 'rm_out')
+    b.cbnz_w(20, 'rm_out')                    # frames left: stock
+    b.cmp_wi(21, 0)
+    _r(b, 0x5A95A6A9, 'cneg w9, w21, lt')     # |step|
+    b.cmp_w(8, 9)
+    b.b_cond('le', 'rm_out')                  # within one step of the end point: done
     b.ldr_w(8, 19, FS_TOTAL_OFF)              # estimate used up before the end point: one more frame
     b.cmp_wi(8, FS_MAX_SHOTS)
     b.b_cond('hs', 'rm_out')
@@ -562,25 +571,42 @@ def _focus(b):
     b.ldr_x(20, 31, 0x10)
     b.ldp_post(19, 30, 0x20)
     b.ret()
-    # row actions (context x0, state = [x0]): set the end point to the current focus position / clear it
-    b.label('fs_set_end')
+    # fs_end_entry(state): the Focus end point sub-page opens with the cursor on "Set end point"
+    b.label('fs_end_entry')
     b.stp_pre(19, 30, -0x10)
-    b.ldr_x(19, 0)
+    b.mov_x(19, 0)
+    b.bl(pm.F_ENTRY_GUARD)
+    b.cmp_wi(0, 1)
+    b.b_cond('eq', 'fee_done')
+    b.mov_x(0, 19)
+    b.mov_w(1, FS_ITEM_END0)
+    b.bl(pm.F_SET_CURSOR)
+    b.label('fee_done')
+    b.ldp_post(19, 30, 0x10)
+    b.ret()
+    # fs_end_ok(context): the chosen row (item computed as in the bank sub-page's ok): 0 set the end point to the
+    # current focus position, 1 clear it.  The transition then goes back to the focus shift page, which redraws.
+    b.label('fs_end_ok')
+    b.stp_pre(19, 30, -0x10)
+    b.ldr_x(9, 0)
+    b.mov_w(8, 0x2C)
+    b.ldr_x(10, 9, 0x50)
+    b.ldrh_w(11, 9, 0x58)
+    b.ldrh_w(9, 9, 0x32)
+    b.ldr_x(10, 10, 0x10)
+    b.add_x(9, 9, 11)
+    b.madd_x(8, 9, 8, 10)
+    b.ldr_w(8, 8, 0x18)
+    b.mov_w(9, FS_ITEM_END0)
+    b.sub_w(8, 8, 9)
+    b.mov_w(0, 0)
+    b.cbnz_w(8, 'eo_put')                      # Clear end point
     b.bl(F_LENS_POS)
     _r(b, 0x52010000, 'eor w0, w0, #0x80000000')
+    b.label('eo_put')
     b.bl('fs_end_put')
-    b.b('fs_act_tail')
-    b.label('fs_clear_end')
-    b.stp_pre(19, 30, -0x10)
-    b.ldr_x(19, 0)
-    b.mov_w(0, 0)
-    b.bl('fs_end_put')
-    b.label('fs_act_tail')
-    b.mov_x(0, 19)
-    b.bl('fs_refresh')
-    b.mov_x(0, 19)
     b.ldp_post(19, 30, 0x10)
-    b.b(F_REDRAW)
+    b.ret()
 
     # ---- focus step width slider ------------------------------------------------------------------------------------
     t_dec = len(STATE_TEXT) + 4                    # "%d"
@@ -1148,7 +1174,7 @@ def strings(context):
     ids = context.add('bank-store', [list(ENGLISH) for _ in range(36)])
     fs = context.add('focus-end', [list(FS_ENGLISH) for _ in range(36)])
     return dict(label_id=ids[0], option_ids=ids[1:1 + N_OPTIONS], fs_set_id=fs[0], fs_clear_id=fs[1],
-                sl_top_id=fs[2], sl_empty_id=fs[3])
+                sl_top_id=fs[2], sl_empty_id=fs[3], fs_end_ids=(fs[4], fs[1]))
 
 
 def menu(img, ids, blk):
@@ -1247,12 +1273,13 @@ def focus_menu(img, ids, blk, at):
     tail = rows[FS_ROW_SHOTS][7:]
     if rows[FS_ROW_SET][7:] != tail or rows[FS_ROW_CLEAR][7:] != tail:
         raise ValueError('stock focus shift row tails differ')
-    new_rows = {FS_ROW_SET: (ids['fs_set_id'], 0xFFFF, 0xFFFF, 0, 0x101049, 0xFFFF, FS_ITEM_SET) + tail,
-                FS_ROW_CLEAR: (ids['fs_clear_id'], 0xFFFF, 0xFFFF, 0, 0x101040, 0xFFFF, FS_ITEM_CLEAR) + tail}
-    for k, fields in new_rows.items():
-        img.put(FS_ROWS + 44 * k, struct.pack('<11I', *fields), f'focus shift page row {k}: hidden row -> end point row',
-                expect=struct.pack('<11I', *rows[k]))
-    # transitions: the stock "Focus position auto reset" row's table (an in-place toggle row), with our action
+    # row 5 becomes "Focus end point" (value SET / OFF, arrow); row 6 stays hidden as in stock (c3: its Clear
+    # function moved into the sub-page)
+    fields = (ids['fs_set_id'], 0xFFFF, 0xFFFF, 0, 0x101049, 0xFFFF, FS_ITEM_SET) + tail
+    img.put(FS_ROWS + 44 * FS_ROW_SET, struct.pack('<11I', *fields), f'focus shift page row {FS_ROW_SET}: hidden row -> end point row',
+            expect=struct.pack('<11I', *rows[FS_ROW_SET]))
+    # transitions: the stock "Focus position auto reset" row's table, its three OK events retargeted to the end point
+    # sub-page (state 0xB5) without an action
     source = img.u64(FS_EVPTR + 8 * FS_ROW_RESET) - BASE
     count = 0
     while img.u64(source + 32 * count) != 0x3BB:
@@ -1260,23 +1287,22 @@ def focus_menu(img, ids, blk, at):
     count += 1
     pointers = {}
     at = (at + 7) & ~7
-    for k, action in ((FS_ROW_SET, 'fs_set_end'), (FS_ROW_CLEAR, 'fs_clear_end')):
-        hits = []
+    hits = []
 
-        def change(e, a, g, t, hits=hits, target=blk.labels[action]):
-            if a == F_FS_TOGGLE:
-                hits.append(e)
-                return e, target, g, t
-            return e, a, g, t
-        table = pm.events(img, source, count, change)
-        if hits != [0x286, 0x28B, 0x2AE]:
-            raise ValueError(f'unexpected transitions of the stock auto-reset row: {hits}')
-        img.put(at, table, f'focus shift page row {k}: transition table', expect_zero=True)
-        old = img.u64(FS_EVPTR + 8 * k)
-        img.put(FS_EVPTR + 8 * k, struct.pack('<Q', va(at)), f'focus shift page row {k}: transition table pointer',
-                expect=struct.pack('<Q', old))
-        pointers[k] = hex(va(at))
-        at += len(table)
+    def change(e, a, g, t):
+        if a == F_FS_TOGGLE:
+            hits.append(e)
+            return e, 0, g, STATE_FS_END
+        return e, a, g, t
+    table = pm.events(img, source, count, change)
+    if hits != [0x286, 0x28B, 0x2AE]:
+        raise ValueError(f'unexpected transitions of the stock auto-reset row: {hits}')
+    k = FS_ROW_SET
+    img.put(at, table, f'focus shift page row {k}: transition table (OK -> end point sub-page)', expect_zero=True)
+    img.put(FS_EVPTR + 8 * k, struct.pack('<Q', va(at)), f'focus shift page row {k}: transition table pointer',
+            expect=struct.pack('<Q', img.u64(FS_EVPTR + 8 * k)))
+    pointers[k] = hex(va(at))
+    at += len(table)
     # cursor navigation table with the end point row added
     nav = [struct.unpack_from('<IHH', img.old, FS_NAV_TABLE - BASE + 8 * k) for k in range(FS_NAV_COUNT)]
     if [e[0] for e in nav] != [0x2C1E, FS_ITEM_SHOTS, 0x2C52, 0x2C20, 0x2C85, FS_ITEM_CLEAR, 0x2E04, 0x2E29, 0x2C21] or \
@@ -1302,13 +1328,64 @@ def focus_menu(img, ids, blk, at):
     for site, word in new_words.items():
         img.put(site - BASE, struct.pack('<I', word), f'focus shift cursor code {site:#x}: copied table / 10 entries',
                 expect=struct.pack('<I', FS_NAV_SITES[site]))
-    for site in FS_HIDE_SITES:
-        img.put(site - BASE, struct.pack('<I', FS_SHOW), f'focus shift page entry: show the row instead of hiding it ({site:#x})',
-                expect=struct.pack('<I', FS_HIDE_STOCK))
+    site = FS_HIDE_SITES[0]
+    img.put(site - BASE, struct.pack('<I', FS_SHOW), f'focus shift page entry: show the end point row instead of hiding it ({site:#x})',
+            expect=struct.pack('<I', FS_HIDE_STOCK))
+    sub = end_menu(img, ids, blk, at)
+    at = int(sub.pop('gui_end'), 16)
     if img.u64(FS_CALLBACKS + 32) != F_FS_REFRESH:
         raise ValueError('stock focus shift refresh callback differs')
     img.put(FS_CALLBACKS + 32, struct.pack('<Q', blk.labels['fs_refresh']), 'focus shift page value refresh callback -> wrapper')
-    return dict(tables=pointers, cursor_table=hex(nav_va), gui_end=hex(at))
+    return dict(tables=pointers, cursor_table=hex(nav_va), sub_page=sub, gui_end=hex(at))
+
+
+def end_menu(img, ids, blk, at):
+    """Focus end point sub-page in state 0xB5 (N-RAW option page template, as menu() does for the bank page):
+    "Set end point" / "Clear end point", OK -> fs_end_ok, then back to the focus shift page (stock option-page OK)."""
+    layout = bytearray(img.old[pm.NRAW_LAYOUT:pm.NRAW_LAYOUT + 0x110])
+    if struct.unpack_from('<I', layout, 0x44)[0] != 0x8A6:
+        raise ValueError('stock layout: title id not where expected')
+    struct.pack_into('<I', layout, 0x44, ids['fs_set_id'])
+    stock_row = struct.unpack_from('<11I', img.old, pm.NRAW_ROWS)
+    n = len(ids['fs_end_ids'])
+    rows = b''.join(struct.pack('<11I', ids['fs_end_ids'][i], *stock_row[1:6], FS_ITEM_END0 + i, *stock_row[7:])
+                    for i in range(n))
+    ok = blk.labels['fs_end_ok']
+    table = pm.events(img, pm.NRAW_EVENTS, 14, lambda e, a, g, t: (e, ok if a == pm.NRAW_OK else a, g, t))
+    if table.count(struct.pack('<QQQ', ok, 0, 0x68D)) != 3:
+        raise ValueError('expected three OK transitions (back) in the stock option table')
+    at = (at + 15) & ~15
+    layout_at = at; at += len(layout)
+    rows_at = at; at += len(rows)
+    at = (at + 7) & ~7
+    table_at = at; at += len(table)
+    evptr_at = at; at += n * 8
+    callbacks_at = at; at += 5 * 8
+    page_at = at; at += 0x50
+    if at > FS_GUI_LIMIT:
+        raise ValueError('GUI area too small for the end point sub-page')
+    page = bytearray(img.old[pm.NRAW_PAGE:pm.NRAW_PAGE + 0x50])
+    struct.pack_into('<3Q', page, 8, va(layout_at), va(rows_at), va(evptr_at))
+    struct.pack_into('<H', page, 0x20, n)
+    img.put(layout_at, layout, 'focus end point sub-page layout (N-RAW layout, title "Focus end point")', expect_zero=True)
+    img.put(rows_at, rows, 'focus end point sub-page rows', expect_zero=True)
+    img.put(table_at, table, 'focus end point sub-page transition table (shared by both rows)', expect_zero=True)
+    img.put(evptr_at, struct.pack(f'<{n}Q', *([va(table_at)] * n)), 'focus end point sub-page transition table pointers',
+            expect_zero=True)
+    img.put(callbacks_at, struct.pack('<5Q', blk.labels['fs_end_entry'], *pm.NRAW_CALLBACKS[1:]),
+            'focus end point sub-page callbacks', expect_zero=True)
+    img.put(page_at, page, 'focus end point sub-page page record', expect_zero=True)
+    record = pm.STATE_TABLE + pm.STATE_SIZE * STATE_FS_END
+    st = struct.unpack_from('<HHI11Q', img.old, record)
+    nraw_state = struct.unpack_from('<HHI11Q', img.old, pm.STATE_TABLE + pm.STATE_SIZE * pm.STATE_NRAW)
+    if st[:2] != (2, STATE_FS_END) or st[3] != nraw_state[3] or (st[7], st[12]) != STATE_FS_END_STOCK or \
+            any(st[4:7] + st[8:12] + st[13:]):
+        raise ValueError('stock state 0xB5 record differs')
+    img.put(record + 0x28, struct.pack('<Q', va(callbacks_at)), 'state 0xB5: callbacks -> focus end point sub-page',
+            expect=struct.pack('<Q', STATE_FS_END_STOCK[0]))
+    img.put(record + 0x50, struct.pack('<Q', va(page_at)), 'state 0xB5: page record -> focus end point sub-page',
+            expect=struct.pack('<Q', STATE_FS_END_STOCK[1]))
+    return dict(page=hex(va(page_at)), callbacks=hex(va(callbacks_at)), table=hex(va(table_at)), gui_end=hex(at))
 
 
 def slider_layout(img, ids):

@@ -77,11 +77,12 @@ def windows(version, tag, n, stock):
         'stub state callbacks': (pm.STATE_TABLE + pm.STATE_SIZE * pm.STATE_NEW + 0x28, 8),
         'stub state page record': (pm.STATE_TABLE + pm.STATE_SIZE * pm.STATE_NEW + 0x50, 8),
         'focus shift page entry: show row 5': (FS_HIDE_SITES[0] - BASE, 4),
-        'focus shift page entry: show row 6': (FS_HIDE_SITES[1] - BASE, 4),
         'focus shift per-frame remaining-shots load': (FS_FRAME_SITE - BASE, 4),
         'focus shift start: No. of shots read': (FS_START_SITE - BASE, 4),
-        'focus shift page rows 5 and 6': (FS_ROWS + 44 * 5, 88),
-        'focus shift page row 5/6 transition pointers': (FS_EVPTR + 8 * 5, 16),
+        'focus shift page row 5': (FS_ROWS + 44 * 5, 44),
+        'focus shift page row 5 transition pointer': (FS_EVPTR + 8 * 5, 8),
+        'state 0xB5 callbacks pointer': (pm.STATE_TABLE + pm.STATE_SIZE * 0xB5 + 0x28, 8),
+        'state 0xB5 page record pointer': (pm.STATE_TABLE + pm.STATE_SIZE * 0xB5 + 0x50, 8),
         'focus shift page refresh callback': (FS_CALLBACKS + 32, 8),
     }
     return w
@@ -154,7 +155,7 @@ def verify(stock_raw, out_raw, version, tag):
                'dispatcher menu-bank call (link hook)', 'dispatcher custom-bank call (link hook)',
                'change-notice routine entry (second notice for linked switches)', 'Bracketing burst handler entry',
                'Setup menu hide site', 'new code, sub-page, state material', 'shared strings text',
-               'shared string tables', 'focus shift page entry: show row 5', 'focus shift page entry: show row 6',
+               'shared string tables', 'focus shift page entry: show row 5',
                'focus shift per-frame remaining-shots load', 'focus shift start: No. of shots read',
                'focus shift cursor table address (low half)', 'focus shift cursor table address (high half)',
                'focus shift cursor table count', 'focus step width slider: arrow update entry'}
@@ -279,28 +280,55 @@ def verify(stock_raw, out_raw, version, tag):
     require(body[-10][1:] == ('mov', 'w8, w20'), 'fs_remain must return the count in w8')
     first = code_rows[addrs.index(shots) + 1]
     require(first[1] == 'bl' and int(first[2].split()[-1], 16) == 0x41012C84, 'fs_shots must start with the stock read')
-    for site in FS_HIDE_SITES:
-        require(struct.unpack_from('<I', eg0, site - BASE)[0] == 0x320003E2 and
-                struct.unpack_from('<I', eg1, site - BASE)[0] == 0x2A1F03E2, f'focus shift row show site {site:#x}')
+    site = FS_HIDE_SITES[0]
+    require(struct.unpack_from('<I', eg0, site - BASE)[0] == 0x320003E2 and
+            struct.unpack_from('<I', eg1, site - BASE)[0] == 0x2A1F03E2, f'focus shift row show site {site:#x}')
+    require(eg1[FS_HIDE_SITES[1] - BASE:FS_HIDE_SITES[1] - BASE + 4] == eg0[FS_HIDE_SITES[1] - BASE:FS_HIDE_SITES[1] - BASE + 4],
+            'focus shift row 6 must stay hidden (stock)')
+    require(eg1[FS_ROWS + 44 * 6:FS_ROWS + 44 * 7] == eg0[FS_ROWS + 44 * 6:FS_ROWS + 44 * 7] and
+            eg1[FS_EVPTR + 48:FS_EVPTR + 56] == eg0[FS_EVPTR + 48:FS_EVPTR + 56], 'focus shift row 6 must be stock')
     require(struct.unpack_from('<Q', eg0, FS_CALLBACKS + 32)[0] == 0x405EF210, 'stock focus shift refresh callback')
     refresh = struct.unpack_from('<Q', eg1, FS_CALLBACKS + 32)[0]
     require(BASE + 0x8A0000 <= refresh < limit and by_addr[refresh][0] == 'stp', 'focus shift refresh wrapper')
     calls = [int(o.split()[-1], 16) for a, m, o in code_rows[addrs.index(refresh):addrs.index(refresh) + 6] if m == 'bl']
     require(calls == [0x405EF210], 'focus shift refresh wrapper must call the stock refresh first')
-    for k in (5, 6):
-        t = struct.unpack_from('<Q', eg1, FS_EVPTR + 8 * k)[0] - BASE
-        require(0x8A1000 <= t < 0x8A3000, f'focus shift row {k}: transition table outside the new material')
-        actions = set()
-        j = 0
-        while True:
-            e, act, g, tg = struct.unpack_from('<4Q', eg1, t + 32 * j)
-            if BASE + 0x8A0000 <= act < limit:
-                actions.add(act)
-                require(tg == 0x68C and e in (0x286, 0x28B, 0x2AE), f'focus shift row {k}: our action on event {e:#x}')
-            j += 1
-            if e == 0x3BB:
-                break
-        require(len(actions) == 1 and by_addr[next(iter(actions))][0] == 'stp', f'focus shift row {k}: action')
+    # row 5 (Focus end point): OK opens state 0xB5 without an action; every other transition as in the stock table
+    t = struct.unpack_from('<Q', eg1, FS_EVPTR + 8 * 5)[0] - BASE
+    require(0x8A1000 <= t < 0x8A3000, 'focus shift row 5: transition table outside the new material')
+    src = struct.unpack_from('<Q', eg0, FS_EVPTR + 8 * 7)[0] - BASE          # stock "Focus position auto reset" table
+    oks, j = [], 0
+    while True:
+        e, act, g, tg = struct.unpack_from('<4Q', eg1, t + 32 * j)
+        e0, a0, g0, t0 = struct.unpack_from('<4Q', eg0, src + 32 * j)
+        if a0 == 0x4051226C:
+            require((e, act, g, tg) == (e0, 0, g0, 0xB5), f'focus shift row 5: OK transition {e0:#x}')
+            oks.append(e)
+        else:
+            require((e, act, g, tg) == (e0, a0, g0, t0), f'focus shift row 5: transition {e0:#x} changed')
+        j += 1
+        if e0 == 0x3BB:
+            break
+    require(oks == [0x286, 0x28B, 0x2AE], 'focus shift row 5: OK events')
+    # state 0xB5: the end point sub-page (entry and OK in the new code, page in the new material)
+    cb = struct.unpack_from('<Q', eg1, pm.STATE_TABLE + pm.STATE_SIZE * 0xB5 + 0x28)[0]
+    page = struct.unpack_from('<Q', eg1, pm.STATE_TABLE + pm.STATE_SIZE * 0xB5 + 0x50)[0]
+    require(BASE + 0x8A1000 <= cb < BASE + 0x8A3000 and BASE + 0x8A1000 <= page < BASE + 0x8A3000, 'state 0xB5 material outside the new material')
+    entry = struct.unpack_from('<Q', eg1, cb - BASE)[0]
+    require(BASE + 0x8A0000 <= entry < limit and by_addr[entry][0] == 'stp', 'end point sub-page entry')
+    require(struct.unpack_from('<4Q', eg1, cb - BASE + 8) == tuple(pm.NRAW_CALLBACKS[1:]), 'end point sub-page: stock option-page callbacks')
+    nrows = struct.unpack_from('<H', eg1, page - BASE + 0x20)[0]
+    require(nrows == 2, 'end point sub-page row count')
+    evp = struct.unpack_from('<Q', eg1, page - BASE + 0x18)[0]
+    for row in range(nrows):
+        tbl = struct.unpack_from('<Q', eg1, evp - BASE + 8 * row)[0]
+        for j in range(14):
+            e, a, g, tg = struct.unpack_from('<4Q', eg1, tbl - BASE + 32 * j)
+            e0, a0, g0, t0 = struct.unpack_from('<4Q', eg0, pm.NRAW_EVENTS + 32 * j)
+            if a0 == pm.NRAW_OK:
+                require(BASE + 0x8A0000 <= a < limit and by_addr[a][0] == 'stp' and (e, g, tg) == (e0, g0, 0x68D),
+                        f'end point sub-page row {row}: OK -> our action, back')
+            else:
+                require((e, a, g, tg) == (e0, a0, g0, t0), f'end point sub-page row {row}: transition {e0:#x} changed')
     # focus shift cursor table: the stock nine entries plus the end point row, loaded by the patched mov/movk/mov
     require(struct.unpack_from('<3I', eg0, 0x405EF4D0 - BASE)[::2] == (0xD293DA16, 0xF2A85656) and
             struct.unpack_from('<I', eg0, 0x405EF4EC - BASE)[0] == 0x52800121, 'stock focus shift cursor code')

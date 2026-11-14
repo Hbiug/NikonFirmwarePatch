@@ -11,7 +11,9 @@ SECTIONS {
   .bss    : { *(.bss*) *(COMMON) }
   .s_rowobj      0x40399EF0 : { *(.s_rowobj) } :menu
   .s_element     0x4039E810 : { *(.s_element) }
+  .s_guard       0x403AE0F8 : { *(.s_guard) }
   .s_rowindex    0x403AF870 : { *(.s_rowindex) }
+  .s_cursor      0x403B0048 : { *(.s_cursor) }
   .s_redraw      0x403B26C0 : { *(.s_redraw) }
   .s_settext     0x403F2920 : { *(.s_settext) }
   .s_visible     0x403F621C : { *(.s_visible) }
