@@ -165,29 +165,30 @@ SL_RECTS_NEW = {SL_ONE_RECT: (0xDF00AE, 0xF70222), SL_TEN_RECT: (0xDF0222, 0xDF0
                 SL_NARROW_RECT: (0xB5005C, 0xDD0274), SL_WIDE_RECT: (0xB50274, 0xB50274)}                     # global text slots (stock page: 5 shots, 6 step width, 7 interval)
 FS_CALLBACKS = 0xA028E8060 - 0xA02808000 + 0x4B13000   # five pointers of state 0xB1 (data image)
 F_FS_REFRESH, F_FS_TOGGLE = 0x405EF210, 0x4051226C
-# ---- focus shift: Start sub-page and start on the bracketing-burst button (b10) -----------------------------------
+# ---- focus shift: Start sub-page and start on the next MENU press (c1) ------------------------------------------------
 # The focus shift page's Start row (stock action 0x405EF5E4) opens a sub-page in state 0xB5 (the stock 2-row page behind
-# the old hidden row 5, unreachable since b8): "Start now" (the stock action), "Start on button" (arm and close the
-# menu) and "Cancel" (disarm).  While armed, the next press of a button assigned to Bracketing burst starts the series
-# (the module start 0x40FB3A68 with the stock completion callback 0x405EF678, after clearing the GUI's
-# "series finished" event flag 0x10000000 as the stock action does) instead of bracketing, and its release is
-# swallowed; the arm is then cleared.  The arm byte lives in the zero gap of the text section, written through the
+# the old hidden row 5, unreachable since b8): "Start now" (the stock action), "Start on MENU" (arm) and "Cancel"
+# (disarm).  While armed, the next opening of the menu (MENU button, stock path) goes straight to the focus shift page
+# and runs the stock Start action there, in the GUI task, exactly as pressing OK on Start does; the arm is then cleared.
+# The hook is the menu app's event-0xA case (0x40508260, reached through the switch table of 0x40508038), which runs
+# when the menu opens.  c0 started the series from the Bracketing burst handler instead and froze the camera (the GUI
+# never got the series it expected).  The arm byte lives in the zero gap of the text section, written through the
 # section's RAM alias (the toolkit's stash technique): the loader copies the zero gap at every boot, so it starts
 # cleared at each power-on.
 TEXT_ALIAS = 0xA0F800000 - 0x40200000                 # text VA + TEXT_ALIAS = writable RAM alias
 FS_ARM_AT = 0x8A2F00                                   # payload offset of the arm byte (zero in the image)
-FS_ARM_RW = BASE + FS_ARM_AT + TEXT_ALIAS              # bit 0 armed, bit 1 the next release is ours
+FS_ARM_RW = BASE + FS_ARM_AT + TEXT_ALIAS              # bit 0 armed
 STATE_FS_START = 0xB5
 STATE_FS_START_STOCK = (0xA028E8100, 0xA028CF540)      # its stock callbacks and page record pointers
 FS_START_ROW_TABLE = 0x43EA10A0 - BASE                 # transition table of the Start row (row 0 of state 0xB1)
 F_FS_START = 0x405EF5E4                                # stock Start action
-F_FS_MODULE_START, F_FS_DONE_CB = 0x40FB3A68, 0x405EF678
-F_EVFLAGS, F_EVFLAGS_CLEAR, FS_EV_FINISHED = 0x403DBA3C, 0x403DBA60, 0x10000000
-FS_ITEM_START0 = pm.ITEM_OPTION0 + 5                   # 0x35BA..0x35BC: Start now / Start on button / Cancel
+MENU_EVENTS, MENU_EV_TICK, MENU_EV_TICK_STOCK = 0x42B086D8, 0xA, 0x40508260  # menu app's event switch, event 0xA case
+MENU_TOP, MENU_GOTO, STATE_FS_PAGE = 0x403DBDB4, 0x403AF53C, 0xB1   # top of the menu stack, transition, focus shift page
+FS_ITEM_START0 = pm.ITEM_OPTION0 + 5                   # 0x35BA..0x35BC: Start now / Start on MENU / Cancel
 FS_START_TITLE = 0x3F7                                 # stock "Start"
 FS_TEXT = (b'SET', b'OFF', b'--', b'~%d', b'%d')      # after STATE_TEXT, same 16-byte slots
 FS_ENGLISH = ('Focus end point', 'Clear focus end point', 'Narrow' + ' ' * 4 + 'Est. shots' + ' ' * 6 + 'Wide ', '',
-              'Start now', 'Start on button', 'Cancel')
+              'Start now', 'Start on MENU', 'Cancel')
 FS_STRING_FIRST, FS_STRING_COUNT = 3143, 7
 
 # ---- new material (same text-gap regions as the ProRes row; this patch does not combine with it) ------------
@@ -605,16 +606,6 @@ def _focus(b):
 
 
     # ---- focus shift Start sub-page and the armed start --------------------------------------------------------
-    # fs_go: start the series as the stock Start action does, without its wait for the end of the series
-    b.label('fs_go')
-    b.raw(0xF81F0FFE)                          # str x30,[sp,#-0x10]!
-    b.bl(F_EVFLAGS)
-    _r(b, 0x320403E1, 'orr w1, wzr, #0x10000000')
-    b.bl(F_EVFLAGS_CLEAR)
-    b.mov_x64(0, F_FS_DONE_CB)
-    b.bl(F_FS_MODULE_START)
-    b.raw(0xF84107FE)                          # ldr x30,[sp],#0x10
-    b.ret()
     # fs_sub_entry(state): cursor on "Cancel" while armed, else on "Start now"
     b.label('fs_sub_entry')
     b.stp_pre(19, 30, -0x20)
@@ -1061,25 +1052,6 @@ def code(cs):
     blk.mov_wr(21, 2)
     blk.mov_wr(22, 3)
     blk.mov_x64(24, BKT_FLAG_RAM)
-    # focus shift armed: this press starts the series instead of bracketing, and its release is swallowed
-    blk.mov_x64(9, FS_ARM_RW)
-    blk.ldrb_w(10, 9)
-    blk.tbz_w(20, 0, 'arm_rel')
-    _tbnz(blk, 10, 0, 'arm_go')
-    blk.strb_w(31, 9)                         # an ordinary press forgets a stale release marker
-    blk.b('arm_none')
-    blk.label('arm_go')
-    blk.mov_w(10, 2)
-    blk.strb_w(10, 9)
-    blk.bl('fs_go')
-    blk.b('arm_zero')
-    blk.label('arm_rel')
-    blk.tbz_w(10, 1, 'arm_none')
-    blk.strb_w(31, 9)
-    blk.label('arm_zero')
-    blk.mov_w(23, 0)
-    blk.b('bw_done')
-    blk.label('arm_none')
     blk.tbz_w(20, 0, 'bw_call')               # release: stock first
     blk.ldrb_w(8, 24)
     blk.cbnz_w(8, 'bw_call')                  # already switched on by us
@@ -1410,7 +1382,7 @@ def focus_menu(img, ids, blk, at):
 
 
 def start_menu(img, ids, blk, at):
-    """Focus shift Start row -> sub-page in state 0xB5 with Start now / Start on button / Cancel (N-RAW sub-page
+    """Focus shift Start row -> sub-page in state 0xB5 with Start now / Start on MENU / Cancel (N-RAW sub-page
     template, as menu() does for the bank page)."""
     layout = bytearray(img.old[pm.NRAW_LAYOUT:pm.NRAW_LAYOUT + 0x110])
     if struct.unpack_from('<I', layout, 0x44)[0] != 0x8A6:
@@ -1421,7 +1393,7 @@ def start_menu(img, ids, blk, at):
                     for i in range(3))
     ok = blk.labels['fs_sub_ok']
     # Start now stays in the state, as the stock Start transition does (target 0x68C): the stock action ends in a
-    # menu close or the series' result screen.  Start on button and Cancel go back to the focus shift page (the
+    # menu close or the series' result screen.  Start on MENU and Cancel go back to the focus shift page (the
     # stock option-page OK, target 0x68D).
     tables = [pm.events(img, pm.NRAW_EVENTS, 14,
                         lambda e, a, g, t, i=i: (e, ok, g, 0x68C if i == 0 else t) if a == pm.NRAW_OK else (e, a, g, t))
@@ -1510,6 +1482,38 @@ def slider_layout(img, ids):
     return dict(top_string=ids['sl_top_id'], empty_string=ids['sl_empty_id'])
 
 
+def start_code(cs, at):
+    """Second code block (in the new-material area, same read-only executable text mapping as the code page): the menu
+    hook of the armed start.  It runs in the GUI task, where the stock Start action runs when OK is pressed on Start."""
+    b = Block(va(at))
+    # mn_tick: the menu app's event-0xA case (0x40508260, entered by the switch in 0x40508038 with its frame set up;
+    # it runs when the menu opens).  If armed: disarm, go to the focus shift page (the transition the Photo shooting
+    # menu row performs) and run the stock Start action there, then continue with the stock case.
+    b.label('mn_tick')
+    b.mov_x64(9, FS_ARM_RW)
+    b.ldrb_w(10, 9)
+    b.tbz_w(10, 0, 'mn_stock')
+    b.strb_w(31, 9)                            # one use
+    b.bl(MENU_TOP)
+    b.cbz_x(0, 'mn_stock')
+    b.ldrh_w(8, 0, 2)
+    b.cmp_wi(8, STATE_FS_PAGE)
+    b.b_cond('eq', 'mn_start')
+    b.mov_w(0, STATE_FS_PAGE)
+    b.bl(MENU_GOTO)
+    b.bl(MENU_TOP)
+    b.cbz_x(0, 'mn_stock')
+    b.ldrh_w(8, 0, 2)
+    b.cmp_wi(8, STATE_FS_PAGE)
+    b.b_cond('ne', 'mn_stock')
+    b.label('mn_start')
+    b.bl(F_FS_START)                           # stock Start: waits for the series, then closes the menu / result
+    b.label('mn_stock')
+    b.b(MENU_EV_TICK_STOCK)
+    listing = b.listing(cs)
+    return b, b.bytes(), listing
+
+
 def build_main(eg, strings_context):
     """Return the edited Image and review metadata for the stock EG image."""
     from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
@@ -1565,6 +1569,19 @@ def build_main(eg, strings_context):
             'stock focus shift page entry callback differs')
     fs_where = focus_menu(img, ids, blk, where.pop('gui_end'))
     start_where = start_menu(img, ids, blk, int(fs_where['gui_end'], 16))
+    # ---- start on the next MENU press (c1): menu hook ---------------------------------------------------------------
+    at2 = (int(start_where['gui_end'], 16) + 15) & ~15
+    blk2, code2, listing2 = start_code(cs, at2)
+    require(at2 + len(code2) <= FS_ARM_AT, 'no room for the menu hook')
+    img.put(at2, code2, 'code: armed start on the next menu opening (menu event-0xA hook)', expect_zero=True)
+    entry = MENU_EVENTS + 8 * MENU_EV_TICK - BASE
+    require(struct.unpack_from('<Q', eg, entry)[0] == MENU_EV_TICK_STOCK and
+            struct.unpack_from('<2I', eg, 0x40508260 - BASE) == (0x528004A0, 0xF90007FF) and
+            struct.unpack_from('<I', eg, 0x4050804C - BASE)[0] == 0x7100581F, 'stock menu event switch differs')
+    img.put(entry, struct.pack('<Q', blk2.labels['mn_tick']), 'menu event 0xA case -> button-start hook',
+            expect=struct.pack('<Q', MENU_EV_TICK_STOCK))
+    start_where.update(code=hex(at2), mn_tick=hex(blk2.labels['mn_tick']),
+                       code_end=hex(at2 + len(code2)), listing=[dict(va=hex(x), word=w, text=t) for x, w, t in listing2])
     require(struct.unpack_from('<I', eg, FS_FRAME_SITE - BASE)[0] == FS_FRAME_STOCK and
             struct.unpack_from('<6I', eg, 0x40FCEA1C - BASE)[:1] == (0xD2900E08,), 'stock focus shift frame code differs')
     require(struct.unpack_from('<I', eg, FS_START_SITE - BASE)[0] == FS_START_STOCK and

@@ -44,7 +44,7 @@ def _always(data, lo, hi, base, cond_word):
 
 MUTATIONS = {
     # bracketing is switched on even when it is already on (the press test of the shot number is gone)
-    'bkt-always-on': lambda d, L, b: _nop_first(d, L['arm_none'] + 0xC, L['bw_call'], b, 0xFF000000, 0x35000000),
+    'bkt-always-on': lambda d, L, b: _nop_first(d, L['bkt_wrap'] + 0x44, L['bw_call'], b, 0xFF000000, 0x35000000),
     # the second change notice for a linked switch is never sent (the b3/b4 defect)
     'single-notice': lambda d, L, b: _nop_first(d, L['post_wrap'], L['pw_done'], b, 0xFF000000, 0x36000000) or struct.pack_into('<I', d, L['pw_both'] - b, 0x14000000 | ((L['pw_done'] - L['pw_both']) // 4)),
     # the link wrapper no longer tests the link bit: it links even when the link is off
@@ -64,13 +64,18 @@ MUTATIONS = {
     'fs-no-direction': lambda d, L, b: _nop_first(d, L['fs_est'], L['est_dir'], b, 0xFFFFFFFF, 0x4B0803E8),
     # slider: the text routine always uses the 2-character spacing
     'sl-fixed-spacing': lambda d, L, b: _nop_first(d, L['sl_lenok'], L['sl_n1'], b, 0xFF00001F, 0x54000003),
-    # focus shift arm: an armed press starts the series but does not disarm (the arm would never clear after use)
-    'fs-arm-sticky': lambda d, L, b: _nop_first(d, L['arm_go'], L['arm_rel'], b, 0xFFC00000, 0x39000000),
-    # focus shift arm: the release of the armed press is not swallowed (the stock release handler runs)
-    'fs-release-leak': lambda d, L, b: _nop_first(d, L['arm_rel'], L['arm_zero'], b, 0xFFC00000, 0x39000000) or struct.pack_into('<I', d, L['arm_rel'] - b, 0x14000000 | ((L['arm_none'] - L['arm_rel']) // 4)),
     # the gate no longer looks at the keep bit: live->bank stores are always skipped
     'gate-always-skips': lambda d, L, b: _nop_first(d, L['gate'], L['native'], b, 0xFF000000, 0x36000000),
 }
+
+# mutations of the second block (button start through the menu)
+MUTATIONS2 = {
+    # the menu hook does not disarm: every later opening of the menu would start a series
+    'fs-arm-sticky': lambda d, L, b: _nop_first(d, L['mn_tick'], L['mn_start'], b, 0xFFC00000, 0x39000000),
+    # the menu hook does not check that the transition reached the focus shift page before starting
+    'fs-start-anywhere': lambda d, L, b: _nop_first(d, L['mn_tick'] + 0x30, L['mn_start'], b, 0xFF00001F, 0x54000001),
+}
+START_CODE_AT = 0x8A2790
 
 
 def main():
@@ -78,16 +83,25 @@ def main():
     ap.add_argument('--qemu', default=shutil.which('qemu-system-aarch64') or 'qemu-system-aarch64')
     ap.add_argument('--out', type=Path, default=HERE / 'build')
     ap.add_argument('--ram', default='44G')
-    ap.add_argument('--mutate', choices=sorted(MUTATIONS), help='deliberately break the code under test (the harness must then fail)')
+    ap.add_argument('--mutate', choices=sorted(MUTATIONS) + sorted(MUTATIONS2), help='deliberately break the code under test (the harness must then fail)')
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
-    blk, data, _ = P.code(Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN))
+    cs = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
+    blk, data, _ = P.code(cs)
     base = P.va(P.CODE_AT)
-    if a.mutate:
+    blk2, data2, _ = P.start_code(cs, START_CODE_AT)    # the real build places it after the Start sub-page material
+    base2 = P.va(START_CODE_AT)
+    if a.mutate in MUTATIONS:
         data = bytearray(data)
         MUTATIONS[a.mutate](data, blk.labels, base)
         data = bytes(data)
+    elif a.mutate:
+        data2 = bytearray(data2)
+        MUTATIONS2[a.mutate](data2, blk2.labels, base2)
+        data2 = bytes(data2)
     (a.out / 'hooks.bin').write_bytes(data)
+    (a.out / 'hooks2.bin').write_bytes(data2)
+    L2 = blk2.labels
     L = blk.labels
     th = lambda w: '"' + ','.join('0x%08X' % x for x in w) + '"'
     (a.out / 'gen.h').write_text('\n'.join([
@@ -105,7 +119,8 @@ def main():
         f'#define THUNK_MENU {th(P.THUNK_MENU_WORDS)}', f'#define THUNK_CUSTOM {th(P.THUNK_CUSTOM_WORDS)}', '']))
     defs = [f'--defsym=hook_{n}={L[n]:#x}' for n in ('gate', 'save', 'has_prev', 'hook_menu', 'hook_custom', 'link_sync', 'texts', 'post_wrap', 'bkt_wrap',
                                                  'fs_end_get', 'fs_pps', 'fs_est', 'fs_shots', 'fs_remain', 'fs_refresh',
-                                                 'fs_set_end', 'fs_clear_end', 'sl_wrap', 'sl_text', 'fs_go', 'fs_sub_entry', 'fs_sub_ok')]
+                                                 'fs_set_end', 'fs_clear_end', 'sl_wrap', 'sl_text', 'fs_sub_entry', 'fs_sub_ok')]
+    defs += [f'--defsym=hook_{n}={L2[n]:#x}' for n in ('mn_tick',)]
     obj = a.out / 'harness.o'
     run = lambda *c: subprocess.run(c, check=True)
     run('clang', '--target=aarch64-none-elf', '-O1', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
@@ -115,7 +130,8 @@ def main():
     run('ld.lld', '-T', str(HERE / 'link.ld'), *defs, '-o', str(elf), str(obj))
     cmd = [a.qemu, '-M', 'virt,memory-backend=r0', '-cpu', 'max', '-m', a.ram,
            '-object', f'memory-backend-ram,id=r0,size={a.ram},reserve=off', '-display', 'none', '-serial', 'stdio', '-monitor', 'none',
-           '-semihosting', '-kernel', str(elf), '-device', f'loader,file={a.out / "hooks.bin"},addr={base:#x},force-raw=on']
+           '-semihosting', '-kernel', str(elf), '-device', f'loader,file={a.out / "hooks.bin"},addr={base:#x},force-raw=on',
+           '-device', f'loader,file={a.out / "hooks2.bin"},addr={base2:#x},force-raw=on']
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)
