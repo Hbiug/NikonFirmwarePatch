@@ -77,23 +77,43 @@ MUTATIONS = {
 LENS_VA = 0x40A02000
 LENS_MUTATIONS = {
     # metre text: the interpolation between table entries is gone (steps of 2^(1/32))
-    'dist-no-interp': lambda d, L, b: _nop_first(d, L['fs_dist_text'], L['fs_val'], b, 0xFFFFFFFF, 0x0B4F19CE),
+    'dist-no-interp': lambda d, L, b: _nop_first(d, L['fs_dist_text'], L['fs_end_refresh'], b, 0xFFFFFFFF, 0x0B4F19CE),
     # metre text: no rounding to the nearest centimetre
-    'dist-no-round': lambda d, L, b: _nop_first(d, L['fs_dist_text'], L['fs_val'], b, 0xFFFFFFFF, 0x8B0F01CE),
+    'dist-no-round': lambda d, L, b: _nop_first(d, L['fs_dist_text'], L['fs_end_refresh'], b, 0xFFFFFFFF, 0x8B0F01CE),
+    # metre text: the 2/3 scale of the raw value is gone (the c5 formula)
+    'dist-c5-scale': lambda d, L, b: _nop_first(d, L['fs_dist_text'], L['fs_end_refresh'], b, 0xFFFFFFFF, 0x1ACA0929),
     # Set end point no longer stores the lens distance
     'ok2-no-dist': lambda d, L, b: _nop_first(d, L['fs_end_ok2'], L['fs_dist_text'], b, 0xFFC00000, 0x79000000),
-    # diagnostic rows: the second value is not passed to sprintf
-    'diag-one-value': lambda d, L, b: _nop_first(d, L['er_diag'], L['er_done'], b, 0xFFFFFFFF, 0x2A0003E3),
 }
+if P.FS_DIAG:
+    # diagnostic rows: the second value is not passed to sprintf
+    LENS_MUTATIONS['diag-one-value'] = lambda d, L, b: _nop_first(d, L['er_diag'], L['er_done'], b, 0xFFFFFFFF, 0x2A0003E3)
+# without an end point the run no longer aims at the lens's infinity position (c5 behaviour)
+MUTATIONS['fs-no-infinity'] = lambda d, L, b: _cb_always(d, L['fs_target_get'], L['tg_done'], b)
+
+
+def _cb_always(data, lo, hi, base):
+    """Turn the first cbnz w in lo..hi into an unconditional branch to the same target."""
+    for a, w in _words(data, lo, hi, base):
+        if w & 0xFF000000 == 0x35000000:
+            imm = (w >> 5) & 0x7FFFF
+            imm = imm - (1 << 19) if imm & (1 << 18) else imm
+            struct.pack_into('<I', data, a - base, 0x14000000 | (imm & 0x3FFFFFF))
+            return
+    raise SystemExit('mutation site not found')
+
+
+def _m_q16(u):
+    T = P.FS_EXP_TABLE
+    f = u & 0x7FF
+    i, w = f >> 6, f & 63
+    return (T[i] + ((((T[i + 1] - T[i]) * w) & 0xFFFFFFFF) >> 6)) & 0xFFFFFFFF
 
 
 def dist_model(raw):
-    """The integer arithmetic of fs_dist_text (2^(raw/2048 - 10) m), as text."""
-    T = P.FS_EXP_TABLE
-    e, f = raw >> 11, raw & 0x7FF
-    i, w = f >> 6, f & 63
-    m = (T[i] + ((((T[i + 1] - T[i]) * w) & 0xFFFFFFFF) >> 6)) & 0xFFFFFFFF
-    cm = ((((m * 100) << e) + (1 << 25)) >> 26) & 0xFFFFFFFF
+    """The integer arithmetic of fs_dist_text (2^((raw - 20480) / 3072) m), as text."""
+    u = (2 * raw) // 3
+    cm = (((_m_q16(u) * P.FS_DIST_SCALE) << (u >> 11)) + (1 << 31)) >> 32 & 0xFFFFFFFF
     if cm < 1000:
         return f'~{cm // 100}.{cm % 100:02d} m'
     dm = (cm + 5) // 10
@@ -104,17 +124,15 @@ def dist_model(raw):
 
 def dist_cases():
     for raw in range(1, 65536):                       # the model stays within 0.05 % of the true distance
-        cm_true = 100 * 2 ** (raw / 2048 - 10)
-        T = P.FS_EXP_TABLE
-        e, f = raw >> 11, raw & 0x7FF
-        m = T[f >> 6] + ((((T[(f >> 6) + 1] - T[f >> 6]) * (f & 63)) & 0xFFFFFFFF) >> 6)
-        exact = m * 100 * 2 ** e / 2 ** 26
+        cm_true = 100 * 2 ** ((raw - 20480) / 3072)
+        u = (2 * raw) // 3
+        exact = _m_q16(u) * P.FS_DIST_SCALE * 2 ** (u >> 11) / 2 ** 32
         assert abs(exact - cm_true) <= 0.0005 * cm_true + 1e-9, raw
-    for raw, text in ((17378, '~0.35 m'), (21840, '~1.58 m'), (28922, '~17.4 m')):
+    for raw, text in ((15827, '~0.35 m'), (22520, '~1.58 m'), (33143, '~17.4 m')):   # the camera's live values
         assert dist_model(raw) == text, (raw, dist_model(raw))
-    raws = [17378, 21840, 28922, 1, 2047, 2048, 2049, 10240, 13606, 16383, 16384, 16385, 18000, 19000, 20000, 20480,
-            23000, 24000, 24600, 25000, 26000, 27200, 27500, 27900, 28000, 29000, 30000, 30500, 31000, 32767, 32768,
-            34000, 36000, 40000, 50000, 65535] + [17378 + 37 * k for k in range(1, 8)]
+    raws = [15827, 22520, 33143, 1, 3071, 3072, 3073, 10000, 13000, 15000, 16000, 17000, 18000, 19000, 20000, 20480,
+            21000, 23000, 24000, 25000, 26000, 27000, 28000, 29000, 30000, 31000, 32000, 32767, 32768, 34000, 36000,
+            38000, 40000, 45000, 50000, 65535] + [15827 + 37 * k for k in range(1, 8)]
     return [(r, dist_model(r)) for r in raws]
 
 
@@ -174,16 +192,16 @@ def main():
         f'#define FS_ITEM_SET {P.FS_ITEM_SET:#x}u', f'#define SL_VALUE {P.SL_VALUE:#x}UL', f'#define FS_ITEM_SHOTS {P.FS_ITEM_SHOTS:#x}u', f'#define FS_ITEM_END0 {P.FS_ITEM_END0:#x}u',
         f'#define THUNK_MENU {th(P.THUNK_MENU_WORDS)}', f'#define THUNK_CUSTOM {th(P.THUNK_CUSTOM_WORDS)}',
         f'#define FS_DIST_RAM {P.FS_DIST_RAM:#x}UL', f'#define P_DISTANCE {P.P_DISTANCE:#x}u', f'#define FS_INFO_SLOT0 {P.FS_INFO_SLOT0}u',
-        f'#define N_DIAG {len(P.FS_DIAG)}',
+        f'#define N_DIAG {len(P.FS_DIAG)}', f'#define P_INFINITY {P.P_INFINITY:#x}u', f'#define P_NEAR {P.P_NEAR:#x}u',
         '#define INFO_ITEMS {' + ','.join(f'{x:#x}' for x in P.FS_INFO_ITEMS[:2 + len(P.FS_DIAG)]) + '}',
         '#define DIST_CASES {' + ','.join(f'{{{r:#x}, "{t}"}}' for r, t in dist_cases()) + '}',
-        '#define DIAG_PARAMS {' + ','.join(f'{{{i:#x}, {v:#x}u}}' for i, v in params) + '}',
-        '#define DIAG_EXPECT_A {' + ','.join(f'"{t}"' for t in a_txt) + '}',
-        '#define DIAG_EXPECT_D {' + ','.join(f'"{t}"' for t in d_txt) + '}', '']))
+        '#define DIAG_PARAMS {' + ','.join(f'{{{i:#x}, {v:#x}u}}' for i, v in params or [(0, 0)]) + '}',
+        '#define DIAG_EXPECT_A {' + ','.join(f'"{t}"' for t in a_txt or ['']) + '}',
+        '#define DIAG_EXPECT_D {' + ','.join(f'"{t}"' for t in d_txt or ['']) + '}', '']))
     defs = [f'--defsym=hook_{n}={L[n]:#x}' for n in ('gate', 'save', 'has_prev', 'hook_menu', 'hook_custom', 'link_sync', 'texts', 'post_wrap', 'bkt_wrap',
                                                  'fs_end_get', 'fs_pps', 'fs_est', 'fs_shots', 'fs_remain', 'fs_refresh',
-                                                 'fs_end_ok', 'fs_end_entry', 'fs_wake', 'sl_wrap', 'sl_text')]
-    defs += [f'--defsym=lens_{n}={lens.labels[n]:#x}' for n in ('fs_end_ok2', 'fs_dist_text', 'fs_end_refresh', 'fs_val')]
+                                                 'fs_end_ok', 'fs_end_entry', 'fs_wake', 'sl_wrap', 'sl_text', 'fs_target_get')]
+    defs += [f'--defsym=lens_{n}={lens.labels[n]:#x}' for n in ('fs_end_ok2', 'fs_dist_text', 'fs_end_refresh')]
     obj = a.out / 'harness.o'
     run = lambda *c: subprocess.run(c, check=True)
     run('clang', '--target=aarch64-none-elf', '-O1', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',

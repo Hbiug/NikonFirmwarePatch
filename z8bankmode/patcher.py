@@ -170,11 +170,16 @@ FS_TEXT = (b'SET', b'OFF', b'--', b'~%d', b'%d')      # after STATE_TEXT, same 1
 # The lens module keeps the lens's data packets in RAM; 0x4109E130(id) reads one parameter from them (table 0xA02A147F8,
 # id * 0x28: packet / offset for each protocol layout, reader, size; pure memory reads).  0x4107B704, which fills the lens
 # block of every shot's MakerNote (found with an emulator write watch), takes FocusDistance from parameter 0x117 (packet
-# 0xC +0x2E, u16) and FocusStepsFromInfinity from 0xF8 (packet 0xD +0xB).  Distance in metres = 2^(raw / 2048 - 10)
-# (fits the user's ExifTool values 0.35 / 1.58 / 17.4 m exactly: raw 17378 / 21840 / 28922).  0x41068D8C(out) decodes
+# 0xC +0x2E, u16) and FocusStepsFromInfinity from 0xF8 (packet 0xD +0xB).  Distance in metres =
+# 2^((raw - 20480) / 3072): the camera's live values 15827 / 22520 / 33143 against ExifTool's 0.35 / 1.58 / 17.4 m for the
+# same positions, exact to 1e-14 (c5 used 2^(raw/2048 - 10), fitted to the metres alone).  0x41068D8C(out) decodes
 # the newest lens status record (position, drive-end bits, two unknown 32-bit fields).
 F_LENS_PARAM, F_LENS_STATUS = 0x4109E130, 0x41068D8C
 P_DISTANCE = 0x117
+# c6, from the c5 diagnostic rows on the camera (24-120 mm at 24 / 120 mm): parameter 0xB0 (packet 0xD +0x21, s32) is the
+# infinity end of the focus range (-7351 / -406; the infinity stop read -7361 / -408) and 0xAE (+0x29) its closest end
+# (50150 / 47026; ExifTool's closest-focus shot 50153); both constant while focusing, following the zoom
+P_INFINITY, P_NEAR = 0xB0, 0xAE
 # distance of the stored end point (u16 raw, 0 = unknown): zero gap after the GUI material, written through the text RW
 # alias (as the toolkit does for its own state); the loader copies the gap from the image at every boot, so it is 0 then.
 FS_DIST_OFF = 0x8A2F00
@@ -185,11 +190,10 @@ FS_DIST_RAM = FS_DIST_OFF + 0x40160000 + 0xA0F800000 - 0x40200000      # 0xA1000
 FS_INFO_ITEMS = (0x38D3, 0x38D4, 0x38D5, 0x38D6, 0x38D7, 0x38DA, 0x38DD, 0x38DE, 0x38E1, 0x38E2, 0x38E3, 0x38E5,
                  0x38E7, 0x38E9, 0x38C5)                    # unused row item ids (no row, no code constant)
 FS_INFO_SLOT0 = 9                                         # text slots 9.. (the focus shift page uses 5..8)
-FS_DIAG = ((0x8000, 0xF8), (P_DISTANCE, 0x8001), (0x111, 0x112), (0xEC, 0xED), (0xF9, 0x115), (0xB0, 0xAF),
-           (0xAE, 0x102), (0x103, 0x143), (0xB5, 0xB6), (0xB7, 0xB8), (0x8002, 0x8003), (0x4, 0x5), (0xA6, 0xA7))
-FS_DIAG_LABELS = ('D1 pos / steps', 'D2 dist / end', 'D3 111 / 112', 'D4 EC / ED', 'D5 F9 / 115', 'D6 B0 / AF',
-                  'D7 AE / 102', 'D8 103 / 143', 'D9 B5 / B6', 'D10 B7 / B8', 'D11 S34 / S38', 'D12 4 / 5',
-                  'D13 A6 / A7')
+# c5 had 13 rows: (0x8000, 0xF8), (0x117, 0x8001), (0x111, 0x112), (0xEC, 0xED), (0xF9, 0x115), (0xB0, 0xAF),
+# (0xAE, 0x102), (0x103, 0x143), (0xB5, 0xB6), (0xB7, 0xB8), (0x8002, 0x8003), (0x4, 0x5), (0xA6, 0xA7); c6 has none
+FS_DIAG = ()
+FS_DIAG_LABELS = ()
 FS_PAGE = 0xA028CF400 - 0xA02808000 + 0x4B13000             # page record of the focus shift page (state 0xB1)
 FS_LAYOUT, FS_LAYOUT_BYTES = 0x43DF8D58 - BASE, 0x198
 FS_GUIDE_STRING, FS_GUIDE_AT = 0xA4C, 0xCC              # "Interrupt after start ->" guide of the focus shift layout
@@ -329,6 +333,24 @@ def _focus(b):
             _r(b, 0x53087C00, 'lsr w0, w0, #8')
         b.strb_w(0, 9, k * REL_SLOT_STEP)
     b.ret()
+    # fs_target_get -> w0 = 1 and w1 = the position a run aims at: the stored end point, else (c6) the lens's infinity
+    # position (lens parameter 0xB0; unknown when it and the closest-focus position 0xAE both read 0, e.g. no Z lens)
+    b.label('fs_target_get')
+    b.stp_pre(19, 30, -0x10)
+    b.bl('fs_end_get')
+    b.cbnz_w(0, 'tg_done')
+    b.mov_w(0, P_INFINITY)
+    b.bl(F_LENS_PARAM)
+    b.mov_wr(19, 0)
+    b.mov_w(0, P_NEAR)
+    b.bl(F_LENS_PARAM)
+    _r(b, 0x2A130008, 'orr w8, w0, w19')
+    b.mov_wr(1, 19)
+    b.cmp_wi(8, 0)
+    _r(b, 0x1A9F07E0, 'cset w0, ne')
+    b.label('tg_done')
+    b.ldp_post(19, 30, 0x10)
+    b.ret()
     # fs_pps(w0 = step width 1..10) -> w0 = lens pulses one focus shift step subtracts from the position, 0 = unknown.
     # The defocus amount is computed exactly as 0x40FDEE64 does, the pulses exactly as lens request type 4 does.
     b.label('fs_pps')
@@ -411,7 +433,7 @@ def _focus(b):
     b.cbz_w(19, 'est_zero')
     b.bl(F_LENS_POS)
     b.mov_wr(20, 0)
-    b.bl('fs_end_get')
+    b.bl('fs_target_get')
     b.cbz_w(0, 'est_zero')
     _r(b, 0x4B010288, 'sub w8, w20, w1')
     b.cmp_wi(19, 0)
@@ -444,7 +466,7 @@ def _focus(b):
     b.stp_pre(19, 30, -0x10)
     b.bl(GET_DS)
     b.mov_wr(19, 0)
-    b.bl('fs_end_get')
+    b.bl('fs_target_get')
     b.cbz_w(0, 'sh_done')
     _get(b, ID_FS_WIDTH)
     b.bl('fs_est')
@@ -470,8 +492,8 @@ def _focus(b):
     b.str_x(30, 31, 0x60)
     b.mov_x64(19, FS_REMAIN)
     b.ldr_w(20, 19)
-    b.bl('fs_end_get')
-    b.cbz_w(0, 'rm_out')                      # no end point: stock
+    b.bl('fs_target_get')
+    b.cbz_w(0, 'rm_out')                      # no end point and no infinity position: stock
     b.mov_wr(22, 1)
     b.ldr_w(0, 19, FS_WIDTH_OFF)
     b.bl('fs_pps')
@@ -545,7 +567,8 @@ def _focus(b):
     b.ldp(20, 21, 0x10)
     b.ldp_post(19, 30, 0x30)
     b.ret()
-    # fs_texts(state): "SET" / "OFF" on the end point row; with an end point, "~N" (or "--") on the No. of shots row
+    # fs_texts(state): "SET" / "OFF" on the end point row; "~N" (or "--") on the No. of shots row whenever there is an
+    # estimate (to the end point, else to infinity); without one the stock value stays
     b.label('fs_texts')
     b.stp_pre(19, 30, -0x30)
     b.str_x(20, 31, 0x10)
@@ -553,6 +576,10 @@ def _focus(b):
     b.bl('fs_end_get')
     b.cbz_w(0, 'tx_off')
     _adr_text(b, 0, t_set)
+    b.b('tx_mark')
+    b.label('tx_off')
+    _adr_text(b, 0, t_off)
+    b.label('tx_mark')
     b.mov_w(1, FS_ITEM_SET)
     b.mov_x(2, 19)
     b.mov_w(3, FS_SLOT_SET)
@@ -560,7 +587,8 @@ def _focus(b):
     _get(b, ID_FS_WIDTH)
     b.bl('fs_est')
     b.cmp_wi(0, 0)
-    b.b_cond('le', 'tx_dash')
+    b.b_cond('eq', 'tx_done')
+    b.b_cond('lt', 'tx_dash')
     b.mov_wr(2, 0)
     _adr_text(b, 1, t_fmt)
     b.add_xi(0, 31, 0x18)
@@ -573,13 +601,6 @@ def _focus(b):
     b.mov_w(1, FS_ITEM_SHOTS)
     b.mov_x(2, 19)
     b.mov_w(3, FS_SLOT_SHOTS)
-    b.bl('fs_row_text')
-    b.b('tx_done')
-    b.label('tx_off')
-    _adr_text(b, 0, t_off)
-    b.mov_w(1, FS_ITEM_SET)
-    b.mov_x(2, 19)
-    b.mov_w(3, FS_SLOT_SET)
     b.bl('fs_row_text')
     b.label('tx_done')
     b.ldr_x(20, 31, 0x10)
@@ -672,7 +693,7 @@ def _focus(b):
     b.bl(F_ELEMENT)
     b.mov_x(19, 0)
     b.cbz_x(19, 'sl_done')                     # page not built: nothing to write
-    b.bl('fs_end_get')
+    b.bl('fs_target_get')
     b.cbz_w(0, 'sl_stock')
     b.mov_x64(8, SL_VALUE)
     _r(b, 0x79C00100, 'ldrsh w0, [x8]')
@@ -765,6 +786,7 @@ def _focus(b):
 
 
 FS_EXP_TABLE = tuple(round(65536 * 2 ** (i / 32)) for i in range(33))   # 2^(i/32) in Q16
+FS_DIST_SCALE = round(100 * 2 ** (-20 / 3) * 65536)                    # 64508: centimetres, Q16
 FS_DIST_TEXT = (b'--', b'SET', b'~%d.%02d m', b'~%d.%d m', b'~%d m', b'%d / %d')
 
 
@@ -787,12 +809,16 @@ def lens_code(cs, at, main):
     b.strh_w(19, 9)
     b.ldp_post(19, 30, 0x10)
     b.ret()
-    # fs_dist_text(w0 = raw distance, x1 = buffer): "~0.35 m", "~1.58 m", "~17.4 m", "~120 m"
+    # fs_dist_text(w0 = raw distance, x1 = buffer): "~0.35 m", "~1.58 m", "~17.4 m", "~120 m".
+    # metres = 2^((raw - 20480) / 3072) = 2^(u / 2048) * 2^(-20/3) with u = 2 * raw / 3
     b.label('fs_dist_text')
     b.stp_pre(19, 30, -0x10)
     b.mov_x(19, 1)
-    _r(b, 0x530B7C09, 'lsr w9, w0, #11')        # e = raw >> 11
-    _r(b, 0x1200280A, 'and w10, w0, #0x7ff')    # f = raw & 2047
+    b.add_w(9, 0, 0)
+    b.mov_w(10, 3)
+    _r(b, 0x1ACA0929, 'udiv w9, w9, w10')       # u
+    _r(b, 0x1200292A, 'and w10, w9, #0x7ff')    # f = u & 2047
+    _r(b, 0x530B7D29, 'lsr w9, w9, #11')        # e = u >> 11
     _r(b, 0x53067D4B, 'lsr w11, w10, #6')       # table index
     _r(b, 0x1200154C, 'and w12, w10, #0x3f')    # interpolation weight /64
     b.adr(13, 'exp')
@@ -802,12 +828,12 @@ def lens_code(cs, at, main):
     b.sub_w(15, 15, 14)
     _r(b, 0x1B0C7DEF, 'mul w15, w15, w12')
     _r(b, 0x0B4F19CE, 'add w14, w14, w15, lsr #6')   # m = 2^(f/2048) in Q16
-    b.mov_w(15, 100)
+    b.mov_w(15, FS_DIST_SCALE)
     _r(b, 0x9BAF7DCE, 'umull x14, w14, w15')
     _r(b, 0x9AC921CE, 'lsl x14, x14, x9')
-    _r(b, 0xD2A0400F, 'mov x15, #0x2000000')
+    _r(b, 0xD2B0000F, 'mov x15, #0x80000000')
     _r(b, 0x8B0F01CE, 'add x14, x14, x15')
-    _r(b, 0xD35AFDCE, 'lsr x14, x14, #26')       # centimetres = round(100 * 2^(raw/2048) / 1024)
+    _r(b, 0xD360FDCE, 'lsr x14, x14, #32')       # centimetres = round(m * 2^e * 100 * 2^(-20/3) / 2^16)
     b.mov_w(8, 100)
     b.cmp_wi(14, 1000)
     b.b_cond('hs', 'dt_dm')
@@ -834,25 +860,26 @@ def lens_code(cs, at, main):
     b.bl(F_SPRINTF)
     b.ldp_post(19, 30, 0x10)
     b.ret()
-    # fs_val(w0 = code, x1 = decoded lens status) -> w0: a lens parameter, or 0x8000 position / 0x8001 drive-end bits /
-    # 0x8002, 0x8003 the status record's two unknown fields
-    b.label('fs_val')
-    b.tbz_w(0, 15, 'val_param')
-    _r(b, 0x12001C08, 'and w8, w0, #0xff')
-    b.cbz_w(8, 'val_pos')
-    b.ldr_w(0, 1, 0x2C)
-    b.cmp_wi(8, 1)
-    b.b_cond('eq', 'val_ret')
-    b.ldr_w(0, 1, 0x34)
-    b.cmp_wi(8, 2)
-    b.b_cond('eq', 'val_ret')
-    b.ldr_w(0, 1, 0x38)
-    b.label('val_ret')
-    b.ret()
-    b.label('val_pos')
-    b.b(F_LENS_POS)
-    b.label('val_param')
-    b.b(F_LENS_PARAM)
+    if FS_DIAG:
+        # fs_val(w0 = code, x1 = decoded lens status) -> w0: a lens parameter, or 0x8000 position / 0x8001 drive-end bits /
+        # 0x8002, 0x8003 the status record's two unknown fields
+        b.label('fs_val')
+        b.tbz_w(0, 15, 'val_param')
+        _r(b, 0x12001C08, 'and w8, w0, #0xff')
+        b.cbz_w(8, 'val_pos')
+        b.ldr_w(0, 1, 0x2C)
+        b.cmp_wi(8, 1)
+        b.b_cond('eq', 'val_ret')
+        b.ldr_w(0, 1, 0x34)
+        b.cmp_wi(8, 2)
+        b.b_cond('eq', 'val_ret')
+        b.ldr_w(0, 1, 0x38)
+        b.label('val_ret')
+        b.ret()
+        b.label('val_pos')
+        b.b(F_LENS_POS)
+        b.label('val_param')
+        b.b(F_LENS_PARAM)
     # fs_end_refresh(state): value refresh of the sub-page (the N-RAW page's is an empty `ret`): end point and current
     # focus distance, then the diagnostic rows.  Frame: text buffer sp+0, lens status sp+0x40 (0x50 bytes).
     b.label('fs_end_refresh')
@@ -863,10 +890,11 @@ def lens_code(cs, at, main):
     b.str_x(30, 31, 0xC0)
     b.mov_x(19, 0)
     b.cbz_x(19, 'er_done')
-    for k in range(5):
-        _r(b, 0xA9007FFF | ((0x40 + 0x10 * k) // 8) << 15, f'stp xzr, xzr, [sp, #{0x40 + 0x10 * k:#x}]')
-    b.add_xi(0, 31, 0x40)
-    b.bl(F_LENS_STATUS)
+    if FS_DIAG:
+        for k in range(5):
+            _r(b, 0xA9007FFF | ((0x40 + 0x10 * k) // 8) << 15, f'stp xzr, xzr, [sp, #{0x40 + 0x10 * k:#x}]')
+        b.add_xi(0, 31, 0x40)
+        b.bl(F_LENS_STATUS)
     # end point row
     b.bl(main['fs_end_get'])
     b.cbz_w(0, 'er_end_dash')
@@ -902,30 +930,31 @@ def lens_code(cs, at, main):
     b.mov_x(2, 19)
     b.mov_w(3, FS_INFO_SLOT0 + 1)
     b.bl(main['fs_row_text'])
-    # diagnostic rows: {u16 item, u16 slot, u16 code a, u16 code b}
-    b.adr(20, 'diag')
-    b.mov_w(21, len(FS_DIAG))
-    b.label('er_diag')
-    b.ldrh_w(0, 20, 4)
-    b.add_xi(1, 31, 0x40)
-    b.bl('fs_val')
-    b.mov_wr(22, 0)
-    b.ldrh_w(0, 20, 6)
-    b.add_xi(1, 31, 0x40)
-    b.bl('fs_val')
-    b.mov_wr(3, 0)
-    b.mov_wr(2, 22)
-    b.adr(1, 'fmt_pair')
-    b.add_xi(0, 31, 0)
-    b.bl(F_SPRINTF)
-    b.add_xi(0, 31, 0)
-    b.ldrh_w(1, 20, 0)
-    b.mov_x(2, 19)
-    b.ldrh_w(3, 20, 2)
-    b.bl(main['fs_row_text'])
-    b.add_xi(20, 20, 8)
-    b.subs_wi(21, 21, 1)
-    b.b_cond('ne', 'er_diag')
+    if FS_DIAG:
+        # diagnostic rows: {u16 item, u16 slot, u16 code a, u16 code b}
+        b.adr(20, 'diag')
+        b.mov_w(21, len(FS_DIAG))
+        b.label('er_diag')
+        b.ldrh_w(0, 20, 4)
+        b.add_xi(1, 31, 0x40)
+        b.bl('fs_val')
+        b.mov_wr(22, 0)
+        b.ldrh_w(0, 20, 6)
+        b.add_xi(1, 31, 0x40)
+        b.bl('fs_val')
+        b.mov_wr(3, 0)
+        b.mov_wr(2, 22)
+        b.adr(1, 'fmt_pair')
+        b.add_xi(0, 31, 0)
+        b.bl(F_SPRINTF)
+        b.add_xi(0, 31, 0)
+        b.ldrh_w(1, 20, 0)
+        b.mov_x(2, 19)
+        b.ldrh_w(3, 20, 2)
+        b.bl(main['fs_row_text'])
+        b.add_xi(20, 20, 8)
+        b.subs_wi(21, 21, 1)
+        b.b_cond('ne', 'er_diag')
     b.label('er_done')
     b.mov_x(0, 19)
     b.ldp(19, 20, 0x90)
