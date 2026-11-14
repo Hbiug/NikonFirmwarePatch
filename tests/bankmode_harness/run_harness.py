@@ -23,9 +23,11 @@ def _words(data, lo, hi, base):
     return [(a, struct.unpack_from('<I', data, a - base)[0]) for a in range(lo, hi, 4)]
 
 
-def _nop_first(data, lo, hi, base, mask, value):
+def _nop_first(data, lo, hi, base, mask, value, skip=0):
     for a, w in _words(data, lo, hi, base):
-        if w & mask == value:
+        if w & mask == value and skip:
+            skip -= 1
+        elif w & mask == value:
             struct.pack_into('<I', data, a - base, NOP)
             return
     raise SystemExit('mutation site not found')
@@ -77,17 +79,16 @@ MUTATIONS = {
 LENS_VA = 0x40A02000
 LENS_MUTATIONS = {
     # metre text: the interpolation between table entries is gone (steps of 2^(1/32))
-    'dist-no-interp': lambda d, L, b: _nop_first(d, L['fs_dist_text'], L['fs_end_refresh'], b, 0xFFFFFFFF, 0x0B4F19CE),
+    'dist-no-interp': lambda d, L, b: _nop_first(d, L['fs_dist_text'], L['fs_page_refresh'], b, 0xFFFFFFFF, 0x0B4F19CE),
     # metre text: no rounding to the nearest centimetre
-    'dist-no-round': lambda d, L, b: _nop_first(d, L['fs_dist_text'], L['fs_end_refresh'], b, 0xFFFFFFFF, 0x8B0F01CE),
+    'dist-no-round': lambda d, L, b: _nop_first(d, L['fs_dist_text'], L['fs_page_refresh'], b, 0xFFFFFFFF, 0x8B0F01CE),
     # metre text: the 2/3 scale of the raw value is gone (the c5 formula)
-    'dist-c5-scale': lambda d, L, b: _nop_first(d, L['fs_dist_text'], L['fs_end_refresh'], b, 0xFFFFFFFF, 0x1ACA0929),
+    'dist-c5-scale': lambda d, L, b: _nop_first(d, L['fs_dist_text'], L['fs_page_refresh'], b, 0xFFFFFFFF, 0x1ACA0929),
     # Set end point no longer stores the lens distance
     'ok2-no-dist': lambda d, L, b: _nop_first(d, L['fs_end_ok2'], L['fs_dist_text'], b, 0xFFC00000, 0x79000000),
 }
-if P.FS_DIAG:
-    # diagnostic rows: the second value is not passed to sprintf
-    LENS_MUTATIONS['diag-one-value'] = lambda d, L, b: _nop_first(d, L['er_diag'], L['er_done'], b, 0xFFFFFFFF, 0x2A0003E3)
+# focus shift page: the end point row keeps SET instead of the end point's distance
+LENS_MUTATIONS['page-no-end-distance'] = lambda d, L, b: _nop_first(d, L['fs_page_refresh'], L['pr_now'], b, 0xFC000000, 0x94000000, skip=2)
 # without an end point the run no longer aims at the lens's infinity position (c5 behaviour)
 MUTATIONS['fs-no-infinity'] = lambda d, L, b: _cb_always(d, L['fs_target_get'], L['tg_done'], b)
 
@@ -136,25 +137,6 @@ def dist_cases():
     return [(r, dist_model(r)) for r in raws]
 
 
-def diag_values():
-    """Stub values for the diagnostic parameters and the expected row texts (status valid / status missing)."""
-    params = []
-    for a, b in P.FS_DIAG:
-        for c in (a, b):
-            if c < 0x8000 and c != P.P_DISTANCE and c not in [x for x, _ in params]:
-                v = (c * 2654435761) & 0xFFFFFFFF
-                params.append((c, v if c & 1 else v & 0xFFFF))
-    pv = dict(params)
-    pv[P.P_DISTANCE] = 17378
-    sval = {0x8000: -7361, 0x8001: 2, 0x8002: -5, 0x8003: 123456}
-    s32 = lambda v: v - (1 << 32) if v & 0x80000000 else v
-    a_txt = [f'{s32(pv[a]) if a < 0x8000 else sval[a]} / {s32(pv[b]) if b < 0x8000 else sval[b]}' for a, b in P.FS_DIAG]
-    pv[P.P_DISTANCE] = 0
-    dval = {0x8000: -7361, 0x8001: 0, 0x8002: 0, 0x8003: 0}
-    d_txt = [f'{s32(pv[a]) if a < 0x8000 else dval[a]} / {s32(pv[b]) if b < 0x8000 else dval[b]}' for a, b in P.FS_DIAG]
-    return params, a_txt, d_txt
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--qemu', default=shutil.which('qemu-system-aarch64') or 'qemu-system-aarch64')
@@ -177,7 +159,6 @@ def main():
         data = bytes(data)
     (a.out / 'hooks.bin').write_bytes(data)
     L = blk.labels
-    params, a_txt, d_txt = diag_values()
     th = lambda w: '"' + ','.join('0x%08X' % x for x in w) + '"'
     (a.out / 'gen.h').write_text('\n'.join([
         f'#define ID_BANK {P.ID_BANK:#x}u', f'#define ID_EXT {P.ID_EXT:#x}u', f'#define ID_CUSTOM {P.ID_CUSTOM:#x}u',
@@ -191,17 +172,14 @@ def main():
         f'#define ID_FS_SHOTS {P.ID_FS_SHOTS:#x}u', f'#define ID_FS_WIDTH {P.ID_FS_WIDTH:#x}u',
         f'#define FS_ITEM_SET {P.FS_ITEM_SET:#x}u', f'#define SL_VALUE {P.SL_VALUE:#x}UL', f'#define FS_ITEM_SHOTS {P.FS_ITEM_SHOTS:#x}u', f'#define FS_ITEM_END0 {P.FS_ITEM_END0:#x}u',
         f'#define THUNK_MENU {th(P.THUNK_MENU_WORDS)}', f'#define THUNK_CUSTOM {th(P.THUNK_CUSTOM_WORDS)}',
-        f'#define FS_DIST_RAM {P.FS_DIST_RAM:#x}UL', f'#define P_DISTANCE {P.P_DISTANCE:#x}u', f'#define FS_INFO_SLOT0 {P.FS_INFO_SLOT0}u',
-        f'#define N_DIAG {len(P.FS_DIAG)}', f'#define P_INFINITY {P.P_INFINITY:#x}u', f'#define P_NEAR {P.P_NEAR:#x}u',
-        '#define INFO_ITEMS {' + ','.join(f'{x:#x}' for x in P.FS_INFO_ITEMS[:2 + len(P.FS_DIAG)]) + '}',
-        '#define DIST_CASES {' + ','.join(f'{{{r:#x}, "{t}"}}' for r, t in dist_cases()) + '}',
-        '#define DIAG_PARAMS {' + ','.join(f'{{{i:#x}, {v:#x}u}}' for i, v in params or [(0, 0)]) + '}',
-        '#define DIAG_EXPECT_A {' + ','.join(f'"{t}"' for t in a_txt or ['']) + '}',
-        '#define DIAG_EXPECT_D {' + ','.join(f'"{t}"' for t in d_txt or ['']) + '}', '']))
+        f'#define FS_DIST_RAM {P.FS_DIST_RAM:#x}UL', f'#define P_DISTANCE {P.P_DISTANCE:#x}u',
+        f'#define P_INFINITY {P.P_INFINITY:#x}u', f'#define P_NEAR {P.P_NEAR:#x}u',
+        f'#define FS_ITEM_CURRENT {P.FS_ITEM_CURRENT:#x}u', f'#define FS_SLOT_CURRENT {P.FS_SLOT_CURRENT}u',
+        '#define DIST_CASES {' + ','.join(f'{{{r:#x}, "{t}"}}' for r, t in dist_cases()) + '}', '']))
     defs = [f'--defsym=hook_{n}={L[n]:#x}' for n in ('gate', 'save', 'has_prev', 'hook_menu', 'hook_custom', 'link_sync', 'texts', 'post_wrap', 'bkt_wrap',
                                                  'fs_end_get', 'fs_pps', 'fs_est', 'fs_shots', 'fs_remain', 'fs_refresh',
                                                  'fs_end_ok', 'fs_end_entry', 'fs_wake', 'sl_wrap', 'sl_text', 'fs_target_get')]
-    defs += [f'--defsym=lens_{n}={lens.labels[n]:#x}' for n in ('fs_end_ok2', 'fs_dist_text', 'fs_end_refresh')]
+    defs += [f'--defsym=lens_{n}={lens.labels[n]:#x}' for n in ('fs_end_ok2', 'fs_dist_text', 'fs_page_refresh')]
     obj = a.out / 'harness.o'
     run = lambda *c: subprocess.run(c, check=True)
     run('clang', '--target=aarch64-none-elf', '-O1', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',

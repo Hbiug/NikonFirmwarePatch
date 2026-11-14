@@ -590,16 +590,15 @@ static void focus_tests(void) {
 }
 
 
-/* ---- c5: Focus end point sub-page distances and lens diagnostics (second code block) -------------------------------- */
-extern char lens_fs_end_ok2[], lens_fs_dist_text[], lens_fs_end_refresh[];
+/* ---- c5..c7: distances (second code block): sub-page OK action, focus shift page refresh wrapper, metre text ---------- */
+extern char lens_fs_end_ok2[], lens_fs_dist_text[], lens_fs_page_refresh[];
 #define DIST (*(volatile unsigned short *)FS_DIST_RAM)
 static int streq(const char *a, const char *b) { for (; *a && *a == *b; a++, b++); return *a == *b; }
 static const struct { u32 raw; const char *text; } dist_cases[] = DIST_CASES;
-static const u32 info_items[] = INFO_ITEMS;
-static const struct { u32 id, val; } diag_params[] = DIAG_PARAMS;
-static const char *diag_expect_a[] = DIAG_EXPECT_A, *diag_expect_d[] = DIAG_EXPECT_D;
-static int shown_row(int i, u32 item, u32 slot, const char *t) {
-    return i < nshown && shown[i].item == item && shown[i].slot == slot && shown[i].style == 0x220 && streq(shown[i].text, t);
+static int last_shown(u32 item) { int r = -1; for (int i = 0; i < nshown; i++) if ((shown[i].item & 0x7FFFFFFF) == item) r = i; return r; }
+static int last_is(u32 item, u32 slot, const char *t) {
+    int i = last_shown(item);
+    return i >= 0 && shown[i].item == item && shown[i].slot == slot && shown[i].style == 0x220 && streq(shown[i].text, t);
 }
 static void lens_tests(void) {
     char buf[64]; int bad = 0;
@@ -609,43 +608,40 @@ static void lens_tests(void) {
         if (!streq(buf, dist_cases[c].text)) { bad++; puts_("    raw "); puthex(dist_cases[c].raw); puts_(" got "); puts_(buf);
                                                puts_(" want "); puts_(dist_cases[c].text); putc_('\n'); }
     }
-    check(!bad, "c6 distance text: 2^((raw - 20480)/3072) m, every case as the reference (the camera's 0.35 / 1.58 / 17.4 m)");
-    /* OK action: set stores the position and the lens distance; clear forgets both */
+    check(!bad, "distance text: 2^((raw - 20480)/3072) m, every case as the reference (the camera's 0.35 / 1.58 / 17.4 m)");
+    /* sub-page OK action: set stores the position and the lens distance; clear forgets both */
     static u8 erows[2 * 0x2C]; static u64 epage[4]; static u8 eobj[0x60]; static u64 ectx[1];
     for (u32 i = 0; i < 2; i++) *(volatile u32 *)(erows + i * 0x2C + 0x18) = FS_ITEM_END0 + i;
     epage[2] = (u64)erows; *(volatile u64 *)(eobj + 0x50) = (u64)epage; ectx[0] = (u64)eobj;
     nparam_set = 0; param(P_DISTANCE, 22520); lens_pos = 777; DIST = 0xFFFF;
     EROW(0); call(lens_fs_end_ok2, (u64)ectx, 0, 0, 0);
     check(call(hook_fs_end_get, 0, 0, 0, 0) == 1 && fs_raw() == (777u ^ 0x80000000u) && DIST == 22520,
-          "c5 Set end point: position stored as before, plus the lens distance (parameter 0x117)");
+          "Set end point: position stored as before, plus the lens distance (parameter 0x117)");
     param(P_DISTANCE, 0); EROW(0); call(lens_fs_end_ok2, (u64)ectx, 0, 0, 0);
-    check(call(hook_fs_end_get, 0, 0, 0, 0) == 1 && DIST == 0, "c5 Set end point without lens distance: distance 0 (unknown)");
+    check(call(hook_fs_end_get, 0, 0, 0, 0) == 1 && DIST == 0, "Set end point without lens distance: distance 0 (unknown)");
     DIST = 0x1234; EROW(1); call(lens_fs_end_ok2, (u64)ectx, 0, 0, 0);
-    check(call(hook_fs_end_get, 0, 0, 0, 0) == 0 && DIST == 0, "c5 Clear end point: position and distance forgotten");
-    /* refresh: end point distance, current distance, 13 diagnostic rows */
+    check(call(hook_fs_end_get, 0, 0, 0, 0) == 0 && DIST == 0, "Clear end point: position and distance forgotten");
+    /* focus shift page refresh (c7): stock refresh and texts first, then the end point's distance on the end point row
+       (slot 8) and the current focus distance on the current focus row (item 0x2C4F, slot 9) */
     u64 st[0x20]; for (int i = 0; i < 0x20; i++) st[i] = 0; st[9] = 0x1000;
+    nparam_set = 0; param(P_DISTANCE, 22520); lens_pos = 777; EROW(0); call(lens_fs_end_ok2, (u64)ectx, 0, 0, 0);
+    param(P_DISTANCE, 15827);
+    nshown = 0; fs_calls_refresh = 0;
+    long r = call(lens_fs_page_refresh, (u64)st, 0, 0, 0);
+    check(r == 0x77 && fs_calls_refresh == 1 && shown[0].item == FS_ITEM_SET && last_is(FS_ITEM_SET, 8, "~1.58 m") &&
+          last_is(FS_ITEM_CURRENT, FS_SLOT_CURRENT, "~0.35 m"),
+          "focus shift page: stock refresh first; end point row ~1.58 m (in place of SET), current focus ~0.35 m");
+    DIST = 0; nshown = 0; call(lens_fs_page_refresh, (u64)st, 0, 0, 0);
+    check(last_is(FS_ITEM_SET, 8, "SET") && last_is(FS_ITEM_CURRENT, FS_SLOT_CURRENT, "~0.35 m"),
+          "focus shift page: end point stored without a distance keeps SET");
+    EROW(1); call(lens_fs_end_ok2, (u64)ectx, 0, 0, 0); param(P_DISTANCE, 0);
+    nshown = 0; call(lens_fs_page_refresh, (u64)st, 0, 0, 0);
+    check(last_is(FS_ITEM_SET, 8, "OFF") && last_is(FS_ITEM_CURRENT, FS_SLOT_CURRENT, "--"),
+          "focus shift page: no end point -> OFF; no lens distance -> -- on the current focus row");
+    nshown = 0; fs_calls_refresh = 0; lens_param_calls = 0;
+    r = call(lens_fs_page_refresh, 0, 0, 0, 0);
+    check(r == 0x77 && fs_calls_refresh == 1 && nshown == 0 && lens_param_calls == 0, "focus shift page: no state -> stock refresh only");
     nparam_set = 0;
-    for (u32 i = 0; i < sizeof diag_params / sizeof diag_params[0]; i++) param(diag_params[i].id, diag_params[i].val);
-    param(P_DISTANCE, 15827); lens_pos = -7361; st2c = 2; st34 = -5; st38 = 123456; status_valid = 1;
-    param(P_DISTANCE, 22520); lens_pos = 777; EROW(0); call(lens_fs_end_ok2, (u64)ectx, 0, 0, 0);
-    param(P_DISTANCE, 15827); lens_pos = -7361;
-    nshown = 0;
-    long r = call(lens_fs_end_refresh, (u64)st, 0, 0, 0);
-    int ok = r == (long)(u64)st && nshown == (int)(sizeof info_items / sizeof info_items[0]);
-    ok &= shown_row(0, info_items[0], FS_INFO_SLOT0, "~1.58 m") && shown_row(1, info_items[1], FS_INFO_SLOT0 + 1, "~0.35 m");
-    for (int k = 0; k < N_DIAG; k++) ok &= shown_row(2 + k, info_items[2 + k], FS_INFO_SLOT0 + 2 + k, diag_expect_a[k]);
-    check(ok, "sub-page refresh: end point ~1.58 m, current ~0.35 m (and the diagnostic rows, if any) in their slots");
-    if (!ok) for (int i = 0; i < nshown; i++) { puts_("    "); puthex(shown[i].item); puts_(" "); puthex(shown[i].slot); puts_(" "); puts_(shown[i].text); putc_('\n'); }
-    DIST = 0; nshown = 0; call(lens_fs_end_refresh, (u64)st, 0, 0, 0);
-    check(shown_row(0, info_items[0], FS_INFO_SLOT0, "SET"), "c5 sub-page refresh: end point without a known distance shows SET");
-    EROW(1); call(lens_fs_end_ok2, (u64)ectx, 0, 0, 0); param(P_DISTANCE, 0); status_valid = 0;
-    nshown = 0; call(lens_fs_end_refresh, (u64)st, 0, 0, 0);
-    ok = shown_row(0, info_items[0], FS_INFO_SLOT0, "--") && shown_row(1, info_items[1], FS_INFO_SLOT0 + 1, "--");
-    for (int k = 0; k < N_DIAG; k++) ok &= shown_row(2 + k, info_items[2 + k], FS_INFO_SLOT0 + 2 + k, diag_expect_d[k]);
-    check(ok, "sub-page refresh: no end point / no lens distance -> --");
-    nshown = 0; lens_param_calls = 0;
-    check(call(lens_fs_end_refresh, 0, 0, 0, 0) == 0 && nshown == 0 && lens_param_calls == 0, "c5 sub-page refresh: no state -> nothing");
-    status_valid = 1; nparam_set = 0;
 }
 
 void main_(void) {
