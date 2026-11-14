@@ -68,40 +68,22 @@ MUTATIONS = {
     'gate-always-skips': lambda d, L, b: _nop_first(d, L['gate'], L['native'], b, 0xFF000000, 0x36000000),
 }
 
-# mutations of the second block (button start through the menu)
-MUTATIONS2 = {
-    # the menu hook does not disarm: every later opening of the menu would start a series
-    'fs-arm-sticky': lambda d, L, b: _nop_first(d, L['mn_tick'], L['mn_start'], b, 0xFFC00000, 0x39000000),
-    # the menu hook does not check that the transition reached the focus shift page before starting
-    'fs-start-anywhere': lambda d, L, b: _nop_first(d, L['mn_tick'] + 0x30, L['mn_start'], b, 0xFF00001F, 0x54000001),
-}
-START_CODE_AT = 0x8A2790
-
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--qemu', default=shutil.which('qemu-system-aarch64') or 'qemu-system-aarch64')
     ap.add_argument('--out', type=Path, default=HERE / 'build')
     ap.add_argument('--ram', default='44G')
-    ap.add_argument('--mutate', choices=sorted(MUTATIONS) + sorted(MUTATIONS2), help='deliberately break the code under test (the harness must then fail)')
+    ap.add_argument('--mutate', choices=sorted(MUTATIONS), help='deliberately break the code under test (the harness must then fail)')
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
-    cs = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
-    blk, data, _ = P.code(cs)
+    blk, data, _ = P.code(Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN))
     base = P.va(P.CODE_AT)
-    blk2, data2, _ = P.start_code(cs, START_CODE_AT)    # the real build places it after the Start sub-page material
-    base2 = P.va(START_CODE_AT)
-    if a.mutate in MUTATIONS:
+    if a.mutate:
         data = bytearray(data)
         MUTATIONS[a.mutate](data, blk.labels, base)
         data = bytes(data)
-    elif a.mutate:
-        data2 = bytearray(data2)
-        MUTATIONS2[a.mutate](data2, blk2.labels, base2)
-        data2 = bytes(data2)
     (a.out / 'hooks.bin').write_bytes(data)
-    (a.out / 'hooks2.bin').write_bytes(data2)
-    L2 = blk2.labels
     L = blk.labels
     th = lambda w: '"' + ','.join('0x%08X' % x for x in w) + '"'
     (a.out / 'gen.h').write_text('\n'.join([
@@ -115,12 +97,10 @@ def main():
         f'#define FS_END0 {P.FS_END0:#x}UL', f'#define FS_REMAIN {P.FS_REMAIN:#x}UL', f'#define FS_DIV_TABLE {P.FS_DIV_TABLE:#x}UL',
         f'#define ID_FS_SHOTS {P.ID_FS_SHOTS:#x}u', f'#define ID_FS_WIDTH {P.ID_FS_WIDTH:#x}u',
         f'#define FS_ITEM_SET {P.FS_ITEM_SET:#x}u', f'#define SL_VALUE {P.SL_VALUE:#x}UL', f'#define FS_ITEM_SHOTS {P.FS_ITEM_SHOTS:#x}u',
-        f'#define FS_ARM_RW {P.FS_ARM_RW:#x}UL', f'#define FS_ITEM_START0 {P.FS_ITEM_START0:#x}u',
         f'#define THUNK_MENU {th(P.THUNK_MENU_WORDS)}', f'#define THUNK_CUSTOM {th(P.THUNK_CUSTOM_WORDS)}', '']))
     defs = [f'--defsym=hook_{n}={L[n]:#x}' for n in ('gate', 'save', 'has_prev', 'hook_menu', 'hook_custom', 'link_sync', 'texts', 'post_wrap', 'bkt_wrap',
                                                  'fs_end_get', 'fs_pps', 'fs_est', 'fs_shots', 'fs_remain', 'fs_refresh',
-                                                 'fs_set_end', 'fs_clear_end', 'sl_wrap', 'sl_text', 'fs_sub_entry', 'fs_sub_ok')]
-    defs += [f'--defsym=hook_{n}={L2[n]:#x}' for n in ('mn_tick',)]
+                                                 'fs_set_end', 'fs_clear_end', 'sl_wrap', 'sl_text')]
     obj = a.out / 'harness.o'
     run = lambda *c: subprocess.run(c, check=True)
     run('clang', '--target=aarch64-none-elf', '-O1', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
@@ -130,8 +110,7 @@ def main():
     run('ld.lld', '-T', str(HERE / 'link.ld'), *defs, '-o', str(elf), str(obj))
     cmd = [a.qemu, '-M', 'virt,memory-backend=r0', '-cpu', 'max', '-m', a.ram,
            '-object', f'memory-backend-ram,id=r0,size={a.ram},reserve=off', '-display', 'none', '-serial', 'stdio', '-monitor', 'none',
-           '-semihosting', '-kernel', str(elf), '-device', f'loader,file={a.out / "hooks.bin"},addr={base:#x},force-raw=on',
-           '-device', f'loader,file={a.out / "hooks2.bin"},addr={base2:#x},force-raw=on']
+           '-semihosting', '-kernel', str(elf), '-device', f'loader,file={a.out / "hooks.bin"},addr={base:#x},force-raw=on']
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)

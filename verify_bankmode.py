@@ -43,8 +43,7 @@ FS_ROWS, FS_EVPTR = 0x43DF8EF0 - BASE, 0x43DF90D8 - BASE
 FS_CALLBACKS = 0xA028E8060 - 0xA02808000 + 0x4B13000
 FS_TEXTS = (b'SET', b'OFF', b'--', b'~%d', b'%d')
 FS_STOCK_CALLS = {0x40EC4544, 0x40C78518, 0x40C790DC, 0x40DB47F0, 0x40DB76B0, 0x40DB3F90, 0x4127D850, 0x403AF870,
-                  0x40399EF0, 0x405EF210, 0x403B26C0, 0x4039E810, 0x405F6A68, 0x403F621C,
-                  0x405EF5E4}
+                  0x40399EF0, 0x405EF210, 0x403B26C0, 0x4039E810, 0x405F6A68, 0x403F621C}
 SL_ARROWS = 0x405F6A64
 SL_LAYOUT_EDITS = {0x43DF951C: 4, 0x43DF9534: 8, 0x43DF9560: 4, 0x43DF9578: 8, 0x43DF9754: 8, 0x43DF9798: 8}
 
@@ -70,10 +69,6 @@ def windows(version, tag, n, stock):
         'focus shift cursor table address (high half)': (0x405EF4D8 - BASE, 4),
         'focus shift cursor table count': (0x405EF4EC - BASE, 4),
         'focus step width slider: arrow update entry': (SL_ARROWS - BASE, 4),
-        'focus shift Start row transition table': (0x43EA10A0 - BASE, 0x220),
-        'state 0xB5 callbacks pointer': (pm.STATE_TABLE + pm.STATE_SIZE * 0xB5 + 0x28, 8),
-        'state 0xB5 page record pointer': (pm.STATE_TABLE + pm.STATE_SIZE * 0xB5 + 0x50, 8),
-        'menu event switch: event 0xA case': (0x42B086D8 + 8 * 0xA - BASE, 8),
         **{f'focus step width slider layout {a:#x}': (a - BASE, n) for a, n in SL_LAYOUT_EDITS.items()},
         'Setup menu row 43': (SETUP_ROWS + 44 * 43, 44),
         'reused Setup row transition table (59 events)': (row_table, 59 * 32),
@@ -328,54 +323,6 @@ def verify(stock_raw, out_raw, version, tag):
     require(len(sn) == 1, 'displaced slider arrow entry differs')
     body = code_rows[addrs.index(sl_wrap):addrs.index(sl_wrap) + 8]
     require([int(o.split()[-1], 16) for a, m, o in body if m == 'bl'][:1] == [sn[0]], 'slider wrapper must call the stock routine first')
-    # focus shift Start sub-page: the Start row enters state 0xB5 and no longer calls the stock action
-    for j in range(17):
-        e, a, g, t = struct.unpack_from('<4Q', eg1, 0x43EA10A0 - BASE + 32 * j)
-        e0, a0, g0, t0 = struct.unpack_from('<4Q', eg0, 0x43EA10A0 - BASE + 32 * j)
-        if a0 == 0x405EF5E4:
-            require((e, a, g, t) == (e0, 0, g0, 0xB5), f'Start row transition {e0:#x}')
-        else:
-            require((e, a, g, t) == (e0, a0, g0, t0), f'Start row transition {e0:#x} changed')
-        if e0 == 0x3BB:
-            break
-    cb = struct.unpack_from('<Q', eg1, pm.STATE_TABLE + pm.STATE_SIZE * 0xB5 + 0x28)[0]
-    require(BASE + 0x8A1000 <= cb < BASE + 0x8A3000, 'state 0xB5 callbacks outside the new material')
-    entry = struct.unpack_from('<Q', eg1, cb - BASE)[0]
-    require(BASE + 0x8A0000 <= entry < limit and by_addr[entry][0] == 'stp', 'Start sub-page entry')
-    page = struct.unpack_from('<Q', eg1, pm.STATE_TABLE + pm.STATE_SIZE * 0xB5 + 0x50)[0]
-    require(BASE + 0x8A1000 <= page < BASE + 0x8A3000, 'state 0xB5 page outside the new material')
-    evp = struct.unpack_from('<Q', eg1, page - BASE + 0x18)[0]
-    require(struct.unpack_from('<H', eg1, page - BASE + 0x20)[0] == 3, 'Start sub-page row count')
-    for row in range(3):
-        tbl = struct.unpack_from('<Q', eg1, evp - BASE + 8 * row)[0]
-        oks = []
-        for j in range(14):
-            e, a, g, t = struct.unpack_from('<4Q', eg1, tbl - BASE + 32 * j)
-            e0, a0, g0, t0 = struct.unpack_from('<4Q', eg0, pm.NRAW_EVENTS + 32 * j)
-            if a0 == pm.NRAW_OK:
-                require(BASE + 0x8A0000 <= a < limit and by_addr[a][0] == 'ldr' and g == g0, f'Start sub-page row {row} OK action')
-                oks.append(t)
-            else:
-                require((e, a, g, t) == (e0, a0, g0, t0), f'Start sub-page row {row} transition {e0:#x} changed')
-        # Start now stays (the stock action closes the menu or shows the result), the others go back
-        require(oks == [0x68C if row == 0 else 0x68D] * 3, f'Start sub-page row {row} OK target')
-    require(eg0[0x8A2F00:0x8A2F10] == bytes(16) == eg1[0x8A2F00:0x8A2F10], 'arm byte must stay zero in the image')
-    # armed start on the next menu opening: the menu app's event-0xA case -> a hook in the new material that only reads
-    # / clears the arm byte, asks for the focus shift page and calls the stock Start action, then goes on to the stock case
-    require(struct.unpack_from('<Q', eg0, 0x42B086D8 + 8 * 0xA - BASE)[0] == 0x40508260, 'stock menu event 0xA case differs')
-    hook = struct.unpack_from('<Q', eg1, 0x42B086D8 + 8 * 0xA - BASE)[0]
-    require(BASE + 0x8A1000 <= hook < BASE + 0x8A2F00, 'menu hook outside the new material')
-    hrows = disasm(eg1[hook - BASE:hook - BASE + 0x80], hook)
-    end = next((i for i, (a, m, o) in enumerate(hrows) if m == 'b' and int(o.split()[-1], 16) == 0x40508260), None)
-    require(end is not None and end < 30, 'menu hook must end in the stock event 0xA case')
-    body = hrows[:end + 1]
-    hcalls = {int(o.split()[-1], 16) for a, m, o in body if m == 'bl'}
-    require(hcalls == {0x403DBDB4, 0x403AF53C, 0x405EF5E4}, f'menu hook calls {sorted(map(hex, hcalls))}')
-    require(not any(m in ('br', 'blr', 'ret', 'str', 'stp', 'strh', 'svc', 'msr') for a, m, o in body), 'menu hook: unexpected instruction')
-    require([o for a, m, o in body if m == 'strb'] == ['wzr, [x9]'] and
-            [o for a, m, o in body[:4] if m in ('mov', 'movk')] == ['x9, #0x2f00', 'x9, #0x1000, lsl #16', 'x9, #0xa, lsl #32', 'x9, #0x0, lsl #48'],
-            'menu hook must only clear the arm byte 0xA10002F00')
-    require(sum(1 for a, m, o in body if m == 'cmp' and o.endswith('#0xb1')) == 2, 'menu hook must check for the focus shift page')
     # link banks: the two dispatcher calls
 
     def bl_target(site):

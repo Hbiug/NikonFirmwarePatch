@@ -165,31 +165,9 @@ SL_RECTS_NEW = {SL_ONE_RECT: (0xDF00AE, 0xF70222), SL_TEN_RECT: (0xDF0222, 0xDF0
                 SL_NARROW_RECT: (0xB5005C, 0xDD0274), SL_WIDE_RECT: (0xB50274, 0xB50274)}                     # global text slots (stock page: 5 shots, 6 step width, 7 interval)
 FS_CALLBACKS = 0xA028E8060 - 0xA02808000 + 0x4B13000   # five pointers of state 0xB1 (data image)
 F_FS_REFRESH, F_FS_TOGGLE = 0x405EF210, 0x4051226C
-# ---- focus shift: Start sub-page and start on the next MENU press (c1) ------------------------------------------------
-# The focus shift page's Start row (stock action 0x405EF5E4) opens a sub-page in state 0xB5 (the stock 2-row page behind
-# the old hidden row 5, unreachable since b8): "Start now" (the stock action), "Start on MENU" (arm) and "Cancel"
-# (disarm).  While armed, the next opening of the menu (MENU button, stock path) goes straight to the focus shift page
-# and runs the stock Start action there, in the GUI task, exactly as pressing OK on Start does; the arm is then cleared.
-# The hook is the menu app's event-0xA case (0x40508260, reached through the switch table of 0x40508038), which runs
-# when the menu opens.  c0 started the series from the Bracketing burst handler instead and froze the camera (the GUI
-# never got the series it expected).  The arm byte lives in the zero gap of the text section, written through the
-# section's RAM alias (the toolkit's stash technique): the loader copies the zero gap at every boot, so it starts
-# cleared at each power-on.
-TEXT_ALIAS = 0xA0F800000 - 0x40200000                 # text VA + TEXT_ALIAS = writable RAM alias
-FS_ARM_AT = 0x8A2F00                                   # payload offset of the arm byte (zero in the image)
-FS_ARM_RW = BASE + FS_ARM_AT + TEXT_ALIAS              # bit 0 armed
-STATE_FS_START = 0xB5
-STATE_FS_START_STOCK = (0xA028E8100, 0xA028CF540)      # its stock callbacks and page record pointers
-FS_START_ROW_TABLE = 0x43EA10A0 - BASE                 # transition table of the Start row (row 0 of state 0xB1)
-F_FS_START = 0x405EF5E4                                # stock Start action
-MENU_EVENTS, MENU_EV_TICK, MENU_EV_TICK_STOCK = 0x42B086D8, 0xA, 0x40508260  # menu app's event switch, event 0xA case
-MENU_TOP, MENU_GOTO, STATE_FS_PAGE = 0x403DBDB4, 0x403AF53C, 0xB1   # top of the menu stack, transition, focus shift page
-FS_ITEM_START0 = pm.ITEM_OPTION0 + 5                   # 0x35BA..0x35BC: Start now / Start on MENU / Cancel
-FS_START_TITLE = 0x3F7                                 # stock "Start"
 FS_TEXT = (b'SET', b'OFF', b'--', b'~%d', b'%d')      # after STATE_TEXT, same 16-byte slots
-FS_ENGLISH = ('Focus end point', 'Clear focus end point', 'Narrow' + ' ' * 4 + 'Est. shots' + ' ' * 6 + 'Wide ', '',
-              'Start now', 'Start on MENU', 'Cancel')
-FS_STRING_FIRST, FS_STRING_COUNT = 3143, 7
+FS_ENGLISH = ('Focus end point', 'Clear focus end point', 'Narrow' + ' ' * 4 + 'Est. shots' + ' ' * 6 + 'Wide ', '')
+FS_STRING_FIRST, FS_STRING_COUNT = 3143, 4
 
 # ---- new material (same text-gap regions as the ProRes row; this patch does not combine with it) ------------
 # ---- the row lives in the Setup menu (state 0x297), in the slot of its last row "Special shooting" (item 0x3968), which
@@ -604,54 +582,6 @@ def _focus(b):
     b.ldp_post(19, 30, 0x10)
     b.b(F_REDRAW)
 
-
-    # ---- focus shift Start sub-page and the armed start --------------------------------------------------------
-    # fs_sub_entry(state): cursor on "Cancel" while armed, else on "Start now"
-    b.label('fs_sub_entry')
-    b.stp_pre(19, 30, -0x20)
-    b.str_x(20, 31, 0x10)
-    b.mov_x(19, 0)
-    b.mov_x64(9, FS_ARM_RW)
-    b.ldrb_w(8, 9)
-    b.mov_w(20, FS_ITEM_START0)
-    b.tbz_w(8, 0, 'fse_cur')
-    b.mov_w(20, FS_ITEM_START0 + 2)
-    b.label('fse_cur')
-    b.bl(pm.F_ENTRY_GUARD)
-    b.cmp_wi(0, 1)
-    b.b_cond('eq', 'fse_done')
-    b.mov_x(0, 19)
-    b.mov_wr(1, 20)
-    b.bl(pm.F_SET_CURSOR)
-    b.label('fse_done')
-    b.ldr_x(20, 31, 0x10)
-    b.ldp_post(19, 30, 0x20)
-    b.ret()
-    # fs_sub_ok(context): the chosen row (as the bank sub-page's ok): 0 start now, 1 arm, 2 cancel
-    b.label('fs_sub_ok')
-    b.ldr_x(9, 0)
-    b.mov_w(8, 0x2C)
-    b.ldr_x(10, 9, 0x50)
-    b.ldrh_w(11, 9, 0x58)
-    b.ldrh_w(9, 9, 0x32)
-    b.ldr_x(10, 10, 0x10)
-    b.add_x(9, 9, 11)
-    b.madd_x(8, 9, 8, 10)
-    b.ldr_w(8, 8, 0x18)
-    b.mov_w(9, FS_ITEM_START0)
-    b.sub_w(8, 8, 9)
-    b.mov_x64(9, FS_ARM_RW)
-    b.cmp_wi(8, 1)
-    b.b_cond('eq', 'fso_arm')
-    b.strb_w(31, 9)                            # start now or cancel: not armed
-    b.cbnz_w(8, 'fso_ret')                     # cancel
-    b.b(F_FS_START)                            # start now: the stock action (it does not use its argument)
-    b.label('fso_ret')
-    b.ret()
-    b.label('fso_arm')                         # arm only; the transition goes back to the focus shift page
-    b.mov_w(10, 1)                             # (posting the stock "close menu" event 0x1000C here greyed the
-    b.strb_w(10, 9)                            # menu and left it unresponsive in the emulator: it expects a series)
-    b.ret()
     # ---- focus step width slider ------------------------------------------------------------------------------------
     t_dec = len(STATE_TEXT) + 4                    # "%d"
     b.label('sl_native')
@@ -1218,7 +1148,7 @@ def strings(context):
     ids = context.add('bank-store', [list(ENGLISH) for _ in range(36)])
     fs = context.add('focus-end', [list(FS_ENGLISH) for _ in range(36)])
     return dict(label_id=ids[0], option_ids=ids[1:1 + N_OPTIONS], fs_set_id=fs[0], fs_clear_id=fs[1],
-                sl_top_id=fs[2], sl_empty_id=fs[3], fs_start_ids=fs[4:7])
+                sl_top_id=fs[2], sl_empty_id=fs[3])
 
 
 def menu(img, ids, blk):
@@ -1381,84 +1311,6 @@ def focus_menu(img, ids, blk, at):
     return dict(tables=pointers, cursor_table=hex(nav_va), gui_end=hex(at))
 
 
-def start_menu(img, ids, blk, at):
-    """Focus shift Start row -> sub-page in state 0xB5 with Start now / Start on MENU / Cancel (N-RAW sub-page
-    template, as menu() does for the bank page)."""
-    layout = bytearray(img.old[pm.NRAW_LAYOUT:pm.NRAW_LAYOUT + 0x110])
-    if struct.unpack_from('<I', layout, 0x44)[0] != 0x8A6:
-        raise ValueError('stock layout: title id not where expected')
-    struct.pack_into('<I', layout, 0x44, FS_START_TITLE)
-    stock_row = struct.unpack_from('<11I', img.old, pm.NRAW_ROWS)
-    rows = b''.join(struct.pack('<11I', ids['fs_start_ids'][i], *stock_row[1:6], FS_ITEM_START0 + i, *stock_row[7:])
-                    for i in range(3))
-    ok = blk.labels['fs_sub_ok']
-    # Start now stays in the state, as the stock Start transition does (target 0x68C): the stock action ends in a
-    # menu close or the series' result screen.  Start on MENU and Cancel go back to the focus shift page (the
-    # stock option-page OK, target 0x68D).
-    tables = [pm.events(img, pm.NRAW_EVENTS, 14,
-                        lambda e, a, g, t, i=i: (e, ok, g, 0x68C if i == 0 else t) if a == pm.NRAW_OK else (e, a, g, t))
-              for i in range(3)]
-    table = tables[0]
-    if tables[1] != tables[2] or tables[2].count(struct.pack('<QQQ', ok, 0, 0x68D)) != 3 or \
-            tables[0].count(struct.pack('<QQQ', ok, 0, 0x68C)) != 3:
-        raise ValueError('expected three OK transitions in the stock option table')
-    at = (at + 15) & ~15
-    layout_at = at; at += len(layout)
-    rows_at = at; at += len(rows)
-    at = (at + 7) & ~7
-    tables_at = at; at += 3 * len(table)
-    evptr_at = at; at += 3 * 8
-    callbacks_at = at; at += 5 * 8
-    page_at = at; at += 0x50
-    if at > FS_ARM_AT:
-        raise ValueError('GUI area too small for the Start sub-page')
-    page = bytearray(img.old[pm.NRAW_PAGE:pm.NRAW_PAGE + 0x50])
-    struct.pack_into('<3Q', page, 8, va(layout_at), va(rows_at), va(evptr_at))
-    struct.pack_into('<H', page, 0x20, 3)
-    img.put(layout_at, layout, 'focus shift Start sub-page layout (N-RAW layout, title "Start")', expect_zero=True)
-    img.put(rows_at, rows, 'focus shift Start sub-page rows', expect_zero=True)
-    img.put(tables_at, b''.join(tables), 'focus shift Start sub-page transition tables', expect_zero=True)
-    img.put(evptr_at, struct.pack('<3Q', *(va(tables_at + len(table) * i) for i in range(3))),
-            'focus shift Start sub-page transition table pointers', expect_zero=True)
-    img.put(callbacks_at, struct.pack('<5Q', blk.labels['fs_sub_entry'], *pm.NRAW_CALLBACKS[1:]),
-            'focus shift Start sub-page callbacks', expect_zero=True)
-    img.put(page_at, page, 'focus shift Start sub-page page record', expect_zero=True)
-    img.put(FS_ARM_AT, bytes(16), 'focus shift arm byte (RAM state through the text alias, zero at every boot)',
-            expect_zero=True)
-    record = pm.STATE_TABLE + pm.STATE_SIZE * STATE_FS_START
-    st = struct.unpack_from('<HHI11Q', img.old, record)
-    nraw_state = struct.unpack_from('<HHI11Q', img.old, pm.STATE_TABLE + pm.STATE_SIZE * pm.STATE_NRAW)
-    if st[:2] != (2, STATE_FS_START) or st[3] != nraw_state[3] or (st[7], st[12]) != STATE_FS_START_STOCK or \
-            any(st[4:7] + st[8:12] + st[13:]):
-        raise ValueError('stock state 0xB5 record differs')
-    img.put(record + 0x28, struct.pack('<Q', va(callbacks_at)), 'state 0xB5: callbacks -> focus shift Start sub-page',
-            expect=struct.pack('<Q', STATE_FS_START_STOCK[0]))
-    img.put(record + 0x50, struct.pack('<Q', va(page_at)), 'state 0xB5: page record -> focus shift Start sub-page',
-            expect=struct.pack('<Q', STATE_FS_START_STOCK[1]))
-    # the Start row enters the sub-page instead of running the stock action
-    if img.u64(FS_EVPTR) - BASE != FS_START_ROW_TABLE or \
-            sum(1 for k in range(FS_COUNT) if img.u64(FS_EVPTR + 8 * k) - BASE == FS_START_ROW_TABLE) != 1:
-        raise ValueError('Start row transition table differs or is shared')
-    hits = []
-
-    def retarget(e, a, g, t):
-        if a == F_FS_START:
-            hits.append(e)
-            if t != 0x68C:
-                raise ValueError('Start row transition target differs')
-            return e, 0, g, STATE_FS_START
-        return e, a, g, t
-    count = 0
-    while img.u64(FS_START_ROW_TABLE + 32 * count) != 0x3BB:
-        count += 1
-    new = pm.events(img, FS_START_ROW_TABLE, count + 1, retarget)
-    if hits != [0x286, 0x28B, 0x2AE]:
-        raise ValueError(f'unexpected Start row transitions: {hits}')
-    img.put(FS_START_ROW_TABLE, new, 'focus shift Start row: open the Start sub-page (state 0xB5)')
-    return dict(page=hex(va(page_at)), callbacks=hex(va(callbacks_at)), tables=hex(va(tables_at)),
-                arm_byte=hex(FS_ARM_RW), gui_end=hex(at))
-
-
 def slider_layout(img, ids):
     """Focus step width slider page: the "1" label spans the scale, the "10" box is shrunk away, "Narrow" becomes the
     combined top line and "Wide" is emptied and shrunk (static layout data of state 0xB3)."""
@@ -1480,38 +1332,6 @@ def slider_layout(img, ids):
     img.put(SL_WIDE_STR, struct.pack('<I', ids['sl_empty_id']), 'focus step width slider: "Wide" label emptied',
             expect=struct.pack('<I', 0x7AD))
     return dict(top_string=ids['sl_top_id'], empty_string=ids['sl_empty_id'])
-
-
-def start_code(cs, at):
-    """Second code block (in the new-material area, same read-only executable text mapping as the code page): the menu
-    hook of the armed start.  It runs in the GUI task, where the stock Start action runs when OK is pressed on Start."""
-    b = Block(va(at))
-    # mn_tick: the menu app's event-0xA case (0x40508260, entered by the switch in 0x40508038 with its frame set up;
-    # it runs when the menu opens).  If armed: disarm, go to the focus shift page (the transition the Photo shooting
-    # menu row performs) and run the stock Start action there, then continue with the stock case.
-    b.label('mn_tick')
-    b.mov_x64(9, FS_ARM_RW)
-    b.ldrb_w(10, 9)
-    b.tbz_w(10, 0, 'mn_stock')
-    b.strb_w(31, 9)                            # one use
-    b.bl(MENU_TOP)
-    b.cbz_x(0, 'mn_stock')
-    b.ldrh_w(8, 0, 2)
-    b.cmp_wi(8, STATE_FS_PAGE)
-    b.b_cond('eq', 'mn_start')
-    b.mov_w(0, STATE_FS_PAGE)
-    b.bl(MENU_GOTO)
-    b.bl(MENU_TOP)
-    b.cbz_x(0, 'mn_stock')
-    b.ldrh_w(8, 0, 2)
-    b.cmp_wi(8, STATE_FS_PAGE)
-    b.b_cond('ne', 'mn_stock')
-    b.label('mn_start')
-    b.bl(F_FS_START)                           # stock Start: waits for the series, then closes the menu / result
-    b.label('mn_stock')
-    b.b(MENU_EV_TICK_STOCK)
-    listing = b.listing(cs)
-    return b, b.bytes(), listing
 
 
 def build_main(eg, strings_context):
@@ -1568,20 +1388,6 @@ def build_main(eg, strings_context):
             all(struct.unpack_from('<I', eg, a + 8 - BASE)[0] == 0x97F70B75 - (a - 0x405EF0F4) // 4 for a in FS_HIDE_SITES),
             'stock focus shift page entry callback differs')
     fs_where = focus_menu(img, ids, blk, where.pop('gui_end'))
-    start_where = start_menu(img, ids, blk, int(fs_where['gui_end'], 16))
-    # ---- start on the next MENU press (c1): menu hook ---------------------------------------------------------------
-    at2 = (int(start_where['gui_end'], 16) + 15) & ~15
-    blk2, code2, listing2 = start_code(cs, at2)
-    require(at2 + len(code2) <= FS_ARM_AT, 'no room for the menu hook')
-    img.put(at2, code2, 'code: armed start on the next menu opening (menu event-0xA hook)', expect_zero=True)
-    entry = MENU_EVENTS + 8 * MENU_EV_TICK - BASE
-    require(struct.unpack_from('<Q', eg, entry)[0] == MENU_EV_TICK_STOCK and
-            struct.unpack_from('<2I', eg, 0x40508260 - BASE) == (0x528004A0, 0xF90007FF) and
-            struct.unpack_from('<I', eg, 0x4050804C - BASE)[0] == 0x7100581F, 'stock menu event switch differs')
-    img.put(entry, struct.pack('<Q', blk2.labels['mn_tick']), 'menu event 0xA case -> button-start hook',
-            expect=struct.pack('<Q', MENU_EV_TICK_STOCK))
-    start_where.update(code=hex(at2), mn_tick=hex(blk2.labels['mn_tick']),
-                       code_end=hex(at2 + len(code2)), listing=[dict(va=hex(x), word=w, text=t) for x, w, t in listing2])
     require(struct.unpack_from('<I', eg, FS_FRAME_SITE - BASE)[0] == FS_FRAME_STOCK and
             struct.unpack_from('<6I', eg, 0x40FCEA1C - BASE)[:1] == (0xD2900E08,), 'stock focus shift frame code differs')
     require(struct.unpack_from('<I', eg, FS_START_SITE - BASE)[0] == FS_START_STOCK and
@@ -1609,7 +1415,7 @@ def build_main(eg, strings_context):
     delta = blk.labels['sl_wrap'] - SL_ARROWS
     img.put(SL_ARROWS - BASE, struct.pack('<I', 0x14000000 | ((delta // 4) & 0x3FFFFFF)),
             'focus step width slider: arrow update entry -> wrapper (estimate line)', expect=struct.pack('<I', SL_ARROWS_STOCK))
-    return img, dict(strings=ids, menu=where, start=start_where, slider=dict(sl_where, wrapper=hex(blk.labels['sl_wrap']),
+    return img, dict(strings=ids, menu=where, slider=dict(sl_where, wrapper=hex(blk.labels['sl_wrap']),
                                                           text=hex(blk.labels['sl_text'])),
                      focus_end=dict(fs_where, end_bytes=[hex(FS_END0 + REL_SLOT_STEP * k) for k in range(4)],
                                                      frame_site=hex(FS_FRAME_SITE), start_site=hex(FS_START_SITE),

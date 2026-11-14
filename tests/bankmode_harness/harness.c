@@ -104,32 +104,6 @@ __asm__(".section .s_bkt,\"ax\"\n"
         "    ldr x30, [sp, #0x28]\n"
         "    ldr x22, [sp], #0x30\n"
         "    ret\n");
-/* ---- focus shift Start sub-page and the button start through the menu: stock routines they call -------------- */
-enum { K_APPPOST = 20, K_FSSTART, K_GUARD, K_CURSOR, K_GOTO, K_MNCONT, K_APP };
-#define ARM (*(volatile u8 *)FS_ARM_RW)
-static int guard_result;
-static struct { unsigned short type, state; } menu_top;
-static int menu_top_null, goto_works;
-__attribute__((noinline, used)) u64 c_app(void) { logrec(K_APP, 0, 0, 0, 0); return 0xA9900000UL; }
-__attribute__((noinline, used)) void c_apppost(u64 obj, u32 ev) { logrec(K_APPPOST, obj, ev, 0, 0); }
-__attribute__((noinline, used)) void c_fsstart(u64 x0) { logrec(K_FSSTART, x0, menu_top.state, 0, 0); }
-__attribute__((noinline, used)) int c_guard(u64 st) { logrec(K_GUARD, st, 0, 0, 0); return guard_result; }
-__attribute__((noinline, used)) void c_cursor(u64 st, u32 item) { logrec(K_CURSOR, st, item, 0, 0); }
-__attribute__((noinline, used)) void *c_mtop(void) { return menu_top_null ? 0 : (void *)&menu_top; }
-__attribute__((noinline, used)) void c_goto(u32 target) { logrec(K_GOTO, target, 0, 0, 0); if (goto_works) menu_top.state = (unsigned short)target; }
-__attribute__((noinline, used)) void c_mncont(void) { logrec(K_MNCONT, 0, 0, 0, 0); }
-
-__asm__(".section .s_app,\"ax\"\n    b c_app\n"
-        ".section .s_apppost,\"ax\"\n    b c_apppost\n"
-        ".section .s_fsstart,\"ax\"\n    b c_fsstart\n"
-        ".section .s_guard,\"ax\"\n    b c_guard\n"
-        ".section .s_cursor,\"ax\"\n    b c_cursor\n"
-        ".section .s_mtop,\"ax\"\n    b c_mtop\n"
-        ".section .s_goto,\"ax\"\n    b c_goto\n"
-        /* the event-0xA case runs inside 0x40508038's frame and leaves through its epilogue: mn_call builds that frame */
-        ".section .s_mncont,\"ax\"\n    bl c_mncont\n    ldp x29, x30, [sp], #16\n    ret\n"
-        ".text\n.global mn_call\nmn_call:\n    stp x29, x30, [sp, #-16]!\n    b hook_mn_tick\n"
-        ".text\n");
 /* the stock change-notice routine (body after its first instruction): which bank type is announced */
 __attribute__((noinline, used)) void c_post(struct txn *t) { logrec(K_POST, MARK(t), MARKTYPE(t), t->count, 0); }
 __asm__(".section .s_post,\"ax\"\n"
@@ -156,7 +130,7 @@ __asm__(".section .s_copyentry,\"ax\"\n"
 
 typedef u32 (*hookfn)(u32, u32, struct txn *);
 extern char hook_gate[], hook_save[], hook_has_prev[], hook_hook_menu[], hook_hook_custom[], hook_link_sync[];
-extern char hook_texts[], hook_fs_sub_entry[], hook_fs_sub_ok[], hook_mn_tick[], mn_call[];
+extern char hook_texts[];
 extern long call_canary(void *fn, u64 a0, u64 a1, u64 a2, u64 a3, u64 *regs);
 
 /* calls fn with canary values in x19..x29 and checks that they (and sp) come back unchanged */
@@ -755,68 +729,6 @@ save_done:
     reset(0, 0, 0); BKT(1); ds_bktshots = 7; relog(); BKT(0);
     check(ds_bktshots == 0 && BKTFLAG == 0, "bracketing burst: release switches off even if the frame count was changed while held");
 
-    /* ---------------- the arm does not touch the Bracketing burst button (c0's start from it froze the camera) ---------------- */
-    reset(0, 0, 0); ARM = 1; ds_bktdir = 1;
-    r = BKT(1);
-    check(r == 0x55 && nlog == 3 && L[2].kind == K_BKT && BKTFLAG == 0x81 && ARM == 1, "armed: the Bracketing burst press is ordinary (b7 behaviour), arm kept");
-    relog(); r = BKT(0);
-    check(L[0].kind == K_BKT && ds_bktshots == 0 && BKTFLAG == 0 && ARM == 1, "armed: its release is ordinary too");
-    ARM = 0;
-
-    /* ---------------- menu event 0xA (the menu opens): armed -> focus shift page and the stock Start ---------------- */
-#define MN() ((void)call(mn_call, 0, 0, 0, 0))
-    reset(0, 0, 0); ARM = 0; menu_top_null = 0; menu_top.type = 2; menu_top.state = 0x20; goto_works = 1;
-    MN();
-    check(nlog == 1 && L[0].kind == K_MNCONT && menu_top.state == 0x20, "menu opens, not armed: only the stock case");
-    reset(0, 0, 0); ARM = 1; menu_top.state = 0xB1;
-    MN();
-    check(nlog == 2 && L[0].kind == K_FSSTART && L[1].kind == K_MNCONT && ARM == 0, "menu opens on the focus shift page, armed: disarm, stock Start, then the stock case");
-    reset(0, 0, 0); ARM = 1; menu_top.state = 0x20; goto_works = 1;
-    MN();
-    check(nlog == 3 && L[0].kind == K_GOTO && L[0].a == 0xB1 && L[1].kind == K_FSSTART && L[1].b == 0xB1 && L[2].kind == K_MNCONT && ARM == 0,
-          "menu opens elsewhere, armed: transition to the focus shift page, stock Start there, then the stock case");
-    reset(0, 0, 0); ARM = 1; menu_top.state = 0x20; goto_works = 0;
-    MN();
-    check(nlog == 2 && L[0].kind == K_GOTO && L[1].kind == K_MNCONT && ARM == 0, "armed, transition refused: no Start, disarmed");
-    reset(0, 0, 0); ARM = 1; menu_top_null = 1;
-    MN();
-    check(nlog == 1 && L[0].kind == K_MNCONT && ARM == 0, "armed, no menu stack: no Start, disarmed");
-    reset(0, 0, 0); ARM = 1; menu_top_null = 0; menu_top.state = 0xB1;
-    MN(); relog(); MN();
-    check(nlog == 1 && L[0].kind == K_MNCONT, "one use: the next opening of the menu is ordinary");
-    menu_top_null = 0; ARM = 0;
-
-    /* ---------------- focus shift Start sub-page ---------------- */
-    {
-        static u8 rows[3 * 0x2C];
-        static u64 page[4];
-        static u8 obj[0x60];
-        static u64 ctx[1];
-        for (u32 i = 0; i < 3; i++) *(volatile u32 *)(rows + i * 0x2C + 0x18) = FS_ITEM_START0 + i;
-        page[2] = (u64)rows;
-        *(volatile u64 *)(obj + 0x50) = (u64)page;
-        ctx[0] = (u64)obj;
-#define PICK(top, cur) (*(volatile unsigned short *)(obj + 0x58) = (top), *(volatile unsigned short *)(obj + 0x32) = (cur))
-        reset(0, 0, 0); ARM = 1; PICK(0, 0);
-        r = (u32)call(hook_fs_sub_ok, (u64)ctx, 0, 0, 0);
-        check(ARM == 0 && nlog == 1 && L[0].kind == K_FSSTART, "Start now: disarms and runs the stock Start action");
-        reset(0, 0, 0); ARM = 0; PICK(1, 0);
-        r = (u32)call(hook_fs_sub_ok, (u64)ctx, 0, 0, 0);
-        check(ARM == 1 && nlog == 0, "Start on button: arms, nothing else (the transition goes back to the page)");
-        reset(0, 0, 0); ARM = 1; PICK(0, 2);
-        r = (u32)call(hook_fs_sub_ok, (u64)ctx, 0, 0, 0);
-        check(ARM == 0 && nlog == 0, "Cancel: disarms, nothing else");
-        reset(0, 0, 0); ARM = 0; guard_result = 0;
-        call(hook_fs_sub_entry, 0x1234, 0, 0, 0);
-        check(nlog == 2 && L[0].kind == K_GUARD && L[1].kind == K_CURSOR && L[1].a == 0x1234 && L[1].b == FS_ITEM_START0, "sub-page entry, not armed: cursor on Start now");
-        reset(0, 0, 0); ARM = 1;
-        call(hook_fs_sub_entry, 0x1234, 0, 0, 0);
-        check(nlog == 2 && L[1].kind == K_CURSOR && L[1].b == FS_ITEM_START0 + 2 && ARM == 1, "sub-page entry, armed: cursor on Cancel, arm kept");
-        reset(0, 0, 0); guard_result = 1;
-        call(hook_fs_sub_entry, 0x1234, 0, 0, 0);
-        check(nlog == 1 && L[0].kind == K_GUARD, "sub-page entry: the stock guard's early exit is honoured");
-        guard_result = 0; ARM = 0;
-    }
     /* ---------------- has_prev ---------------- */
     fresh(); T.ids[0] = 5; T.ids[1] = 6; T.ids[2] = 7; T.count = 3;
     check(call(hook_has_prev, 5, (u64)&T, 0, 0) == 1 && call(hook_has_prev, 6, (u64)&T, 0, 0) == 1, "has_prev: finds earlier entries");
