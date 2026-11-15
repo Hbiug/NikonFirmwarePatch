@@ -22,8 +22,9 @@ Framing grid
 
 ## Status
 
+- Firmware built from this branch has been **flashed successfully onto a Nikon Z8**.
 - The menu-bank changes were used on a camera during development (a link defect found there was fixed).
-- The focus shift additions and the Custom frame grid are checked offline (independent verifier, instruction-level harness, menus in a QEMU emulator) but are **not camera-tested**. The emulator never draws the framing grid, so the Custom frame rectangle itself has only been checked by the harness.
+- The focus shift additions and the Custom frame grid are checked offline (independent verifier, instruction-level harness, menus in a QEMU emulator); their behaviour on the camera is not yet confirmed feature by feature. The emulator never draws the framing grid, so the Custom frame rectangle itself has only been checked by the harness.
 - A test raising Multiple exposure above 10 shots froze the camera ("busy") and was reverted; it is not in the current build.
 
 ## Build and verify

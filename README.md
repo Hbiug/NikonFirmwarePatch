@@ -2,6 +2,45 @@
 
 [简体中文](#简体中文) · [English](#english) · [Changelog](CHANGELOG.md)
 
+## This fork: menu banks, focus shift and Custom frame (`bankmode.py`)
+
+This fork of [XinmiaoZhao/NikonFirmwarePatch](https://github.com/XinmiaoZhao/NikonFirmwarePatch) adds a separate patch for the official **Nikon Z8 C 3.11** firmware, built with `bankmode.py` (branch `z8-menu-bank-behavior`). It is standalone: it does not combine with the toolkit's ProRes, pre-capture, pixel-shift or open-gate/N-RAW features below.
+
+**Status: firmware built from this branch has been flashed successfully onto a Nikon Z8.** Feature-by-feature camera status is listed in [docs/menu-bank.md](docs/menu-bank.md#status). It is still experimental firmware: flash at your own risk (see [LICENSE](LICENSE) and [NOTICE](NOTICE.md)).
+
+### What it adds
+
+| Area | Change |
+|---|---|
+| Menu banks | **Menu bank behavior** row at the end of the Setup menu: auto-store changes (stock) or keep stored settings (Z7 style), optionally **linking** the photo shooting menu bank and the Custom Settings bank, and a *Save current settings to bank* command. Release mode is stored per bank. |
+| Bracketing | The **Bracketing burst** button switches bracketing on while it is held. |
+| Focus shift | **Focus end point**: store the current focus position as the end of the series; the camera estimates the number of shots to reach it (on the page and on the focus step width slider). The page shows the end point and the **current focus** distance. The end point is forgotten at standby. |
+| i menu | Selecting **Focus shift shooting** in the i menu starts the series from live view. |
+| Framing grid | **Custom frame** in Custom Settings › Grid type (photo): crop factor 1.00x–1.50x (0.05 steps) and aspect ratio X:Y (1–99 each, default 1.00x 3:2 = full frame). Live view draws the largest X:Y rectangle centred in the crop area. |
+
+### Menus
+
+Emulator screenshots of the patched firmware (English UI).
+
+| Menu bank behavior (Setup menu) | Focus shift shooting page |
+|---|---|
+| <img src="docs/images/bankmode-menu-bank-behavior.png" width="420" alt="Menu bank behavior page" /> | <img src="docs/images/bankmode-focus-shift.png" width="420" alt="Focus shift page with end point and current focus rows" /> |
+| **Focus end point** | **Grid type with Custom frame** |
+| <img src="docs/images/bankmode-focus-end-point.png" width="420" alt="Focus end point sub-page" /> | <img src="docs/images/bankmode-grid-custom-frame.png" width="420" alt="Grid type picker with the Custom frame entry" /> |
+| **Custom frame parameters** | |
+| <img src="docs/images/bankmode-custom-frame-edit.png" width="420" alt="Custom frame page, crop factor being edited" /> | |
+
+### Build and verify
+
+```sh
+python bankmode.py "/path/to/Z_8_0311.bin" --version 04.20 --tag d0 --output build/bank
+python verify_bankmode.py "/path/to/Z_8_0311.bin" build/bank/Z_8_0420.bin --version 04.20 --tag d0
+```
+
+Expected output with these arguments: `Z_8_0420.bin`, SHA-256 `b8323e3f71ec6c865a9bb64b4440567b9c6a968f00582ae590f4cdf802b20f7a`. Requirements, the test harness and details: [docs/menu-bank.md](docs/menu-bank.md). The repository contains source only: no Nikon firmware, patched firmware or extracted firmware data. Obtain the official input from [Nikon](https://downloadcenter.nikonimglib.com/en/download/fw/606.html).
+
+---
+
 ## 功能预览 / Feature preview
 
 英文模拟器界面，用于展示功能菜单。Emulator UI in English, illustrating the feature menus.
@@ -71,8 +110,6 @@ Windows 使用 `py -3 -m venv .venv` 创建环境，用 `.\.venv\Scripts\Activat
 开发者回归命令：`python tests/validate_combinations.py --stock /path/to/Z_8_0311.bin --report build/combinations.json`，需要已核对的源码编译器。源码采用 GPL-3.0-only；不改变 Nikon 固件的许可。本项目与 Nikon 无隶属关系。
 
 ## English
-
-> **This fork** adds a standalone Z8 C 3.11 patch for menu banks, focus shift shooting and a Custom frame grid: see [docs/menu-bank.md](docs/menu-bank.md). It is not part of the upstream toolkit releases.
 
 **Current version: v0.3.0.** This toolkit builds selected features from official **Nikon Z8 C 3.11**. The previous public release is [v0.2.0](https://github.com/XinmiaoZhao/NikonFirmwarePatch/releases/tag/v0.2.0); see the [changelog](CHANGELOG.md).
 
