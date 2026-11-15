@@ -15,12 +15,18 @@ SECTIONS {
   .s_guard       0x403AE0F8 : { *(.s_guard) }
   .s_rowindex    0x403AF870 : { *(.s_rowindex) }
   .s_cursor      0x403B0048 : { *(.s_cursor) }
+  .s_mark        0x403B00B8 : { *(.s_mark) }
+  .s_moves       0x403B1B74 : { *(.s_moves) }
   .s_redraw      0x403B26C0 : { *(.s_redraw) }
   .s_menutop     0x403DBDB4 : { *(.s_menutop) }
+  .s_guids       0x403EC398 : { *(.s_guids) }
   .s_settext     0x403F2920 : { *(.s_settext) }
   .s_visible     0x403F621C : { *(.s_visible) }
   .s_setcontent  0x403F645C : { *(.s_setcontent) }
   .s_imresume    0x4044F2DC : { *(.s_imresume) }
+  .s_gridnext    0x4046B0D0 : { *(.s_gridnext) }
+  .s_gridrect    0x4046B39C : { *(.s_gridrect) }
+  .s_pickentry   0x405225F8 : { *(.s_pickentry) }
   .s_fsopen      0x405EF0B4 : { *(.s_fsopen) }
   .s_menutick    0x40508260 : { *(.s_menutick) }
   .s_fsrefresh   0x405EF210 : { *(.s_fsrefresh) }

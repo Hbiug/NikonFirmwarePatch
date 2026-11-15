@@ -1420,7 +1420,8 @@ def strings(context):
     """English text in every language: the stock string pool has no equivalent wording."""
     ids = context.add('bank-store', [list(ENGLISH) for _ in range(36)])
     fs = context.add('focus-end', [list(FS_ENGLISH) for _ in range(36)])
-    return dict(label_id=ids[0], option_ids=ids[1:1 + N_OPTIONS], fs_set_id=fs[0], fs_clear_id=fs[1],
+    cf = context.add('grid-frame', [list(CF_ENGLISH) for _ in range(36)])
+    return dict(cf_title_id=cf[0], cf_row_ids=tuple(cf[1:4]), label_id=ids[0], option_ids=ids[1:1 + N_OPTIONS], fs_set_id=fs[0], fs_clear_id=fs[1],
                 sl_top_id=fs[2], sl_empty_id=fs[3], fs_end_ids=(fs[4], fs[1]), fs_current_id=fs[5])
 
 
@@ -1819,7 +1820,9 @@ def build_main(eg, strings_context):
     delta = blk.labels['sl_wrap'] - SL_ARROWS
     img.put(SL_ARROWS - BASE, struct.pack('<I', 0x14000000 | ((delta // 4) & 0x3FFFFFF)),
             'focus step width slider: arrow update entry -> wrapper (estimate line)', expect=struct.pack('<I', SL_ARROWS_STOCK))
-    return img, dict(strings=ids, menu=where, slider=dict(sl_where, wrapper=hex(blk.labels['sl_wrap']),
+    # ---- c10: custom frame photo grid -----------------------------------------------------------------------------
+    cf_where = custom_frame(img, ids, blk.labels, cs, int(fs_where['gui_end'], 16))
+    return img, dict(strings=ids, custom_frame=cf_where, menu=where, slider=dict(sl_where, wrapper=hex(blk.labels['sl_wrap']),
                                                           text=hex(blk.labels['sl_text'])),
                      focus_end=dict(fs_where, end_bytes=[hex(FS_END0 + REL_SLOT_STEP * k) for k in range(4)],
                                                      frame_site=hex(FS_FRAME_SITE), start_site=hex(FS_START_SITE),
@@ -1840,3 +1843,522 @@ def build_main(eg, strings_context):
                                   menu_switch=hex(blk.labels['menu_switch']), store=hex(blk.labels['rel_store']),
                                   load=hex(blk.labels['rel_load']),
                                   slots=[hex(SWITCH_RAM + REL_SLOT_STEP * k) for k in (1, 2, 3, 4)]))
+
+
+# ---- c10: "Custom frame" photo grid ---------------------------------------------------------------------------------
+# Custom Settings > Grid type (photo, state 0x1C4) gains a sixth row "Custom frame" (grid value 9, which no stock grid
+# uses; every other reader of the photo grid value bounds-checks it).  OK on it selects value 9 and opens a parameter
+# page in state 0xB6 (the stock child page of a focus shift row that b8 reused: no longer reachable): Crop factor
+# 1.00x..1.50x in 0.05 steps, Aspect ratio X and Y 1..99 (default 1.00x, 3:2 = the whole frame).  OK on a row starts
+# editing it (the value shows as "< v >"), up / down / the dials then change the value, OK again or back ends editing
+# and stores it.  The live-view grid routine 0x4046AF18 draws value 9 through the stock safe-zone rectangle code with
+# our size: the crop area W / c x H / c with the largest X:Y rectangle centred in it.
+CF_AT, CF_LIMIT = 0x8A3000, 0x8A4000                     # menu records (text gap, copied by the loader; not executable)
+CF_VALUE = 9                                             # photo grid value of the custom frame
+GRID_DS = 0x2001A01                                      # eDSID_Setting_GridType (photo)
+CF_STORE = 0xA03D6DD50 + 1                               # padding bytes 1..3 of one-byte GUI item 0x1AC6: crop step, X, Y
+CF_ITEM_STORE = 0x1AC6
+CF_RAM = FS_DIST_RAM + 4                                 # u8 crop step, u8 X, u8 Y, u8 editing row + 1, u8 fresh (zero gap)
+CF_DEFAULT = (0, 3, 2)
+CF_STEPS, CF_XY_MAX = 10, 99
+CF_ITEM_PICK = 0x3F29                                    # free item ids (in no stock row, no code constant)
+CF_ROW_ITEMS = (0x3F2A, 0x3CCC, 0x3CCD)
+CF_SLOT0 = 10                                            # text slots 10..12 (the focus shift pages use 5..9)
+STATE_CF = 0xB6
+STATE_CF_STOCK = (0xA028E8128, 0xA028CF590)
+PICK_STATE = 0x1C4
+PICK_PAGE = 0xA028B9B00 - 0xA02808000 + 0x4B13000        # page record of the photo grid picker (data image)
+PICK_CALLBACKS = 0xA028EA950 - 0xA02808000 + 0x4B13000
+PICK_ENTRY, PICK_OK, PICK_COUNT = 0x405225F8, 0x4052B1D0, 5
+PICK_ITEMS = (0x334B, 0x334C, 0x334D, 0x334E, 0x334F)
+CF_ROW_KIND = 0x101040                                   # picker row with an arrow (opens the parameter page)
+# the picker's name line and preview picture come from item tables (0x40522740: names, 5 entries for state 0x1C4;
+# 0x405226C8: pictures, 12 entries shared with the video picker); copies with the Custom frame row added
+PICK_NAMES, PICK_NAMES_N = 0x42B0D134, 5
+PICK_PICTURES, PICK_PICTURES_N = 0x42B0D0D4, 12
+CF_PICTURE = 0x12EF                                      # the safe-zone picture (a centred frame), also used by the video picker
+PICK_TABLE_SITES = {0x40522794: (0xD29A2695, 'names'), 0x40522798: (0xF2A85615, 'names'), 0x405227A0: (0x528000A1, 'names n'),
+                    0x405226DC: (0xD29A1A94, 'pictures'), 0x405226E4: (0xF2A85614, 'pictures'), 0x40522704: (0x321E07E1, 'pictures n')}
+GRID_SITE, GRID_SITE_STOCK, GRID_NEXT = 0x4046B0CC, 0x510006C8, 0x4046B0D0   # sub w8, w22, #1 (grid value - 1)
+GRID_RECT = 0x4046B39C                                  # stock safe-zone path: frame w / h in s2 / s1, thickness in w8
+F_GUI_GET, F_GUI_SET = 0x403EC398, 0x403EC39C
+F_CURSOR_UP, F_CURSOR_DOWN, F_BACK = 0x403B1B74, 0x403B1B8C, 0x403B1BA4
+CF_ENGLISH = ('Custom frame', 'Crop factor', 'Aspect ratio X', 'Aspect ratio Y')
+CF_STRING_FIRST, CF_STRING_COUNT = FS_STRING_FIRST + FS_STRING_COUNT, len(CF_ENGLISH)
+CF_TEXT = (b'%d.%02dx', b'<%d.%02dx>', b'%d', b'< %d >')
+
+
+def _fp(b, op, d, n, m=0):
+    """Single-precision data processing: fmul / fdiv / fsub / ucvtf (n = w register) / fcmp."""
+    words = {'fmul': (0x1E200800, f'fmul s{d}, s{n}, s{m}'), 'fdiv': (0x1E201800, f'fdiv s{d}, s{n}, s{m}'),
+             'fsub': (0x1E203800, f'fsub s{d}, s{n}, s{m}'), 'ucvtf': (0x1E230000, f'ucvtf s{d}, w{n}'),
+             'fcmp': (0x1E202000, f'fcmp s{n}, s{m}')}
+    base, text = words[op]
+    _r(b, base | m << 16 | n << 5 | (0 if op == 'fcmp' else d), text)
+
+
+def frame_code(cs, at, main):
+    """c10 code (GUI area, executable): grid drawing hook, picker entry / pick action, parameter page callbacks and
+    actions.  `main` = labels of the main code block (fs_row_text)."""
+    b = Block(at)
+    # cf_draw: replaces "sub w8, w22, #1" (w22 = grid value) of the grid routine.  Value 9: the stock safe-zone rectangle
+    # with our size (s8 / s11 = left / right, s9 / s10 = top / bottom; x21 = output record; s0 = W, s4 = H, s2 / s1 =
+    # frame width / height, w8 = line thickness, as the stock path has them at 0x4046B39C).
+    b.label('cf_draw')
+    b.cmp_wi(22, CF_VALUE)
+    b.b_cond('eq', 'cd_frame')
+    _r(b, 0x510006C8, 'sub w8, w22, #1')
+    b.b(GRID_NEXT)
+    b.label('cd_frame')
+    b.ldrh_w(8, 21, 0x1A)                      # thickness 1 -> 2, as the stock safe zone does
+    b.cmp_wi(8, 1)
+    b.b_cond('ne', 'cd_thick')
+    b.mov_w(8, 2)
+    b.strh_w(8, 21, 0x1A)
+    b.label('cd_thick')
+    b.bl('cf_load')                            # w0 = step | X << 8 | Y << 16 (leaf: x9..x13 only)
+    _fp(b, 'fsub', 0, 11, 8)                   # W
+    _fp(b, 'fsub', 4, 10, 9)                   # H
+    _r(b, 0x12001C09, 'and w9, w0, #0xff')
+    _r(b, 0x11005129, 'add w9, w9, #0x14')     # 20 + step  (crop = (20 + step) / 20)
+    _fp(b, 'ucvtf', 5, 9)
+    b.mov_w(10, 20)
+    _fp(b, 'ucvtf', 6, 10)
+    _fp(b, 'fmul', 2, 0, 6)
+    _fp(b, 'fdiv', 2, 2, 5)                    # Wc = W * 20 / (20 + step)
+    _fp(b, 'fmul', 1, 4, 6)
+    _fp(b, 'fdiv', 1, 1, 5)                    # Hc
+    _r(b, 0x53083C0B, 'ubfx w11, w0, #8, #8')  # X
+    _r(b, 0x53105C0C, 'ubfx w12, w0, #16, #8') # Y
+    _fp(b, 'ucvtf', 6, 11)
+    _fp(b, 'ucvtf', 7, 12)
+    _fp(b, 'fmul', 3, 2, 7)                    # Wc * Y
+    _fp(b, 'fmul', 5, 1, 6)                    # Hc * X
+    _fp(b, 'fcmp', 0, 3, 5)
+    b.b_cond('gt', 'cd_tall')
+    _fp(b, 'fdiv', 1, 3, 6)                    # wide enough: width Wc, height Wc * Y / X
+    b.b('cd_set')
+    b.label('cd_tall')
+    _fp(b, 'fdiv', 2, 5, 7)                    # height Hc, width Hc * X / Y
+    b.label('cd_set')
+    b.mov_w(9, 2)
+    b.strh_w(9, 21, 0x16)
+    b.strh_w(9, 21, 0xA)
+    b.ldrh_w(8, 21, 0x1A)
+    b.b(GRID_RECT)
+    # cf_load (leaf, x9..x13): w0 = crop step | X << 8 | Y << 16 from the stored bytes, or 1.00x 3:2 when they are not valid
+    b.label('cf_load')
+    b.mov_x64(9, CF_STORE)
+    b.ldrb_w(10, 9)
+    b.ldrb_w(11, 9, 1)
+    b.ldrb_w(12, 9, 2)
+    b.cmp_wi(10, CF_STEPS)
+    b.b_cond('hi', 'cl_def')
+    _r(b, 0x5100056D, 'sub w13, w11, #1')
+    b.cmp_wi(13, CF_XY_MAX - 1)
+    b.b_cond('hi', 'cl_def')
+    _r(b, 0x5100058D, 'sub w13, w12, #1')
+    b.cmp_wi(13, CF_XY_MAX - 1)
+    b.b_cond('hi', 'cl_def')
+    _r(b, 0x0B0B2140, 'add w0, w10, w11, lsl #8')
+    _r(b, 0x0B0C4000, 'add w0, w0, w12, lsl #16')
+    b.ret()
+    b.label('cl_def')
+    b.mov_w(0, CF_DEFAULT[0] | CF_DEFAULT[1] << 8)
+    b.movk_w16(0, CF_DEFAULT[2])
+    b.ret()
+    # cf_save (leaf, x9..x12): the working bytes -> the stored bytes
+    b.label('cf_save')
+    b.mov_x64(9, CF_RAM)
+    b.ldrb_w(10, 9)
+    b.ldrb_w(11, 9, 1)
+    b.ldrb_w(12, 9, 2)
+    b.mov_x64(9, CF_STORE)
+    b.strb_w(10, 9)
+    b.strb_w(11, 9, 1)
+    b.strb_w(12, 9, 2)
+    b.ret()
+    # cf_cur(context): w0 = cursor row of the parameter page (0..2, from its item; 0xFF.. otherwise)
+    b.label('cf_cur')
+    b.ldr_x(9, 0)
+    b.mov_w(8, 0x2C)
+    b.ldr_x(10, 9, 0x50)
+    b.ldrh_w(11, 9, 0x58)
+    b.ldrh_w(9, 9, 0x32)
+    b.ldr_x(10, 10, 0x10)
+    b.add_x(9, 9, 11)
+    b.madd_x(8, 9, 8, 10)
+    b.ldr_w(8, 8, 0x18)
+    b.mov_w(0, 0)
+    for k, item in enumerate(CF_ROW_ITEMS):
+        b.mov_w(9, item)
+        b.cmp_w(8, 9)
+        b.b_cond('eq', 'cc_done')
+        _add_wi(b, 0, 0, 1)
+    b.label('cc_done')
+    b.ret()
+    # cf_texts(state): the three value texts ("1.20x", "3", "2"; the row being edited as "< v >")
+    b.label('cf_texts')
+    b.stp_pre(19, 30, -0x60)
+    b.stp(20, 21, 0x10)
+    b.mov_x(19, 0)
+    b.mov_w(20, 0)
+    b.label('ct_row')
+    b.mov_x64(9, CF_RAM)
+    b.ldrb_w(10, 9, 3)
+    b.cbnz_w(20, 'ct_num')
+    b.ldrb_w(8, 9)
+    b.mov_w(2, 1)
+    _r(b, 0x0B080903, 'add w3, w8, w8, lsl #2')   # 5 * step hundredths
+    b.adr(1, 'fmt_crop')
+    b.b('ct_fmt')
+    b.label('ct_num')
+    b.ldrb_idx(2, 9, 20)
+    b.adr(1, 'fmt_num')
+    b.label('ct_fmt')
+    _add_wi(b, 11, 20, 1)
+    b.cmp_w(10, 11)
+    b.b_cond('ne', 'ct_plain')
+    b.add_xi(1, 1, 16)                         # editing format follows each plain one
+    b.label('ct_plain')
+    b.add_xi(0, 31, 0x20)
+    b.bl(F_SPRINTF)
+    b.adr(9, 'row_items')
+    b.ldr_w_idx(1, 9, 20)
+    b.add_xi(0, 31, 0x20)
+    b.mov_x(2, 19)
+    b.mov_w(3, CF_SLOT0)
+    b.add_w(3, 3, 20)
+    b.bl(main['fs_row_text'])
+    _add_wi(b, 20, 20, 1)
+    b.cmp_wi(20, 3)
+    b.b_cond('lo', 'ct_row')
+    b.ldp(20, 21, 0x10)
+    b.ldp_post(19, 30, 0x60)
+    b.ret()
+    # cf_entry(state): opened from the picker (cf_pick set the "fresh" byte): working copy from the stored bytes, not
+    # editing, cursor on the first row.  Any other entry (the page redraw after each action re-enters here with the
+    # stock guard saying "first", and the menu can reopen on this page) keeps the working copy and the editing state,
+    # unless the working copy is empty (zero gap after power-on): then it is loaded
+    b.label('cf_entry')
+    b.stp_pre(19, 30, -0x10)
+    b.mov_x(19, 0)
+    b.mov_x64(9, CF_RAM)
+    b.ldrb_w(10, 9, 4)
+    b.cbz_w(10, 'ce_again')
+    b.strb_w(31, 9, 4)
+    b.bl('cf_load')
+    b.mov_x64(9, CF_RAM)
+    b.str_w(0, 9)
+    b.mov_x(0, 19)
+    b.mov_w(1, CF_ROW_ITEMS[0])
+    b.bl(pm.F_SET_CURSOR)
+    b.b('ce_done')
+    b.label('ce_again')
+    b.ldrb_w(10, 9, 1)
+    b.cbnz_w(10, 'ce_done')
+    b.bl('cf_load')
+    b.mov_x64(9, CF_RAM)
+    b.str_w(0, 9)
+    b.label('ce_done')
+    b.ldp_post(19, 30, 0x10)
+    b.ret()
+    # cf_refresh(state): value refresh callback
+    b.label('cf_refresh')
+    b.cbz_x(0, 'cr_done')
+    b.stp_pre(19, 30, -0x10)
+    b.mov_x(19, 0)
+    b.bl('cf_texts')
+    b.mov_x(0, 19)
+    b.ldp_post(19, 30, 0x10)
+    b.label('cr_done')
+    b.ret()
+    # cf_up / cf_down(context): while editing, change the value of the edited row (stop at the limits); otherwise the
+    # stock cursor move
+    b.label('cf_up')
+    b.mov_w(12, 1)
+    b.b('cf_step')
+    b.label('cf_down')
+    b.mov_w(12, 0)
+    b.label('cf_step')
+    b.mov_x64(9, CF_RAM)
+    b.ldrb_w(10, 9, 3)
+    b.cbnz_w(10, 'cs_edit')
+    b.cbz_w(12, 'cs_down')
+    b.b(F_CURSOR_UP)
+    b.label('cs_down')
+    b.b(F_CURSOR_DOWN)
+    b.label('cs_edit')
+    b.stp_pre(19, 30, -0x10)
+    b.mov_x(19, 0)
+    _r(b, 0x5100054A, 'sub w10, w10, #1')
+    b.ldrb_idx(11, 9, 10)
+    b.mov_w(13, CF_STEPS)
+    b.mov_w(14, 0)
+    b.cbz_w(10, 'cs_lim')
+    b.mov_w(13, CF_XY_MAX)
+    b.mov_w(14, 1)
+    b.label('cs_lim')
+    b.cbz_w(12, 'cs_dec')
+    b.cmp_w(11, 13)
+    b.b_cond('hs', 'cs_done')
+    _add_wi(b, 11, 11, 1)
+    b.b('cs_put')
+    b.label('cs_dec')
+    b.cmp_w(11, 14)
+    b.b_cond('ls', 'cs_done')
+    _r(b, 0x5100056B, 'sub w11, w11, #1')
+    b.label('cs_put')
+    _r(b, 0x382A692B, 'strb w11, [x9, x10]')
+    b.ldr_x(0, 19)
+    b.bl('cf_redraw')
+    b.label('cs_done')
+    b.ldp_post(19, 30, 0x10)
+    b.ret()
+    # cf_ok(context): editing -> store and stop; otherwise start editing the cursor row
+    b.label('cf_ok')
+    b.stp_pre(19, 30, -0x10)
+    b.mov_x(19, 0)
+    b.mov_x64(9, CF_RAM)
+    b.ldrb_w(10, 9, 3)
+    b.cbz_w(10, 'co_start')
+    b.strb_w(31, 9, 3)
+    b.bl('cf_save')
+    b.b('co_show')
+    b.label('co_start')
+    b.bl('cf_cur')
+    b.cmp_wi(0, len(CF_ROW_ITEMS) - 1)
+    b.b_cond('hi', 'co_show')
+    _add_wi(b, 0, 0, 1)
+    b.mov_x64(9, CF_RAM)
+    b.strb_w(0, 9, 3)
+    b.label('co_show')
+    b.ldr_x(0, 19)
+    b.bl('cf_redraw')
+    b.ldp_post(19, 30, 0x10)
+    b.ret()
+    # cf_redraw(state): the value texts, then the stock page redraw (as the b8 focus shift actions did)
+    b.label('cf_redraw')
+    b.stp_pre(19, 30, -0x10)
+    b.mov_x(19, 0)
+    b.bl('cf_texts')
+    b.mov_x(0, 19)
+    b.ldp_post(19, 30, 0x10)
+    b.b(F_REDRAW)
+    # cf_back(context): stop editing, store, then the stock back action
+    b.label('cf_back')
+    b.stp_pre(0, 30, -0x10)
+    b.mov_x64(9, CF_RAM)
+    b.strb_w(31, 9, 3)
+    b.bl('cf_save')
+    b.ldp_post(0, 30, 0x10)
+    b.b(F_BACK)
+    # cf_pick(context): OK on "Custom frame" in the picker: mark the parameter page fresh, photo grid value 9 (the
+    # transition then opens state 0xB6)
+    b.label('cf_pick')
+    b.mov_x64(9, CF_RAM)
+    b.mov_w(10, 1)
+    b.strb_w(10, 9, 4)                         # the parameter page opens fresh
+    b.mov_w(0, GRID_DS & 0xFFFF)
+    b.movk_w16(0, GRID_DS >> 16)
+    b.mov_w(1, CF_VALUE)
+    b.b(F_GUI_SET)
+    # cf_pick_entry(state): the stock picker entry (cursor / mark on the stored grid; value 9 falls back to 3x3),
+    # then for value 9 the cursor (when first shown) and the mark on "Custom frame"
+    b.label('cf_pick_entry')
+    b.stp_pre(19, 30, -0x10)
+    b.mov_x(19, 0)
+    b.bl(PICK_ENTRY)
+    b.mov_w(0, GRID_DS & 0xFFFF)
+    b.movk_w16(0, GRID_DS >> 16)
+    b.bl(F_GUI_GET)
+    b.cmp_wi(0, CF_VALUE)
+    b.b_cond('ne', 'pe_done')
+    b.bl(pm.F_ENTRY_GUARD)
+    b.cmp_wi(0, 1)
+    b.b_cond('eq', 'pe_mark')
+    b.mov_x(0, 19)
+    b.mov_w(1, CF_ITEM_PICK)
+    b.bl(pm.F_SET_CURSOR)
+    b.label('pe_mark')
+    b.mov_x(0, 19)
+    b.mov_w(1, CF_ITEM_PICK)
+    b.mov_w(2, 1)
+    b.bl(pm.F_SET_MARK)
+    b.label('pe_done')
+    b.ldp_post(19, 30, 0x10)
+    b.ret()
+    # ---- data (read-only) ---------------------------------------------------------------------------------------
+    code_len = len(b.items) * 4
+    data = b''
+    labels = {}
+    for name, text in zip(('fmt_crop', 'fmt_crop_e', 'fmt_num', 'fmt_num_e'), CF_TEXT):
+        labels[name] = len(data)
+        data += text.ljust(16, b'\0')
+    labels['row_items'] = len(data)
+    data += struct.pack('<4I', *CF_ROW_ITEMS, 0)
+    for name, off in labels.items():
+        b.labels[name] = at + code_len + off
+    listing = b.listing(cs)
+    for index, text in getattr(b, 'expect', {}).items():
+        got = _norm(listing[index][2])
+        if got != _norm(text):
+            raise ValueError(f'frame code raw word {index}: {got!r} != {text!r}')
+    return b, b.bytes() + data, listing
+
+
+def custom_frame(img, ids, main, cs, code_at):
+    """c10: picker row, parameter page (state 0xB6), drawing hook.  The code goes in the executable GUI area after the
+    focus shift material (code_at, below FS_GUI_LIMIT); the menu records go at CF_AT (text gap after the zero state:
+    copied by the loader and readable, but not executable: code there stopped the emulator's boot)."""
+    code_at = (code_at + 15) & ~15
+    code, code_bytes, listing = frame_code(cs, va(code_at), main)
+    if code_at + len(code_bytes) > FS_GUI_LIMIT:
+        raise ValueError('GUI area too small for the custom frame code')
+    img.put(code_at, code_bytes, 'code (GUI area): custom frame grid drawing, picker entry / pick, parameter page',
+            expect_zero=True)
+    at = CF_AT
+    # -- picker: six rows (stock five + "Custom frame"), its own transition table: OK -> cf_pick, then state 0xB6
+    page = bytearray(img.old[PICK_PAGE:PICK_PAGE + 0x50])
+    p_rows, p_evptr = struct.unpack_from('<2Q', page, 0x10)
+    if struct.unpack_from('<H', page, 0x20)[0] != PICK_COUNT:
+        raise ValueError('stock photo grid picker page record differs')
+    rows = [struct.unpack_from('<11I', img.old, p_rows - BASE + 44 * k) for k in range(PICK_COUNT)]
+    if tuple(r[6] for r in rows) != PICK_ITEMS or any(r[4] != 0x101000 for r in rows) or \
+            any(r[7:] != rows[0][7:] for r in rows):
+        raise ValueError('stock photo grid picker rows differ')
+    ptrs = struct.unpack_from(f'<{PICK_COUNT}Q', img.old, p_evptr - BASE)
+    count = 0
+    while img.u64(ptrs[0] - BASE + 32 * count) != 0x3BB:
+        count += 1
+    count += 1
+    hits = []
+
+    def pick(e, a, g, t):
+        if a == PICK_OK:
+            hits.append(e)
+            return e, code.labels['cf_pick'], g, STATE_CF
+        return e, a, g, t
+    table = pm.events(img, ptrs[0] - BASE, count, pick)
+    if hits != [0x286, 0x28B, 0x2AE]:
+        raise ValueError(f'unexpected OK transitions in the stock photo grid picker: {hits}')
+    new_row = (ids['cf_title_id'],) + rows[0][1:4] + (CF_ROW_KIND,) + rows[0][5:6] + (CF_ITEM_PICK,) + rows[0][7:]
+    p_rows_at = at; at += 44 * (PICK_COUNT + 1)
+    at = (at + 7) & ~7
+    p_table_at = at; at += len(table)
+    p_evptr_at = at; at += 8 * (PICK_COUNT + 1)
+    p_page_at = at; at += 0x50
+    img.put(p_rows_at, b''.join(struct.pack('<11I', *r) for r in rows + [new_row]),
+            'photo grid picker rows: stock five + "Custom frame"', expect_zero=True)
+    img.put(p_table_at, table, 'photo grid picker, "Custom frame" row: transitions (OK -> grid value 9, parameter page)',
+            expect_zero=True)
+    img.put(p_evptr_at, struct.pack(f'<{PICK_COUNT + 1}Q', *ptrs, va(p_table_at)),
+            'photo grid picker transition pointers', expect_zero=True)
+    struct.pack_into('<2Q', page, 0x10, va(p_rows_at), va(p_evptr_at))
+    struct.pack_into('<H', page, 0x20, PICK_COUNT + 1)
+    img.put(p_page_at, page, 'photo grid picker page record (copy, six rows)', expect_zero=True)
+    record = pm.STATE_TABLE + pm.STATE_SIZE * PICK_STATE
+    st = struct.unpack_from('<HHI11Q', img.old, record)
+    if st[:2] != (2, PICK_STATE) or st[7] != 0xA028EA950 or st[12] != 0xA028B9B00:
+        raise ValueError('stock state 0x1C4 record differs')
+    img.put(record + 0x50, struct.pack('<Q', va(p_page_at)), 'state 0x1C4 (photo grid type): page record -> six rows',
+            expect=struct.pack('<Q', 0xA028B9B00))
+    if img.u64(PICK_CALLBACKS) != PICK_ENTRY:
+        raise ValueError('stock photo grid picker entry callback differs')
+    img.put(PICK_CALLBACKS, struct.pack('<Q', code.labels['cf_pick_entry']),
+            'photo grid picker entry callback -> wrapper (cursor / mark on Custom frame)', expect=struct.pack('<Q', PICK_ENTRY))
+    # -- picker name line / preview picture: table copies with the Custom frame row, loads repointed
+    names = img.old[PICK_NAMES - BASE:PICK_NAMES - BASE + 8 * PICK_NAMES_N]
+    pics = img.old[PICK_PICTURES - BASE:PICK_PICTURES - BASE + 8 * PICK_PICTURES_N]
+    if [struct.unpack_from('<I', names, 8 * k)[0] for k in range(PICK_NAMES_N)] != list(PICK_ITEMS) or \
+            [struct.unpack_from('<I', pics, 8 * k)[0] for k in range(5)] != list(PICK_ITEMS) or \
+            CF_PICTURE not in [struct.unpack_from('<I', pics, 8 * k + 4)[0] for k in range(PICK_PICTURES_N)]:
+        raise ValueError('stock picker name / picture tables differ')
+    for site, (word, what) in PICK_TABLE_SITES.items():
+        if struct.unpack_from('<I', img.old, site - BASE)[0] != word:
+            raise ValueError(f'stock picker {what} load at {site:#x} differs')
+    names_at = at; at += len(names) + 8
+    pics_at = at; at += len(pics) + 8
+    img.put(names_at, names + struct.pack('<2I', CF_ITEM_PICK, ids['cf_title_id']),
+            'photo grid picker name table (copy + Custom frame)', expect_zero=True)
+    img.put(pics_at, pics + struct.pack('<2I', CF_ITEM_PICK, CF_PICTURE),
+            'grid picker picture table (copy + Custom frame: safe-zone picture)', expect_zero=True)
+    for reg, (lo_site, hi_site, n_site), table, n in ((21, (0x40522794, 0x40522798, 0x405227A0), names_at, PICK_NAMES_N + 1),
+                                                      (20, (0x405226DC, 0x405226E4, 0x40522704), pics_at, PICK_PICTURES_N + 1)):
+        v = va(table)
+        if v >> 32 or (v >> 16) != 0x40A0:
+            raise ValueError('picker table copy does not fit the two-instruction load')
+        for site, word in ((lo_site, 0xD2800000 | (v & 0xFFFF) << 5 | reg), (hi_site, 0xF2A00000 | (v >> 16) << 5 | reg),
+                           (n_site, 0x52800001 | n << 5)):
+            img.put(site - BASE, struct.pack('<I', word), f'grid picker {PICK_TABLE_SITES[site][1]} load {site:#x} -> copy',
+                    expect=struct.pack('<I', PICK_TABLE_SITES[site][0]))
+    # -- parameter page in state 0xB6: focus shift layout and page record (as the end point sub-page), three value rows
+    layout = bytearray(img.old[FS_LAYOUT:FS_LAYOUT + FS_LAYOUT_BYTES])
+    if struct.unpack_from('<I', layout, 0x44)[0] != 0x561 or \
+            [k for k in range(0, len(layout), 4) if struct.unpack_from('<I', layout, k)[0] == FS_GUIDE_STRING] != [FS_GUIDE_AT]:
+        raise ValueError('stock focus shift layout differs')
+    struct.pack_into('<I', layout, 0x44, ids['cf_title_id'])
+    struct.pack_into('<I', layout, FS_GUIDE_AT, ids['sl_empty_id'])
+    tail = struct.unpack_from('<11I', img.old, FS_ROWS + 44 * FS_ROW_SHOTS)[7:]
+    rows = b''.join(struct.pack('<11I', ids['cf_row_ids'][i], 0xFFFF, 0xFFFF, 0, FS_VALUE_ROW, 0xFFFF, CF_ROW_ITEMS[i],
+                                *tail) for i in range(3))
+    change = {F_CURSOR_UP: code.labels['cf_up'], F_CURSOR_DOWN: code.labels['cf_down'], F_BACK: code.labels['cf_back']}
+    seen = []
+
+    def param(e, a, g, t):
+        if a == pm.NRAW_OK:
+            seen.append(e)
+            return e, code.labels['cf_ok'], g, 0x68C
+        if a in change:
+            seen.append(e)
+            return e, change[a], g, t
+        return e, a, g, t
+    act = pm.events(img, pm.NRAW_EVENTS, 14, param)
+    if seen != [0x283, 0x284, 0x285, 0x286, 0x28B, 0x29D, 0x29E, 0x2A0, 0x2AE]:
+        raise ValueError(f'unexpected stock option table events: {seen}')
+    at = (at + 15) & ~15
+    layout_at = at; at += len(layout)
+    rows_at = at; at += len(rows)
+    at = (at + 7) & ~7
+    act_at = at; at += len(act)
+    evptr_at = at; at += 3 * 8
+    callbacks_at = at; at += 5 * 8
+    page_at = at; at += 0x50
+    if at > CF_LIMIT:
+        raise ValueError('text gap area too small for the custom frame')
+    fpage = bytearray(img.old[FS_PAGE:FS_PAGE + 0x50])
+    struct.pack_into('<3Q', fpage, 8, va(layout_at), va(rows_at), va(evptr_at))
+    struct.pack_into('<H', fpage, 0x20, 3)
+    img.put(layout_at, layout, 'custom frame page layout (focus shift layout, title "Custom frame")', expect_zero=True)
+    img.put(rows_at, rows, 'custom frame page rows (crop factor, aspect ratio X / Y)', expect_zero=True)
+    img.put(act_at, act, 'custom frame page transition table (OK edits, up / down change, back stores)', expect_zero=True)
+    img.put(evptr_at, struct.pack('<3Q', *[va(act_at)] * 3), 'custom frame page transition pointers', expect_zero=True)
+    img.put(callbacks_at, struct.pack('<5Q', code.labels['cf_entry'], *pm.NRAW_CALLBACKS[1:4], code.labels['cf_refresh']),
+            'custom frame page callbacks', expect_zero=True)
+    img.put(page_at, fpage, 'custom frame page record (focus shift page record, new rows)', expect_zero=True)
+    record = pm.STATE_TABLE + pm.STATE_SIZE * STATE_CF
+    st = struct.unpack_from('<HHI11Q', img.old, record)
+    nraw_state = struct.unpack_from('<HHI11Q', img.old, pm.STATE_TABLE + pm.STATE_SIZE * pm.STATE_NRAW)
+    if st[:2] != (2, STATE_CF) or st[3] != nraw_state[3] or (st[7], st[12]) != STATE_CF_STOCK or \
+            any(st[4:7] + st[8:12] + st[13:]):
+        raise ValueError('stock state 0xB6 record differs')
+    img.put(record + 0x28, struct.pack('<Q', va(callbacks_at)), 'state 0xB6: callbacks -> custom frame page',
+            expect=struct.pack('<Q', STATE_CF_STOCK[0]))
+    img.put(record + 0x50, struct.pack('<Q', va(page_at)), 'state 0xB6: page record -> custom frame page',
+            expect=struct.pack('<Q', STATE_CF_STOCK[1]))
+    # -- drawing hook
+    if struct.unpack_from('<I', img.old, GRID_SITE - BASE)[0] != GRID_SITE_STOCK or \
+            struct.unpack_from('<3I', img.old, GRID_SITE + 4 - BASE)[:2] != (0x71001D1F, 0x54000208) or \
+            struct.unpack_from('<I', img.old, GRID_RECT - BASE)[0] != 0x1E230103:
+        raise ValueError('stock grid routine differs')
+    img.put(GRID_SITE - BASE, struct.pack('<I', _b_word(GRID_SITE, code.labels['cf_draw'])),
+            'grid routine: grid value test -> cf_draw (value 9 = custom frame)', expect=struct.pack('<I', GRID_SITE_STOCK))
+    return dict(code=dict(at=hex(va(code_at)), bytes=len(code_bytes), labels={k: hex(v) for k, v in code.labels.items()},
+                          listing=[dict(va=hex(x), word=w, text=t) for x, w, t in listing]),
+                picker=dict(page=hex(va(p_page_at)), rows=hex(va(p_rows_at)), table=hex(va(p_table_at)),
+                            names=hex(va(names_at)), pictures=hex(va(pics_at)),
+                            item=hex(CF_ITEM_PICK)),
+                page=dict(state=hex(STATE_CF), page=hex(va(page_at)), callbacks=hex(va(callbacks_at)),
+                          table=hex(va(act_at)), items=[hex(i) for i in CF_ROW_ITEMS]),
+                value=CF_VALUE, store=dict(item=hex(CF_ITEM_STORE), bytes=hex(CF_STORE)), ram=hex(CF_RAM),
+                draw_site=hex(GRID_SITE), end=hex(va(at)))

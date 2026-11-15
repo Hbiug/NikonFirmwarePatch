@@ -55,6 +55,18 @@ IM_SITE, IM_SITE_STOCK, IM_RESUME = 0x4044F2C8, 0x52801620, 0x4044F2DC
 FS_MENU_TABLE, FS_OPEN, FS_START, FS_BUSY = 0x43E26400, 0x405EF0B4, 0x405EF5E4, 0x403971AC
 FS_ARM = 0xA10002F02
 MENU_EV_ENTRY, MENU_EV_STOCK, MENU_TOP = 0x42B086D8 + 8 * 0xA, 0x40508260, 0x403DBDB4   # menu app event 0xA case
+# d0 (c10): "Custom frame" photo grid (value 9): picker row, parameter page in state 0xB6, grid drawing hook
+CF_AREA = (0x8A3000, 0x8A4000)
+GRID_SITE, GRID_NEXT, GRID_RECT = 0x4046B0CC, 0x4046B0D0, 0x4046B39C
+PICK_PAGE_PTR = pm.STATE_TABLE + pm.STATE_SIZE * 0x1C4 + 0x50
+PICK_CALLBACKS = 0xA028EA950 - 0xA02808000 + 0x4B13000
+PICK_ENTRY, PICK_OK = 0x405225F8, 0x4052B1D0
+CF_RAM, CF_STORE = 0xA10002F04, 0xA03D6DD51
+PICK_LOADS = {0x40522794: 0xD29A2695, 0x40522798: 0xF2A85615, 0x405227A0: 0x528000A1,     # names: x21 / count 5
+              0x405226DC: 0xD29A1A94, 0x405226E4: 0xF2A85614, 0x40522704: 0x321E07E1}     # pictures: x20 / count 12
+CF_TEXTS = (b'%d.%02dx', b'<%d.%02dx>', b'%d', b'< %d >')
+CF_STOCK_CALLS = {GRID_NEXT, GRID_RECT, 0x4127D850, 0x403AE0F8, 0x403B0048, 0x403B00B8, 0x403B1B74, 0x403B1B8C,
+                  0x403B1BA4, 0x403EC398, 0x403EC39C, 0x403B26C0, PICK_ENTRY}
 SL_LAYOUT_EDITS = {0x43DF951C: 4, 0x43DF9534: 8, 0x43DF9560: 4, 0x43DF9578: 8, 0x43DF9754: 8, 0x43DF9798: 8}
 
 
@@ -98,6 +110,13 @@ def windows(version, tag, n, stock):
         'focus shift page refresh callback': (FS_CALLBACKS + 32, 8),
         'i-menu handler: focus shift case': (IM_SITE - BASE, 4),
         'menu app event 0xA case (i-menu start hook)': (MENU_EV_ENTRY - BASE, 8),
+        'custom frame menu records': (CF_AREA[0], CF_AREA[1] - CF_AREA[0]),
+        'grid routine: grid value test': (GRID_SITE - BASE, 4),
+        'state 0x1C4 page record pointer': (PICK_PAGE_PTR, 8),
+        'photo grid picker entry callback': (PICK_CALLBACKS, 8),
+        **{f'grid picker table load {a:#x}': (a - BASE, 4) for a in PICK_LOADS},
+        'state 0xB6 callbacks pointer': (pm.STATE_TABLE + pm.STATE_SIZE * 0xB6 + 0x28, 8),
+        'state 0xB6 page record pointer': (pm.STATE_TABLE + pm.STATE_SIZE * 0xB6 + 0x50, 8),
     }
     for k in range(64):
         e, a = struct.unpack_from('<2Q', stock, FS_MENU_TABLE - BASE + 32 * k)
@@ -179,7 +198,8 @@ def verify(stock_raw, out_raw, version, tag):
                'focus shift per-frame remaining-shots load', 'focus shift start: No. of shots read', 'standby: mode 0xC request call',
                'focus shift cursor table address (low half)', 'focus shift cursor table address (high half)',
                'focus shift cursor table count', 'focus step width slider: arrow update entry',
-               'i-menu handler: focus shift case'}
+               'i-menu handler: focus shift case', 'custom frame menu records', 'grid routine: grid value test'} | \
+              {f'grid picker table load {a:#x}' for a in PICK_LOADS}
     for r in report:
         if r['start'] < CODE_REGION_END and not set(r['windows']) <= code_ok:
             raise ValueError(f'unexpected code-region change: {r}')
@@ -516,8 +536,144 @@ def verify(stock_raw, out_raw, version, tag):
                 f'{name} wrapper: unexpected inner call')
         require(sum(1 for a, m, o in body if m == 'ret') == 1, f'{name} wrapper: expected one ret')
         wrappers[name] = hex(hook)
+    # ---- d0: custom frame -----------------------------------------------------------------------------------------
+    # the code sits in the executable GUI area (hook target .. value formats); the menu records in CF_AREA
+    require(struct.unpack_from('<I', eg0, GRID_SITE - BASE)[0] == 0x510006C8, 'stock grid value test')
+    w = struct.unpack_from('<I', eg1, GRID_SITE - BASE)[0]
+    require(w >> 26 == 0b000101, 'grid hook is not a branch')
+    d = w & 0x3FFFFFF
+    draw = GRID_SITE + ((d - (1 << 26) if d & (1 << 25) else d) << 2)
+    require(BASE + 0x8A1000 <= draw < BASE + FS_GUI_END, 'custom frame code outside the GUI area')
+    gui = eg1[draw - BASE:BASE + FS_GUI_END - BASE]
+    fmt = gui.find(CF_TEXTS[0] + b'\0' * 8)
+    require(fmt > 0 and fmt % 4 == 0 and
+            gui[fmt:fmt + 64] == b''.join(t.ljust(16, b'\0') for t in CF_TEXTS), 'custom frame: value formats')
+    require(not any(eg1[draw - BASE + fmt + 80:0x8A2F00]) and not any(eg1[0x8A2F00:0x8A3000]),
+            'custom frame: data after the code, or the zero state is not zero')
+    cf_lo, cf_hi = draw, draw + fmt
+    cf_rows = disasm(gui[:fmt], cf_lo)
+    require(len(cf_rows) == fmt // 4, 'custom frame code does not decode')
+    cf_by = {a: (m, o) for a, m, o in cf_rows}
+    for a, m, o in cf_rows:
+        if m in ('b', 'bl') or m.startswith('b.') or m in ('cbz', 'cbnz', 'tbz', 'tbnz'):
+            tgt = int(o.split()[-1], 16)
+            require(cf_lo <= tgt < cf_hi or tgt in CF_STOCK_CALLS or (BASE + 0x8A0000 <= tgt < limit and m == 'bl'),
+                    f'custom frame code: branch at {a:#x} to {tgt:#x}')
+        require(m not in ('br', 'blr', 'svc', 'msr', 'sys', 'eret'), f'custom frame code: {m} at {a:#x}')
+    # stores: only x21 (the grid output record, inside the hook), the working bytes (x9 = CF_RAM, zero gap), the stored
+    # bytes (x9 = CF_STORE) and the stack
+    consts, cur = [], None
+    for a, m, o in cf_rows:
+        if m == 'mov' and o.startswith('x9, #'):
+            cur = int(o.split('#')[1], 16)
+        elif m == 'movk' and o.startswith('x9, #') and cur is not None:
+            parts = o.split('#')
+            cur |= int(parts[1].split(',')[0], 16) << int(parts[2])
+            if '#48' in o:
+                consts.append(cur)
+                cur = None
+    require(set(consts) == {CF_RAM, CF_STORE}, f'custom frame code: addresses {[hex(c) for c in consts]}')
+    require(not any(eg0[0x8A2F04:0x8A2F08]) and not any(eg1[0x8A2F04:0x8A2F10]), 'custom frame working bytes not in the zero gap')
+    for a, m, o in cf_rows:
+        if m.startswith('st') and 'sp' not in o:
+            require(re.search(r'\[x(9|21)(, |\])', o), f'custom frame code: store {m} {o} at {a:#x}')
+    # the hook: value 9 -> rectangle path, anything else -> displaced "sub w8, w22, #1" and back
+    head = [(cf_by[draw + 4 * k][0], cf_by[draw + 4 * k][1]) for k in range(4)]
+    require(head[0] == ('cmp', 'w22, #0x9') and head[1][0] == 'b.eq' and head[2] == ('sub', 'w8, w22, #0x1') and
+            head[3][0] == 'b' and int(head[3][1], 16) == GRID_NEXT, f'grid hook head {head}')
+    frame = int(head[1][1].split()[-1], 16)
+    tail = next(a for a, m, o in cf_rows if a >= frame and m == 'b' and not cf_lo <= int(o, 16) < cf_hi)
+    require(int(cf_by[tail][1], 16) == GRID_RECT and cf_by[tail - 4] == ('ldrh', 'w8, [x21, #0x1a]'), 'grid hook: rectangle path')
+    require({o for a, m, o in cf_rows if frame <= a < tail and m == 'strh'} == {'w8, [x21, #0x1a]', 'w9, [x21, #0x16]', 'w9, [x21, #0xa]'},
+            'grid hook: record fields written')
+    # picker (state 0x1C4): page record copy with six rows, stock five unchanged, sixth row's OK -> grid value 9, state 0xB6
+    require(struct.unpack_from('<Q', eg0, PICK_PAGE_PTR)[0] == 0xA028B9B00, 'stock state 0x1C4 page record')
+    ppage = struct.unpack_from('<Q', eg1, PICK_PAGE_PTR)[0]
+    spage = 0xA028B9B00 - 0xA02808000 + 0x4B13000
+    require(BASE + CF_AREA[0] <= ppage < BASE + CF_AREA[1], 'picker page record outside the custom frame area')
+    pr = eg1[ppage - BASE:ppage - BASE + 0x50]
+    st = eg0[spage:spage + 0x50]
+    require(pr[:0x10] == st[:0x10] and pr[0x22:] == st[0x22:] and struct.unpack_from('<H', pr, 0x20)[0] == 6 and
+            struct.unpack_from('<H', st, 0x20)[0] == 5, 'picker page record copy')
+    prows, pev = struct.unpack_from('<2Q', pr, 0x10)
+    srows, sev = struct.unpack_from('<2Q', st, 0x10)
+    require(eg1[prows - BASE:prows - BASE + 5 * 44] == eg0[srows - BASE:srows - BASE + 5 * 44] and
+            eg1[pev - BASE:pev - BASE + 40] == eg0[sev - BASE:sev - BASE + 40], 'picker: stock rows / tables changed')
+    r6 = struct.unpack_from('<11I', eg1, prows - BASE + 5 * 44)
+    r0 = struct.unpack_from('<11I', eg0, srows - BASE)
+    require(r6[1:4] == r0[1:4] and r6[5] == r0[5] and r6[7:] == r0[7:] and r6[4] == 0x101040 and r6[6] == 0x3F29,
+            'picker: Custom frame row')
+    t6 = struct.unpack_from('<Q', eg1, pev - BASE + 40)[0]
+    t0 = struct.unpack_from('<Q', eg0, sev - BASE)[0]
+    pick, k = set(), 0
+    while True:
+        e, a, g, tg = struct.unpack_from('<4Q', eg1, t6 - BASE + 32 * k)
+        e0, a0, g0, tg0 = struct.unpack_from('<4Q', eg0, t0 - BASE + 32 * k)
+        if a0 == PICK_OK:
+            require((e, g, tg) == (e0, g0, 0xB6), 'picker: Custom frame OK transition')
+            pick.add(a)
+        else:
+            require((e, a, g, tg) == (e0, a0, g0, tg0), f'picker: Custom frame transition {e0:#x}')
+        if e0 == 0x3BB:
+            break
+        k += 1
+    require(len(pick) == 1, 'picker: one pick action')
+    pa = next(iter(pick))
+    body = [cf_by[pa + 4 * j] for j in range(10)]
+    end = next(j for j, (m, o) in enumerate(body) if m == 'b')
+    require(body[end - 3:end] == [('mov', 'w0, #0x1a01'), ('movk', 'w0, #0x200, lsl #16'), ('mov', 'w1, #0x9')] and
+            int(body[end][1], 16) == 0x403EC39C and all(m in ('mov', 'movk', 'strb') for m, o in body[:end]),
+            f'picker: pick action {body[:end + 1]}')
+    require(struct.unpack_from('<Q', eg0, PICK_CALLBACKS)[0] == PICK_ENTRY, 'stock picker entry callback')
+    pe = struct.unpack_from('<Q', eg1, PICK_CALLBACKS)[0]
+    pe_rows = [r for r in cf_rows if pe <= r[0] < pe + 16]
+    require(cf_lo <= pe < cf_hi and [m for a, m, o in pe_rows] == ['stp', 'mov', 'bl'] + [pe_rows[3][1]] and
+            int(pe_rows[2][2].split()[-1], 16) == PICK_ENTRY, 'picker entry wrapper must call the stock entry first')
+    # picker name line / preview picture: the loads point at copies = stock table + (0x3F29, our string / safe-zone picture)
+    for a, w0_ in PICK_LOADS.items():
+        require(struct.unpack_from('<I', eg0, a - BASE)[0] == w0_, f'stock picker table load {a:#x}')
+    def load(lo, hi, n, reg):
+        wl, wh, wn = (struct.unpack_from('<I', eg1, x - BASE)[0] for x in (lo, hi, n))
+        require(wl & 0xFFE0001F == 0xD2800000 | reg and wh & 0xFFE0001F == 0xF2A00000 | reg and wn & 0xFFE0001F == 0x52800001,
+                f'picker table load shape at {lo:#x}')
+        return ((wh >> 5) & 0xFFFF) << 16 | (wl >> 5) & 0xFFFF, (wn >> 5) & 0xFFFF
+    for (lo, hi, n, reg, stock, cnt, extra) in ((0x40522794, 0x40522798, 0x405227A0, 21, 0x42B0D134, 5, None),
+                                                (0x405226DC, 0x405226E4, 0x40522704, 20, 0x42B0D0D4, 12, 0x12EF)):
+        t, k = load(lo, hi, n, reg)
+        require(BASE + CF_AREA[0] <= t < BASE + CF_AREA[1] and k == cnt + 1, f'picker table copy {t:#x} / {k}')
+        require(eg1[t - BASE:t - BASE + 8 * cnt] == eg0[stock - BASE:stock - BASE + 8 * cnt], 'picker table copy differs from stock')
+        item, val = struct.unpack_from('<2I', eg1, t - BASE + 8 * cnt)
+        require(item == 0x3F29 and (val == extra if extra else val >= 3137), 'picker table: Custom frame entry')
+    # state 0xB6: parameter page (stock option-page callbacks 1..3, our entry / refresh; option table, edited actions)
+    cb = struct.unpack_from('<Q', eg1, pm.STATE_TABLE + pm.STATE_SIZE * 0xB6 + 0x28)[0]
+    page = struct.unpack_from('<Q', eg1, pm.STATE_TABLE + pm.STATE_SIZE * 0xB6 + 0x50)[0]
+    require(struct.unpack_from('<2Q', eg0, pm.STATE_TABLE + pm.STATE_SIZE * 0xB6 + 0x28)[0] == 0xA028E8128,
+            'stock state 0xB6 callbacks')
+    require(all(BASE + CF_AREA[0] <= x < BASE + CF_AREA[1] for x in (cb, page)), 'state 0xB6 material outside the area')
+    cbs = struct.unpack_from('<5Q', eg1, cb - BASE)
+    require(cbs[1:4] == tuple(pm.NRAW_CALLBACKS[1:4]) and cf_lo <= cbs[0] < cf_hi and cf_lo <= cbs[4] < cf_hi and
+            cf_by[cbs[0]][0] == 'stp' and cf_by[cbs[4]][0] == 'cbz', 'state 0xB6 callbacks')
+    require(struct.unpack_from('<H', eg1, page - BASE + 0x20)[0] == 3, 'parameter page: three rows')
+    ev = struct.unpack_from('<Q', eg1, page - BASE + 0x18)[0]
+    tbls = set(struct.unpack_from('<3Q', eg1, ev - BASE))
+    require(len(tbls) == 1, 'parameter page: one shared table')
+    tb = next(iter(tbls))
+    changed = {}
+    for j in range(14):
+        e, a, g, tg = struct.unpack_from('<4Q', eg1, tb - BASE + 32 * j)
+        e0, a0, g0, t0_ = struct.unpack_from('<4Q', eg0, pm.NRAW_EVENTS + 32 * j)
+        require((e, g) == (e0, g0), f'parameter page: event {e0:#x}')
+        if (a, tg) != (a0, t0_):
+            require(cf_lo <= a < cf_hi and (tg == t0_ or (a0 == pm.NRAW_OK and tg == 0x68C)), f'parameter page: {e0:#x}')
+            changed[e0] = (a0, a)
+    require(sorted(changed) == [0x283, 0x284, 0x285, 0x286, 0x28B, 0x29D, 0x29E, 0x2A0, 0x2AE], 'parameter page: edited events')
+    # every changed action falls back to its stock action when not editing (up / down / back), or is cf_ok
+    for e0, (a0, a) in changed.items():
+        if a0 != pm.NRAW_OK:
+            reach = {int(o.split()[-1], 16) for x, m, o in cf_rows if a <= x < a + 0x60 and m == 'b'}
+            require(a0 in reach, f'parameter page: {e0:#x} action never reaches stock {a0:#x}')
     return dict(status='VERIFIED', changed_ranges=len(report), windows=sorted({w for r in report for w in r['windows']}),
-                gate=hex(gate), native=hex(native[0]), link_wrappers=wrappers, menu_switch=hex(menu_switch), output_sha256=sha(out_raw))
+                gate=hex(gate), native=hex(native[0]), link_wrappers=wrappers, custom_frame=dict(draw=hex(draw), pick=hex(pa), page=hex(page)), menu_switch=hex(menu_switch), output_sha256=sha(out_raw))
 
 
 def main():

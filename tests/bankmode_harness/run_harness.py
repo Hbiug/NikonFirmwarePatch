@@ -77,6 +77,7 @@ MUTATIONS = {
 
 # c5 second code block (GUI area in the image; any free address here)
 LENS_VA = 0x40A02000
+FRAME_VA = 0x40A02800        # the custom frame code (any address: it branches to stubs at their real addresses)
 LENS_MUTATIONS = {
     # metre text: the interpolation between table entries is gone (steps of 2^(1/32))
     'dist-no-interp': lambda d, L, b: _nop_first(d, L['fs_dist_text'], L['fs_page_refresh'], b, 0xFFFFFFFF, 0x0B4F19CE),
@@ -145,12 +146,28 @@ def dist_cases():
     return [(r, dist_model(r)) for r in raws]
 
 
+# d0 custom frame: the value limits, the fit direction of the frame, the mark on Custom frame
+FRAME_MUTATIONS = {
+    'cf-no-limit': lambda d, L, b: _nop_first(d, L['cs_lim'], L['cs_dec'], b, 0xFF00001F, 0x54000002),
+    'cf-fit-swapped': lambda d, L, b: _flip_gt(d, L['cf_draw'], L['cf_load'], b),
+    'cf-no-mark': lambda d, L, b: _nop_first(d, L['pe_mark'], L['pe_done'], b, 0xFC000000, 0x94000000),
+}
+
+
+def _flip_gt(data, lo, hi, base):
+    for a, w in _words(data, lo, hi, base):
+        if w & 0xFF00001F == 0x5400000C:
+            struct.pack_into('<I', data, a - base, (w & ~0x1F) | 0xD)
+            return
+    raise SystemExit('mutation site not found')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--qemu', default=shutil.which('qemu-system-aarch64') or 'qemu-system-aarch64')
     ap.add_argument('--out', type=Path, default=HERE / 'build')
     ap.add_argument('--ram', default='44G')
-    ap.add_argument('--mutate', choices=sorted(MUTATIONS) + sorted(LENS_MUTATIONS), help='deliberately break the code under test (the harness must then fail)')
+    ap.add_argument('--mutate', choices=sorted(MUTATIONS) + sorted(LENS_MUTATIONS) + sorted(FRAME_MUTATIONS), help='deliberately break the code under test (the harness must then fail)')
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     blk, data, _ = P.code(Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN))
@@ -161,6 +178,15 @@ def main():
         LENS_MUTATIONS[a.mutate](lens_data, lens.labels, LENS_VA)
         lens_data = bytes(lens_data)
     (a.out / 'lens.bin').write_bytes(lens_data)
+    frame, frame_data, _ = P.frame_code(Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN), FRAME_VA, blk.labels)
+    if a.mutate in FRAME_MUTATIONS:
+        frame_data = bytearray(frame_data)
+        FRAME_MUTATIONS[a.mutate](frame_data, frame.labels, FRAME_VA)
+        frame_data = bytes(frame_data)
+    require_gap = FRAME_VA >= LENS_VA + len(lens_data)
+    if not require_gap:
+        raise SystemExit('lens code overlaps the frame code in the harness layout')
+    (a.out / 'frame.bin').write_bytes(frame_data)
     if a.mutate in MUTATIONS:
         data = bytearray(data)
         MUTATIONS[a.mutate](data, blk.labels, base)
@@ -182,12 +208,16 @@ def main():
         f'#define THUNK_MENU {th(P.THUNK_MENU_WORDS)}', f'#define THUNK_CUSTOM {th(P.THUNK_CUSTOM_WORDS)}',
         f'#define FS_DIST_RAM {P.FS_DIST_RAM:#x}UL', f'#define P_DISTANCE {P.P_DISTANCE:#x}u',
         f'#define P_INFINITY {P.P_INFINITY:#x}u', f'#define P_NEAR {P.P_NEAR:#x}u',
+        f'#define CF_STORE {P.CF_STORE:#x}UL', f'#define CF_RAM {P.CF_RAM:#x}UL', f'#define CF_SLOT0 {P.CF_SLOT0}u',
+        f'#define CF_PICK {P.CF_ITEM_PICK:#x}u', *[f'#define CF_ROW{i} {P.CF_ROW_ITEMS[i]:#x}u' for i in range(3)],
         f'#define FS_ITEM_CURRENT {P.FS_ITEM_CURRENT:#x}u', f'#define FS_SLOT_CURRENT {P.FS_SLOT_CURRENT}u',
         '#define DIST_CASES {' + ','.join(f'{{{r:#x}, "{t}"}}' for r, t in dist_cases()) + '}', '']))
     defs = [f'--defsym=hook_{n}={L[n]:#x}' for n in ('gate', 'save', 'has_prev', 'hook_menu', 'hook_custom', 'link_sync', 'texts', 'post_wrap', 'bkt_wrap',
                                                  'fs_end_get', 'fs_pps', 'fs_est', 'fs_shots', 'fs_remain', 'fs_refresh',
                                                  'fs_end_ok', 'fs_end_entry', 'fs_wake', 'sl_wrap', 'sl_text', 'fs_target_get')]
     defs += [f'--defsym=lens_{n}={lens.labels[n]:#x}' for n in ('fs_end_ok2', 'fs_dist_text', 'fs_page_refresh', 'fs_im_arm', 'fs_menu_open', 'mn_tick')]
+    defs += [f'--defsym=frame_{n}={frame.labels[n]:#x}' for n in ('cf_draw', 'cf_load', 'cf_entry', 'cf_refresh', 'cf_up', 'cf_down',
+                                                                    'cf_ok', 'cf_back', 'cf_pick', 'cf_pick_entry')]
     obj = a.out / 'harness.o'
     run = lambda *c: subprocess.run(c, check=True)
     run('clang', '--target=aarch64-none-elf', '-O1', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
@@ -198,7 +228,8 @@ def main():
     cmd = [a.qemu, '-M', 'virt,memory-backend=r0', '-cpu', 'max', '-m', a.ram,
            '-object', f'memory-backend-ram,id=r0,size={a.ram},reserve=off', '-display', 'none', '-serial', 'stdio', '-monitor', 'none',
            '-semihosting', '-kernel', str(elf), '-device', f'loader,file={a.out / "hooks.bin"},addr={base:#x},force-raw=on',
-           '-device', f'loader,file={a.out / "lens.bin"},addr={LENS_VA:#x},force-raw=on']
+           '-device', f'loader,file={a.out / "lens.bin"},addr={LENS_VA:#x},force-raw=on',
+           '-device', f'loader,file={a.out / "frame.bin"},addr={FRAME_VA:#x},force-raw=on']
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)

@@ -697,6 +697,160 @@ static void imenu_tests(void) {
     ARM = 0;
 }
 
+/* ---- d0: custom frame grid (picker row, parameter page, drawing hook) ---------------------------------------------- */
+enum { K_GUISET = 40, K_MARK, K_UP, K_DOWN, K_BACK, K_PICKENTRY };
+static u32 gui_value = 0;
+__attribute__((noinline, used)) u32 c_guiget(u32 id) { return id == 0x2001A01u ? gui_value : 0xEEEE; }
+__attribute__((noinline, used)) void c_guiset(u32 id, u32 v) { logrec(K_GUISET, id, v, 0, 0); if (id == 0x2001A01u) gui_value = v; }
+__attribute__((noinline, used)) void c_mark(u64 st, u32 item, u32 on) { logrec(K_MARK, st, item, on, 0); }
+__attribute__((noinline, used)) void c_up(u64 ctx) { logrec(K_UP, ctx, 0, 0, 0); }
+__attribute__((noinline, used)) void c_down(u64 ctx) { logrec(K_DOWN, ctx, 0, 0, 0); }
+__attribute__((noinline, used)) void c_back(u64 ctx) { logrec(K_BACK, ctx, 0, 0, 0); }
+__attribute__((noinline, used)) void c_pickentry(u64 st) { logrec(K_PICKENTRY, st, 0, 0, 0); }
+__asm__(".section .s_mark,\"ax\"\n    b c_mark\n"
+        ".section .s_moves,\"ax\"\n    b c_up\n    .space 0x14\n    b c_down\n    .space 0x14\n    b c_back\n"
+        ".section .s_guids,\"ax\"\n    b c_guiget\n    b c_guiset\n"
+        ".section .s_pickentry,\"ax\"\n    b c_pickentry\n"
+        ".text\n");
+/* the grid routine around the hook: draw_call enters cf_draw with s8 / s11 / s9 / s10 = left / right / top / bottom,
+   w22 = grid value, x21 = output record; the two continuation stubs record what cf_draw hands on, then come back */
+static volatile int draw_path; static volatile int draw_out[5]; u64 draw_sp;
+__asm__(".arch_extension fp\n.text\n.global draw_call\ndraw_call:\n"
+        "    stp x29, x30, [sp, #-16]!\n    stp x21, x22, [sp, #-16]!\n    stp d8, d9, [sp, #-16]!\n    stp d10, d11, [sp, #-16]!\n"
+        "    adrp x9, draw_sp\n    add x9, x9, :lo12:draw_sp\n    mov x10, sp\n    str x10, [x9]\n"
+        "    ldr s8, [x0]\n    ldr s11, [x0, #4]\n    ldr s9, [x0, #8]\n    ldr s10, [x0, #12]\n    ldr w22, [x0, #16]\n"
+        "    mov x21, x1\n    mov x30, xzr\n    b frame_cf_draw\n"
+        ".global draw_back\ndraw_back:\n"
+        "    adrp x9, draw_sp\n    add x9, x9, :lo12:draw_sp\n    ldr x10, [x9]\n    mov sp, x10\n"
+        "    ldp d10, d11, [sp], #16\n    ldp d8, d9, [sp], #16\n    ldp x21, x22, [sp], #16\n    ldp x29, x30, [sp], #16\n    ret\n"
+        ".section .s_gridnext,\"ax\"\n"
+        "    adrp x9, draw_out\n    add x9, x9, :lo12:draw_out\n    str w8, [x9]\n"
+        "    adrp x9, draw_path\n    add x9, x9, :lo12:draw_path\n    mov w10, #1\n    str w10, [x9]\n    b draw_back\n"
+        ".section .s_gridrect,\"ax\"\n"
+        "    adrp x9, draw_out\n    add x9, x9, :lo12:draw_out\n    str w8, [x9]\n"
+        "    fcvtzs w10, s2\n    str w10, [x9, #4]\n    fcvtzs w10, s1\n    str w10, [x9, #8]\n"
+        "    fcvtzs w10, s0\n    str w10, [x9, #12]\n    fcvtzs w10, s4\n    str w10, [x9, #16]\n"
+        "    adrp x9, draw_path\n    add x9, x9, :lo12:draw_path\n    mov w10, #2\n    str w10, [x9]\n    b draw_back\n"
+        ".text\n");
+extern void draw_call(const u32 *in, unsigned short *rec);
+extern char frame_cf_draw[], frame_cf_load[], frame_cf_entry[], frame_cf_refresh[], frame_cf_up[], frame_cf_down[];
+extern char frame_cf_ok[], frame_cf_back[], frame_cf_pick[], frame_cf_pick_entry[];
+#define CFS(k) (*(volatile u8 *)(CF_STORE + (k)))
+#define CFR(k) (*(volatile u8 *)(CF_RAM + (k)))
+static void cf_store(u32 k, u32 x, u32 y) { CFS(0) = (u8)k; CFS(1) = (u8)x; CFS(2) = (u8)y; }
+static int draw(u32 value, u32 l, u32 r, u32 t, u32 b, unsigned short thick, unsigned short *rec) {
+    /* floats as bit patterns (the harness is built without FP code): 0, 1200.0, 800.0 */
+    u32 in[5]; u32 f[3] = {0, 0x44960000u, 0x44480000u};
+    in[0] = f[l]; in[1] = f[r]; in[2] = f[t]; in[3] = f[b]; in[4] = value;
+    for (int i = 0; i < 16; i++) rec[i] = 0;
+    rec[0x1A / 2] = thick; draw_path = 0;
+    draw_call(in, rec);
+    return draw_path;
+}
+static void frame_tests(void) {
+    unsigned short rec[16];
+    /* drawing: display 1200 x 800 (3:2) */
+    check(draw(0, 0, 1, 0, 2, 1, rec) == 1 && draw_out[0] == -1 && rec[0x1A / 2] == 1,
+          "grid hook, value 0: the displaced sub w8, w22, #1 and back to the stock code, record untouched");
+    check(draw(7, 0, 1, 0, 2, 1, rec) == 1 && draw_out[0] == 6, "grid hook, value 7 (16:9): stock path");
+    cf_store(0, 0, 0);
+    check(draw(9, 0, 1, 0, 2, 1, rec) == 2 && draw_out[1] == 1200 && draw_out[2] == 800 && draw_out[3] == 1200 &&
+          draw_out[4] == 800 && draw_out[0] == 2 && rec[0x1A / 2] == 2 && rec[0x16 / 2] == 2 && rec[0xA / 2] == 2,
+          "custom frame, nothing stored: 1.00x 3:2 = the whole display; thickness 1 -> 2, line counts 2");
+    cf_store(4, 1, 1);
+    check(draw(9, 0, 1, 0, 2, 3, rec) == 2 && draw_out[1] == 666 && draw_out[2] == 666 && draw_out[0] == 3,
+          "custom frame 1.20x 1:1: 666 x 666 (height-limited), thickness 3 kept");
+    cf_store(10, 16, 9);
+    check(draw(9, 0, 1, 0, 2, 1, rec) == 2 && draw_out[1] == 800 && draw_out[2] == 450, "custom frame 1.50x 16:9: 800 x 450");
+    cf_store(0, 4, 5);
+    check(draw(9, 0, 1, 0, 2, 1, rec) == 2 && draw_out[1] == 640 && draw_out[2] == 800, "custom frame 1.00x 4:5: 640 x 800");
+    cf_store(2, 3, 2);
+    check(draw(9, 0, 1, 0, 2, 1, rec) == 2 && draw_out[1] == 1090 && draw_out[2] == 727, "custom frame 1.10x 3:2: 1090 x 727");
+    /* stored bytes: validation */
+    cf_store(10, 99, 99); check(call(frame_cf_load, 0, 0, 0, 0) == (10 | 99 << 8 | 99 << 16), "load: limits accepted");
+    cf_store(11, 3, 2); check(call(frame_cf_load, 0, 0, 0, 0) == (0 | 3 << 8 | 2 << 16), "load: step 11 -> defaults");
+    cf_store(1, 100, 2); check(call(frame_cf_load, 0, 0, 0, 0) == (0 | 3 << 8 | 2 << 16), "load: X 100 -> defaults");
+    cf_store(1, 2, 0); check(call(frame_cf_load, 0, 0, 0, 0) == (0 | 3 << 8 | 2 << 16), "load: Y 0 -> defaults");
+    /* the parameter page: a context whose state shows the cursor on row `cur` */
+    static u32 rows[3 * 11]; static u64 page[4]; static u8 st[0x60]; static u64 ctx[2];
+    u32 items[3] = {CF_ROW0, CF_ROW1, CF_ROW2};
+    for (int i = 0; i < 3; i++) rows[i * 11 + 6] = items[i];
+    page[2] = (u64)rows;
+    for (int i = 0; i < 0x60; i++) st[i] = 0;
+    *(u64 *)(st + 0x50) = (u64)page; *(u64 *)(st + 0x48) = 0x1000;
+    ctx[0] = (u64)st;
+    #define CUR(k) (*(unsigned short *)(st + 0x32) = (unsigned short)(k))
+    cf_store(4, 3, 2);
+    for (int i = 0; i < 4; i++) CFR(i) = 0xAA;
+    CFR(4) = 1; nlog = 0;
+    call(frame_cf_entry, (u64)st, 0, 0, 0);
+    check(CFR(0) == 4 && CFR(1) == 3 && CFR(2) == 2 && CFR(3) == 0 && CFR(4) == 0 && is(0, K_CURSOR, (u64)st, CF_ROW0, 0) && nlog == 1,
+          "parameter page opened from the picker: working copy loaded, not editing, cursor on Crop factor");
+    nlog = 0; CFR(3) = 2; CFR(1) = 7;
+    call(frame_cf_entry, (u64)st, 0, 0, 0);
+    check(CFR(3) == 2 && CFR(1) == 7 && nlog == 0, "page entered again (redraw) while editing: working copy, editing and cursor kept");
+    CFR(3) = 0;
+    call(frame_cf_entry, (u64)st, 0, 0, 0);
+    check(CFR(3) == 0 && CFR(1) == 7 && nlog == 0, "page entered again, not editing: working copy kept");
+    for (int i = 0; i < 4; i++) CFR(i) = 0;
+    call(frame_cf_entry, (u64)st, 0, 0, 0);
+    check(CFR(0) == 4 && CFR(1) == 3 && CFR(2) == 2 && nlog == 0, "page entered with an empty working copy (after power-on): loaded");
+    nshown = 0;
+    call(frame_cf_refresh, (u64)st, 0, 0, 0);
+    check(last_is(CF_ROW0, CF_SLOT0, "1.20x") && last_is(CF_ROW1, CF_SLOT0 + 1, "3") && last_is(CF_ROW2, CF_SLOT0 + 2, "2"),
+          "refresh: 1.20x / 3 / 2 in text slots 10..12");
+    check(call(frame_cf_refresh, 0, 0, 0, 0) == 0, "refresh without a state: nothing");
+    nlog = 0; CUR(1);
+    call(frame_cf_up, (u64)ctx, 0, 0, 0); call(frame_cf_down, (u64)ctx, 0, 0, 0);
+    check(is(0, K_UP, (u64)ctx, 0, 0) && is(1, K_DOWN, (u64)ctx, 0, 0) && CFR(1) == 3, "not editing: up / down move the cursor (stock)");
+    nlog = 0; nshown = 0; fs_calls_redraw = 0; fs_last_state = 0;
+    call(frame_cf_ok, (u64)ctx, 0, 0, 0);
+    check(fs_calls_redraw == 1 && fs_last_state == (u64)st, "OK on a row: page redrawn");
+    check(CFR(3) == 2 && nlog == 0 && last_is(CF_ROW1, CF_SLOT0 + 1, "< 3 >") && last_is(CF_ROW0, CF_SLOT0, "1.20x"),
+          "OK on Aspect ratio X: editing it, shown as < 3 >");
+    for (int i = 0; i < 120; i++) { nshown = 0; call(frame_cf_up, (u64)ctx, 0, 0, 0); }
+    nshown = 0; call(frame_cf_refresh, (u64)st, 0, 0, 0);
+    check(fs_calls_redraw == 1 + 96, "each change redraws the page, a press at the limit does not");
+    check(CFR(1) == 99 && nlog == 0 && CFS(1) == 3 && last_is(CF_ROW1, CF_SLOT0 + 1, "< 99 >"), "editing X: up stops at 99, not stored yet");
+    for (int i = 0; i < 120; i++) call(frame_cf_down, (u64)ctx, 0, 0, 0);
+    check(CFR(1) == 1 && CFR(0) == 4 && CFR(2) == 2, "editing X: down stops at 1, other values untouched");
+    call(frame_cf_up, (u64)ctx, 0, 0, 0);
+    nshown = 0;
+    call(frame_cf_ok, (u64)ctx, 0, 0, 0);
+    check(CFR(3) == 0 && CFS(0) == 4 && CFS(1) == 2 && CFS(2) == 2 && last_is(CF_ROW1, CF_SLOT0 + 1, "2"), "OK again: stored, editing ends");
+    CUR(0); call(frame_cf_ok, (u64)ctx, 0, 0, 0);
+    for (int i = 0; i < 20; i++) { nshown = 0; call(frame_cf_up, (u64)ctx, 0, 0, 0); }
+    nshown = 0; call(frame_cf_refresh, (u64)st, 0, 0, 0);
+    check(CFR(0) == 10 && last_is(CF_ROW0, CF_SLOT0, "<1.50x>"), "editing the crop factor: up stops at 1.50x");
+    for (int i = 0; i < 20; i++) { nshown = 0; call(frame_cf_down, (u64)ctx, 0, 0, 0); }
+    nshown = 0; call(frame_cf_refresh, (u64)st, 0, 0, 0);
+    check(CFR(0) == 0 && last_is(CF_ROW0, CF_SLOT0, "<1.00x>"), "down stops at 1.00x");
+    call(frame_cf_up, (u64)ctx, 0, 0, 0);
+    nlog = 0;
+    call(frame_cf_back, (u64)ctx, 0, 0, 0);
+    check(CFR(3) == 0 && CFS(0) == 1 && is(0, K_BACK, (u64)ctx, 0, 0), "back while editing: stores 1.05x, editing ends, stock back");
+    CUR(2); call(frame_cf_ok, (u64)ctx, 0, 0, 0);
+    call(frame_cf_down, (u64)ctx, 0, 0, 0);
+    call(frame_cf_ok, (u64)ctx, 0, 0, 0);
+    check(CFS(2) == 1 && CFR(3) == 0, "Aspect ratio Y: 2 -> 1");
+    /* picker */
+    nlog = 0; gui_value = 4;
+    CFR(4) = 0;
+    call(frame_cf_pick, 0x1234, 0, 0, 0);
+    check(is(0, K_GUISET, 0x2001A01u, 9, 0) && gui_value == 9 && CFR(4) == 1, "Custom frame row OK: photo grid value 9, page marked fresh");
+    nlog = 0; guard_result = 0;
+    call(frame_cf_pick_entry, (u64)st, 0, 0, 0);
+    check(is(0, K_PICKENTRY, (u64)st, 0, 0) && L[1].kind == K_GUARD && is(2, K_CURSOR, (u64)st, CF_PICK, 0) &&
+          is(3, K_MARK, (u64)st, CF_PICK, 1) && nlog == 4, "picker entry with value 9: stock entry, then cursor and mark on Custom frame");
+    nlog = 0; guard_result = 1;
+    call(frame_cf_pick_entry, (u64)st, 0, 0, 0);
+    check(is(2, K_MARK, (u64)st, CF_PICK, 1) && nlog == 3, "picker entry coming back: mark only");
+    nlog = 0; gui_value = 1;
+    call(frame_cf_pick_entry, (u64)st, 0, 0, 0);
+    check(nlog == 1 && is(0, K_PICKENTRY, (u64)st, 0, 0), "picker entry with a stock grid: stock entry only");
+    guard_result = 0;
+}
+
 void main_(void) {
     u32 r;
     /* ---------------- link off: the stock path ---------------- */
@@ -948,6 +1102,7 @@ save_done:
     focus_tests();
     lens_tests();
     imenu_tests();
+    frame_tests();
     check(canary_bad == 0, "callee-saved registers x19..x29 and sp preserved by every routine called");
     if (canary_bad) { puts_("    canary mask "); puthex(canary_bad); putc_('\n'); }
     puts_("checks "); puthex(checks); puts_(" failures "); puthex(failures); putc_('\n');
@@ -958,6 +1113,9 @@ __asm__(".section .text.start,\"ax\"\n"
         ".global _start\n_start:\n"
         "    ldr x0, =0x40F00000\n"
         "    mov sp, x0\n"
+        "    mov x0, #(3 << 20)\n"
+        "    msr cpacr_el1, x0\n"
+        "    isb\n"
         "    adr x0, vectors\n"
         "    msr vbar_el1, x0\n"
         "    bl main_\n"
