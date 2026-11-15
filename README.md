@@ -72,6 +72,8 @@ Windows 使用 `py -3 -m venv .venv` 创建环境，用 `.\.venv\Scripts\Activat
 
 ## English
 
+> **This fork** adds a standalone Z8 C 3.11 patch for menu banks, focus shift shooting and a Custom frame grid: see [docs/menu-bank.md](docs/menu-bank.md). It is not part of the upstream toolkit releases.
+
 **Current version: v0.3.0.** This toolkit builds selected features from official **Nikon Z8 C 3.11**. The previous public release is [v0.2.0](https://github.com/XinmiaoZhao/NikonFirmwarePatch/releases/tag/v0.2.0); see the [changelog](CHANGELOG.md).
 
 | Option | Feature |
