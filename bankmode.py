@@ -28,7 +28,6 @@ def build(eg, version, tag):
     public = public_words(version)
     shared.STRING_IDS['bank-store'] = (bp.STRING_FIRST, bp.STRING_COUNT)
     shared.STRING_IDS['focus-end'] = (bp.FS_STRING_FIRST, bp.FS_STRING_COUNT)
-    shared.STRING_IDS['multi-exposure-range'] = (bp.ME_STRING_FIRST, bp.ME_STRING_COUNT)
     strings = shared.Strings()
     img, detail = bp.build_main(eg, strings)
     detail['shared_strings'] = strings.emit(img)
@@ -73,7 +72,7 @@ def main():
     report.update(status='BUILT', input_sha256=package.sha256, input_filename=a.firmware.name,
                   output_sha256=sha(packet), output_bytes=len(packet), output_filename=name,
                   output_eg_sha256=sha(eg), input_modules=package.modules, output_modules=checked.modules,
-                  scope='Menu-bank behaviour option, link banks, per-bank release mode, bracketing burst hold, focus shift end point (distance on the page, sub-page to set / clear, current focus distance row, forgotten at standby), estimate (to the end point, else to the infinity position the lens reports), an i-menu start (the Focus shift shooting item starts the series) and, as a test, Multiple exposure with up to 20 shots; static and instruction-level checks, emulator menu runs; not all paths camera-tested')
+                  scope='Menu-bank behaviour option, link banks, per-bank release mode, bracketing burst hold, focus shift end point (distance on the page, sub-page to set / clear, current focus distance row, forgotten at standby), estimate (to the end point, else to the infinity position the lens reports) and an i-menu start (the Focus shift shooting item starts the series); static and instruction-level checks, emulator menu runs; not all paths camera-tested')
     a.output.mkdir(parents=True, exist_ok=False)
     with (a.output / name).open('xb') as f:
         f.write(packet)

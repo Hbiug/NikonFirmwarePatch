@@ -210,27 +210,6 @@ FS_ARM_RAM = FS_DIST_RAM + 2                            # u8, zero at boot (same
 # "Error. Turn camera off and then on again", while Start from an event handler (OK on Start, c1's hook) does not.
 MENU_EVENTS, MENU_EV_TICK, MENU_EV_TICK_STOCK = 0x42B086D8, 0xA, 0x40508260  # menu app's event switch, event 0xA case
 MENU_TOP = 0x403DBDB4                                   # top of the menu stack (state record, u16 state at +2)
-# c9 (test): Multiple exposure > Number of shots up to ME_MAX (stock 2..10).  Picker = state 0x93, a generic spinner
-# whose descriptor (RAM 0xA0284919C) holds min 2 / max 10; its entry clamps the setting to 2..10 (0x405E9D30), the
-# up / down guards allow a step while the value is < 10 (0x405E9C60, 0x405E9CD8), and OK writes table[value] (8-byte
-# entries {shots, shots} at RAM 0xA028491C8, entries 0..10) through the address built at 0x405E9ED8..0x405E9EE8.  The
-# table is copied with entries up to ME_MAX into the GUI area.  Not changed: the shooting-screen button + dial picker
-# (9-entry table 0x43A19258, values 2..10).
-ME_MAX = 20
-ME_DESC = 0xA0284919C - 0xA02808000 + 0x4B13000        # descriptor (payload offset): +0xC min, +0x10 max
-ME_TABLE_RAM = 0xA028491C8
-ME_CMP = {0x405E9D30: (0x7100255F, 0x7100001F | (ME_MAX - 1) << 10 | 10 << 5),   # cmp w10, #(max - 1): value - 2 < max - 1
-          0x405E9C60: (0x7100291F, 0x7100001F | ME_MAX << 10 | 8 << 5),                  # cmp w8, #max (up guard)
-          0x405E9CD8: (0x7100291F, 0x7100001F | ME_MAX << 10 | 8 << 5)}                  # cmp w8, #max (up guard)
-ME_ADDR_SITES = (0x405E9ED8, 0x405E9EDC, 0x405E9EE4, 0x405E9EE8)                        # mov x9 / movk x9 x3
-# the menu row's value text (0x405DFF60, the multiple exposure page refresh) switches on value - 2 over nine constant
-# strings ("2".."10"); above 10 it leaves the row empty.  The switch (sub w8, w0, #2 at 0x405DFFDC) becomes a branch
-# to me_text, which writes the value in decimal into the same 3-byte buffer (sp + 0xC) and joins the stock code at
-# 0x405E00B4 (text slot 3, style 4).  The picker's range hint (layout 0x43DF15C8, used by state 0x93 only; string id at
-# 0x43DF16D8, stock 0xAB3 "2 - 10") gets a new string.
-ME_TEXT_SITE, ME_TEXT_STOCK, ME_TEXT_RESUME = 0x405DFFDC, 0x51000808, 0x405E00B4
-ME_RANGE_AT, ME_RANGE_STOCK = 0x43DF16D8, 0xAB3
-ME_RANGE_TEXT = '2 - %d' % ME_MAX
 FS_ORDER = (0, 1, 2, 3, FS_ROW_SET, FS_ROW_CURRENT, 4, 7, 8, 9, 10)   # new position k shows stock row FS_ORDER[k]
 FS_VALUE_ROW = 0x101009                                # row kind: text value, no arrow (emulator: 0x1x01 / 0x1x05 kinds show a picture)
 FS_PAGE = 0xA028CF400 - 0xA02808000 + 0x4B13000             # page record of the focus shift page (state 0xB1)
@@ -239,7 +218,6 @@ FS_GUIDE_STRING, FS_GUIDE_AT = 0xA4C, 0xCC              # "Interrupt after start
 FS_ENGLISH = ('Focus end point', 'Clear end point', 'Narrow' + ' ' * 4 + 'Est. shots' + ' ' * 6 + 'Wide ', '',
               'Set end point', 'Current focus')
 FS_STRING_FIRST, FS_STRING_COUNT = 3143, len(FS_ENGLISH)
-ME_STRING_FIRST, ME_STRING_COUNT = FS_STRING_FIRST + FS_STRING_COUNT, 1      # c9: "2 - 20"
 # Focus end point sub-page (c3): the end point row opens state 0xB5, the stock child page of that (formerly hidden) row,
 # rebuilt from the N-RAW option page: "Set end point" / "Clear end point"; OK runs fs_end_ok and goes back.
 STATE_FS_END = 0xB5
@@ -1442,10 +1420,8 @@ def strings(context):
     """English text in every language: the stock string pool has no equivalent wording."""
     ids = context.add('bank-store', [list(ENGLISH) for _ in range(36)])
     fs = context.add('focus-end', [list(FS_ENGLISH) for _ in range(36)])
-    me = context.add('multi-exposure-range', [[ME_RANGE_TEXT] for _ in range(36)])
     return dict(label_id=ids[0], option_ids=ids[1:1 + N_OPTIONS], fs_set_id=fs[0], fs_clear_id=fs[1],
-                sl_top_id=fs[2], sl_empty_id=fs[3], fs_end_ids=(fs[4], fs[1]), fs_current_id=fs[5],
-                me_range_id=me[0])
+                sl_top_id=fs[2], sl_empty_id=fs[3], fs_end_ids=(fs[4], fs[1]), fs_current_id=fs[5])
 
 
 def menu(img, ids, blk):
@@ -1671,75 +1647,6 @@ def menu_rows_photo(img):
     return img.u64(page + 0x10) - BASE
 
 
-def me_code(at):
-    """me_text: w0 = number of shots (2..ME_MAX); decimal text into [sp + 0xC], then the stock text-slot code."""
-    b = Block(at)
-    b.mov_w(9, 10)
-    b._w(0x1AC9080A)                           # udiv w10, w0, w9      tens
-    b._w(0x1B09814B)                           # msub w11, w10, w9, w0 ones
-    b._w(0x1100C16B)                           # add  w11, w11, #'0'
-    b.cbz_w(10, 'one')
-    b._w(0x1100C14A)                           # add  w10, w10, #'0'
-    b.strb_w(10, 31, 0xC)
-    b.strb_w(11, 31, 0xD)
-    b.strb_w(31, 31, 0xE)                      # (rt 31 = wzr)
-    b.b(ME_TEXT_RESUME)
-    b.label('one')
-    b.strb_w(11, 31, 0xC)
-    b.strb_w(31, 31, 0xD)
-    b.b(ME_TEXT_RESUME)
-    return b
-
-
-def multi_exposure(img, at, ids):
-    """c9 test: raise the Number of shots limit of Multiple exposure to ME_MAX."""
-    if struct.unpack_from('<4i', img.old, ME_DESC + 4) != (0, 0, 2, 10):
-        raise ValueError('stock multiple exposure spinner descriptor differs')
-    stock_tab = ME_TABLE_RAM - 0xA02808000 + 0x4B13000
-    entries = [struct.unpack_from('<2I', img.old, stock_tab + 8 * v) for v in range(11)]
-    if entries != [(max(v, 2), max(v, 2)) for v in range(11)] or struct.unpack_from('<2I', img.old, stock_tab - 8) != (0x600050F, 0x2800):
-        raise ValueError('stock multiple exposure value table differs')
-    words = [struct.unpack_from('<I', img.old, a - BASE)[0] for a in ME_ADDR_SITES]
-    if words != [0xD2923909, 0xF2A05089, 0xF2C00149, 0xF2E00009]:
-        raise ValueError('stock multiple exposure table address code differs')
-    at = (at + 7) & ~7
-    table = b''.join(struct.pack('<2I', max(v, 2), max(v, 2)) for v in range(ME_MAX + 1))
-    if at + len(table) > FS_GUI_LIMIT:
-        raise ValueError('GUI area full (multiple exposure table)')
-    img.put(at, table, f'multiple exposure: Number of shots value table, entries 0..{ME_MAX}', expect_zero=True)
-    t = va(at)
-    new = [0xD2800009 | (t & 0xFFFF) << 5, 0xF2A00009 | ((t >> 16) & 0xFFFF) << 5,
-           0xF2C00009 | ((t >> 32) & 0xFFFF) << 5, 0xF2E00009 | ((t >> 48) & 0xFFFF) << 5]
-    for a, w0, w1 in zip(ME_ADDR_SITES, words, new):
-        img.put(a - BASE, struct.pack('<I', w1), f'multiple exposure OK: value table address ({a:#x})', expect=struct.pack('<I', w0))
-    for a, (w0, w1) in ME_CMP.items():
-        if struct.unpack_from('<I', img.old, a - BASE)[0] != w0:
-            raise ValueError(f'stock multiple exposure compare at {a:#x} differs')
-        img.put(a - BASE, struct.pack('<I', w1), f'multiple exposure picker limit ({a:#x})', expect=struct.pack('<I', w0))
-    img.put(ME_DESC + 0x10, struct.pack('<i', ME_MAX), 'multiple exposure spinner maximum', expect=struct.pack('<i', 10))
-    at += len(table)
-    # the menu row's value text
-    if struct.unpack_from('<2I', img.old, ME_TEXT_SITE - BASE) != (ME_TEXT_STOCK, 0x7100211F) or \
-            struct.unpack_from('<2I', img.old, ME_TEXT_RESUME - 12 - BASE) != (0x910033E0, 0x320007E2):
-        raise ValueError('stock multiple exposure row text code differs')
-    at = (at + 15) & ~15
-    code = me_code(va(at))
-    cb = code.bytes()
-    if at + len(cb) > FS_GUI_LIMIT:
-        raise ValueError('GUI area full (multiple exposure text)')
-    img.put(at, cb, 'code (GUI area): multiple exposure row value in decimal', expect_zero=True)
-    img.put(ME_TEXT_SITE - BASE, struct.pack('<I', _b_word(ME_TEXT_SITE, va(at))),
-            'multiple exposure page refresh: Number of shots text -> me_text', expect=struct.pack('<I', ME_TEXT_STOCK))
-    text_at = va(at)
-    at += len(cb)
-    # the picker's range hint
-    if struct.unpack_from('<I', img.old, ME_RANGE_AT - BASE)[0] != ME_RANGE_STOCK:
-        raise ValueError('stock multiple exposure picker hint differs')
-    img.put(ME_RANGE_AT - BASE, struct.pack('<I', ids['me_range_id']), f'multiple exposure picker hint -> "{ME_RANGE_TEXT}"',
-            expect=struct.pack('<I', ME_RANGE_STOCK))
-    return dict(max=ME_MAX, table=hex(t), text=hex(text_at), range_string=ids['me_range_id'], gui_end=hex(at))
-
-
 def end_menu(img, ids, blk, lens, at):
     """Focus end point sub-page in state 0xB5, built on the focus shift page's own layout and page record (full-width
     rows, the "Interrupt after start" guide string emptied): "Set end point" / "Clear end point", OK -> fs_end_ok2,
@@ -1909,11 +1816,10 @@ def build_main(eg, strings_context):
     require(struct.unpack_from('<4I', eg, 0x405F68BC - BASE)[:2] == (0xD29FF000, 0xF2A89740) and
             struct.unpack_from('<I', eg, 0x405F68CC - BASE)[0] == 0x52800AA2, 'stock slider "1" label code differs')
     sl_where = slider_layout(img, ids)
-    me_where = multi_exposure(img, int(fs_where['gui_end'], 16), ids)
     delta = blk.labels['sl_wrap'] - SL_ARROWS
     img.put(SL_ARROWS - BASE, struct.pack('<I', 0x14000000 | ((delta // 4) & 0x3FFFFFF)),
             'focus step width slider: arrow update entry -> wrapper (estimate line)', expect=struct.pack('<I', SL_ARROWS_STOCK))
-    return img, dict(strings=ids, menu=where, multiple_exposure=me_where, slider=dict(sl_where, wrapper=hex(blk.labels['sl_wrap']),
+    return img, dict(strings=ids, menu=where, slider=dict(sl_where, wrapper=hex(blk.labels['sl_wrap']),
                                                           text=hex(blk.labels['sl_text'])),
                      focus_end=dict(fs_where, end_bytes=[hex(FS_END0 + REL_SLOT_STEP * k) for k in range(4)],
                                                      frame_site=hex(FS_FRAME_SITE), start_site=hex(FS_START_SITE),

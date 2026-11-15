@@ -54,15 +54,6 @@ LENS_STOCK_CALLS = {0x4109E130, 0x4127D850}          # lens parameter getter, sp
 IM_SITE, IM_SITE_STOCK, IM_RESUME = 0x4044F2C8, 0x52801620, 0x4044F2DC
 FS_MENU_TABLE, FS_OPEN, FS_START, FS_BUSY = 0x43E26400, 0x405EF0B4, 0x405EF5E4, 0x403971AC
 FS_ARM = 0xA10002F02
-# c9 test: Multiple exposure > Number of shots up to 20 (spinner max, three compares, OK value table address)
-ME_MAX = 20
-ME_DESC = 0xA0284919C - 0xA02808000 + 0x4B13000
-ME_CMP = {0x405E9D30: (0x7100255F, 0x7100001F | (ME_MAX - 1) << 10 | 10 << 5),
-          0x405E9C60: (0x7100291F, 0x7100001F | ME_MAX << 10 | 8 << 5),
-          0x405E9CD8: (0x7100291F, 0x7100001F | ME_MAX << 10 | 8 << 5)}
-ME_ADDR = (0x405E9ED8, 0x405E9EDC, 0x405E9EE4, 0x405E9EE8)
-ME_TEXT_SITE, ME_TEXT_STOCK, ME_TEXT_RESUME = 0x405DFFDC, 0x51000808, 0x405E00B4
-ME_RANGE_AT, ME_RANGE_STOCK, ME_RANGE_ID = 0x43DF16D8, 0xAB3, 3149
 MENU_EV_ENTRY, MENU_EV_STOCK, MENU_TOP = 0x42B086D8 + 8 * 0xA, 0x40508260, 0x403DBDB4   # menu app event 0xA case
 SL_LAYOUT_EDITS = {0x43DF951C: 4, 0x43DF9534: 8, 0x43DF9560: 4, 0x43DF9578: 8, 0x43DF9754: 8, 0x43DF9798: 8}
 
@@ -107,14 +98,7 @@ def windows(version, tag, n, stock):
         'focus shift page refresh callback': (FS_CALLBACKS + 32, 8),
         'i-menu handler: focus shift case': (IM_SITE - BASE, 4),
         'menu app event 0xA case (i-menu start hook)': (MENU_EV_ENTRY - BASE, 8),
-        'multiple exposure spinner maximum': (ME_DESC + 0x10, 4),
     }
-    for a in ME_CMP:
-        w[f'multiple exposure picker compare {a:#x}'] = (a - BASE, 4)
-    for a in ME_ADDR:
-        w[f'multiple exposure value table address {a:#x}'] = (a - BASE, 4)
-    w['multiple exposure row text switch'] = (ME_TEXT_SITE - BASE, 4)
-    w['multiple exposure picker hint string'] = (ME_RANGE_AT - BASE, 4)
     for k in range(64):
         e, a = struct.unpack_from('<2Q', stock, FS_MENU_TABLE - BASE + 32 * k)
         if e == 0x3BB:
@@ -195,8 +179,7 @@ def verify(stock_raw, out_raw, version, tag):
                'focus shift per-frame remaining-shots load', 'focus shift start: No. of shots read', 'standby: mode 0xC request call',
                'focus shift cursor table address (low half)', 'focus shift cursor table address (high half)',
                'focus shift cursor table count', 'focus step width slider: arrow update entry',
-               'i-menu handler: focus shift case'} | {f'multiple exposure picker compare {a:#x}' for a in ME_CMP} | \
-              {f'multiple exposure value table address {a:#x}' for a in ME_ADDR} | {'multiple exposure row text switch'}
+               'i-menu handler: focus shift case'}
     for r in report:
         if r['start'] < CODE_REGION_END and not set(r['windows']) <= code_ok:
             raise ValueError(f'unexpected code-region change: {r}')
@@ -533,39 +516,6 @@ def verify(stock_raw, out_raw, version, tag):
                 f'{name} wrapper: unexpected inner call')
         require(sum(1 for a, m, o in body if m == 'ret') == 1, f'{name} wrapper: expected one ret')
         wrappers[name] = hex(hook)
-    # c9 test: the Number of shots picker's limit and its OK value table
-    require(struct.unpack_from('<5i', eg0, ME_DESC) == (0, 0, 0, 2, 10) and struct.unpack_from('<5i', eg1, ME_DESC) == (0, 0, 0, 2, ME_MAX),
-            'multiple exposure spinner descriptor')
-    for a, (w0, w1) in ME_CMP.items():
-        require(struct.unpack_from('<I', eg0, a - BASE)[0] == w0 and struct.unpack_from('<I', eg1, a - BASE)[0] == w1,
-                f'multiple exposure compare {a:#x}')
-    aw0 = [struct.unpack_from('<I', eg0, a - BASE)[0] for a in ME_ADDR]
-    aw1 = [struct.unpack_from('<I', eg1, a - BASE)[0] for a in ME_ADDR]
-    require(aw0 == [0xD2923909, 0xF2A05089, 0xF2C00149, 0xF2E00009] and [x & 0xFFE0001F for x in aw1] ==
-            [0xD2800009, 0xF2A00009, 0xF2C00009, 0xF2E00009], 'multiple exposure table address code')
-    me_tab = sum(((x >> 5) & 0xFFFF) << (16 * k) for k, x in enumerate(aw1))
-    require(BASE + 0x8A1000 <= me_tab and me_tab + 8 * (ME_MAX + 1) <= BASE + FS_GUI_END and me_tab % 8 == 0 and
-            not any(eg0[me_tab - BASE:me_tab - BASE + 8 * (ME_MAX + 1)]) and
-            [struct.unpack_from('<2I', eg1, me_tab - BASE + 8 * v) for v in range(ME_MAX + 1)] ==
-            [(max(v, 2), max(v, 2)) for v in range(ME_MAX + 1)], 'multiple exposure value table')
-    # the row value text: a branch to a 13-instruction decimal formatter in the GUI area that rejoins the stock code
-    require(struct.unpack_from('<I', eg0, ME_TEXT_SITE - BASE)[0] == ME_TEXT_STOCK, 'stock multiple exposure row text')
-    w = struct.unpack_from('<I', eg1, ME_TEXT_SITE - BASE)[0]
-    d = w & 0x3FFFFFF
-    me_text = ME_TEXT_SITE + ((d - (1 << 26) if d & (1 << 25) else d) << 2)
-    require(w >> 26 == 0b000101 and BASE + 0x8A1000 <= me_text < BASE + FS_GUI_END and not any(eg0[me_text - BASE:me_text - BASE + 52]),
-            'multiple exposure row text branch')
-    tr = disasm(eg1[me_text - BASE:me_text - BASE + 52], me_text)
-    require([m for a, m, o in tr] == ['mov', 'udiv', 'msub', 'add', 'cbz', 'add', 'strb', 'strb', 'strb', 'b', 'strb', 'strb', 'b'] and
-            all(o.endswith('[sp, #0xc]') or o.endswith('[sp, #0xd]') or o.endswith('[sp, #0xe]') for a, m, o in tr if m == 'strb') and
-            int(tr[9][2].split()[-1], 16) == ME_TEXT_RESUME and int(tr[12][2].split()[-1], 16) == ME_TEXT_RESUME,
-            'multiple exposure row text formatter')
-    require(struct.unpack_from('<I', eg0, ME_RANGE_AT - BASE)[0] == ME_RANGE_STOCK and
-            struct.unpack_from('<I', eg1, ME_RANGE_AT - BASE)[0] == ME_RANGE_ID, 'multiple exposure picker hint string id')
-    stock_tab = 0xA028491C8 - 0xA02808000 + 0x4B13000
-    require(eg0[stock_tab:stock_tab + 88] == eg1[stock_tab:stock_tab + 88] and
-            [struct.unpack_from('<2I', eg0, stock_tab + 8 * v) for v in range(11)] == [(max(v, 2), max(v, 2)) for v in range(11)],
-            'stock multiple exposure value table')
     return dict(status='VERIFIED', changed_ranges=len(report), windows=sorted({w for r in report for w in r['windows']}),
                 gate=hex(gate), native=hex(native[0]), link_wrappers=wrappers, menu_switch=hex(menu_switch), output_sha256=sha(out_raw))
 
