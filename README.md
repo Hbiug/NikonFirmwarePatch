@@ -6,7 +6,7 @@
 
 This fork of [XinmiaoZhao/NikonFirmwarePatch](https://github.com/XinmiaoZhao/NikonFirmwarePatch) adds a separate patch for the official **Nikon Z8 C 3.11** firmware, built with `bankmode.py` (branch `z8-menu-bank-behavior`). It is standalone: it does not combine with the toolkit's ProRes, pre-capture, pixel-shift or open-gate/N-RAW features below.
 
-**Status: firmware built from this branch has been flashed successfully onto a Nikon Z8.** Feature-by-feature camera status is listed in [docs/menu-bank.md](docs/menu-bank.md#status). It is still experimental firmware: flash at your own risk (see [LICENSE](LICENSE) and [NOTICE](NOTICE.md)).
+**Status: firmware built from this branch has been flashed successfully onto a Nikon Z8, and the menu-bank, focus shift and Custom frame features have been tested on the camera and work.** Details in [docs/menu-bank.md](docs/menu-bank.md#status). It is still experimental firmware: flash at your own risk (see [LICENSE](LICENSE) and [NOTICE](NOTICE.md)).
 
 ### What it adds
 
