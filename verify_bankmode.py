@@ -57,6 +57,15 @@ FS_ARM = 0xA10002F02
 MENU_EV_ENTRY, MENU_EV_STOCK, MENU_TOP = 0x42B086D8 + 8 * 0xA, 0x40508260, 0x403DBDB4   # menu app event 0xA case
 # d0 (c10): "Custom frame" photo grid (value 9): picker row, parameter page in state 0xB6, grid drawing hook
 CF_AREA = (0x8A3000, 0x8A4000)
+# e0: interval timer below 1 s: word edits (site -> (stock, new)) and the three branches to the guard code
+IV_WORDS = {0x405EB7F8: (0x528000AA, 0x5280002A), 0x405EBB14: (0x7100155F, 0x52807D11),
+            0x405EBB28: (0x1A9F01A8, 0x1B11B588), 0x405EBB34: (0x3400010A, 0xD503201F),
+            0x405F5008: (0x7100151F, 0x2A030049), 0x405F500C: (0x54000101, 0x35000109),
+            0x405F5018: (0xF2C00001, 0x7100291F), 0x405F501C: (0x528000A4, 0x2A0803E4),
+            0x405F5024: (0xF2E00001, 0x5400004A), 0x40FB2220: (0x35000128, 0x14000009)}
+IV_HOOKS = {0x40FBDEFC: (0xCB080008, {0x40FBDF00, 0x40FBDF64}), 0x40FBDF5C: (0x528000A9, {0x40FBDF64}),
+            0x40FCAD3C: (0xCB09010A, {0x40FCAD40, 0x40FCAD8C})}
+IV_BLOCK = 0xA03BC7620
 GRID_SITE, GRID_NEXT, GRID_RECT = 0x4046B0CC, 0x4046B0D0, 0x4046B39C
 PICK_PAGE_PTR = pm.STATE_TABLE + pm.STATE_SIZE * 0x1C4 + 0x50
 PICK_CALLBACKS = 0xA028EA950 - 0xA02808000 + 0x4B13000
@@ -112,6 +121,8 @@ def windows(version, tag, n, stock):
         'menu app event 0xA case (i-menu start hook)': (MENU_EV_ENTRY - BASE, 8),
         'custom frame menu records': (CF_AREA[0], CF_AREA[1] - CF_AREA[0]),
         'grid routine: grid value test': (GRID_SITE - BASE, 4),
+        **{f'interval timer edit {a:#x}': (a - BASE, 4) for a in IV_WORDS},
+        **{f'interval timer hook {a:#x}': (a - BASE, 4) for a in IV_HOOKS},
         'state 0x1C4 page record pointer': (PICK_PAGE_PTR, 8),
         'photo grid picker entry callback': (PICK_CALLBACKS, 8),
         **{f'grid picker table load {a:#x}': (a - BASE, 4) for a in PICK_LOADS},
@@ -199,7 +210,8 @@ def verify(stock_raw, out_raw, version, tag):
                'focus shift cursor table address (low half)', 'focus shift cursor table address (high half)',
                'focus shift cursor table count', 'focus step width slider: arrow update entry',
                'i-menu handler: focus shift case', 'custom frame menu records', 'grid routine: grid value test'} | \
-              {f'grid picker table load {a:#x}' for a in PICK_LOADS}
+              {f'grid picker table load {a:#x}' for a in PICK_LOADS} | \
+              {f'interval timer edit {a:#x}' for a in IV_WORDS} | {f'interval timer hook {a:#x}' for a in IV_HOOKS}
     for r in report:
         if r['start'] < CODE_REGION_END and not set(r['windows']) <= code_ok:
             raise ValueError(f'unexpected code-region change: {r}')
@@ -548,8 +560,41 @@ def verify(stock_raw, out_raw, version, tag):
     fmt = gui.find(CF_TEXTS[0] + b'\0' * 8)
     require(fmt > 0 and fmt % 4 == 0 and
             gui[fmt:fmt + 64] == b''.join(t.ljust(16, b'\0') for t in CF_TEXTS), 'custom frame: value formats')
-    require(not any(eg1[draw - BASE + fmt + 80:0x8A2F00]) and not any(eg1[0x8A2F00:0x8A3000]),
-            'custom frame: data after the code, or the zero state is not zero')
+    # e0: the interval guard code follows the custom frame data (16-byte aligned); nothing after it
+    iv_lo = (draw + fmt + 80 + 15) & ~15
+    iv_targets = {}
+    for site, (stock_w, backs) in IV_HOOKS.items():
+        require(struct.unpack_from('<I', eg0, site - BASE)[0] == stock_w, f'stock interval hook site {site:#x}')
+        w = struct.unpack_from('<I', eg1, site - BASE)[0]
+        require(w >> 26 == 0b000101, f'interval hook {site:#x} is not a branch')
+        d = w & 0x3FFFFFF
+        iv_targets[site] = site + ((d - (1 << 26) if d & (1 << 25) else d) << 2)
+    iv_hi = BASE + FS_GUI_END
+    while iv_hi > iv_lo and not any(eg1[iv_hi - 4 - BASE:iv_hi - BASE]):
+        iv_hi -= 4
+    require(not any(eg1[draw - BASE + fmt + 80:iv_lo - BASE]) and min(iv_targets.values()) == iv_lo and
+            not any(eg1[0x8A2F00:0x8A3000]), 'interval code placement, or the zero state is not zero')
+    iv_rows = disasm(eg1[iv_lo - BASE:iv_hi - BASE], iv_lo)
+    require(len(iv_rows) == (iv_hi - iv_lo) // 4, 'interval code does not decode')
+    allowed = set().union(*(b for _, b in IV_HOOKS.values()))
+    for a, m, o in iv_rows:
+        require(m not in ('br', 'blr', 'bl', 'svc', 'msr', 'sys', 'eret', 'ret') and not m.startswith('st'),
+                f'interval code: {m} at {a:#x}')
+        if m == 'b' or m.startswith('b.') or m in ('cbz', 'cbnz', 'tbz', 'tbnz'):
+            tgt = int(o.split()[-1], 16)
+            require(iv_lo <= tgt < iv_hi or tgt in allowed, f'interval code: branch at {a:#x} to {tgt:#x}')
+    consts = set()
+    for i, (a, m, o) in enumerate(iv_rows):
+        if m == 'mov' and o.startswith('x9, #') and i + 3 < len(iv_rows):
+            v = int(o.split('#')[1], 16)
+            for k in (1, 2, 3):
+                mk, ok = iv_rows[i + k][1:]
+                v |= int(ok.split('#')[1].split(',')[0], 16) << int(ok.split('lsl #')[1])
+            consts.add(v)
+    require(consts == {IV_BLOCK}, f'interval code: addresses {[hex(c) for c in consts]}')
+    for site, (stock_w, new_w) in IV_WORDS.items():
+        require(struct.unpack_from('<I', eg0, site - BASE)[0] == stock_w and
+                struct.unpack_from('<I', eg1, site - BASE)[0] == new_w, f'interval timer edit {site:#x}')
     cf_lo, cf_hi = draw, draw + fmt
     cf_rows = disasm(gui[:fmt], cf_lo)
     require(len(cf_rows) == fmt // 4, 'custom frame code does not decode')

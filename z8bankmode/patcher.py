@@ -1822,7 +1822,9 @@ def build_main(eg, strings_context):
             'focus step width slider: arrow update entry -> wrapper (estimate line)', expect=struct.pack('<I', SL_ARROWS_STOCK))
     # ---- c10: custom frame photo grid -----------------------------------------------------------------------------
     cf_where = custom_frame(img, ids, blk.labels, cs, int(fs_where['gui_end'], 16))
-    return img, dict(strings=ids, custom_frame=cf_where, menu=where, slider=dict(sl_where, wrapper=hex(blk.labels['sl_wrap']),
+    cf_code = int(cf_where['code']['at'], 16) + cf_where['code']['bytes'] - BASE
+    iv_where = fast_interval(img, cs, cf_code)
+    return img, dict(strings=ids, custom_frame=cf_where, fast_interval=iv_where, menu=where, slider=dict(sl_where, wrapper=hex(blk.labels['sl_wrap']),
                                                           text=hex(blk.labels['sl_text'])),
                      focus_end=dict(fs_where, end_bytes=[hex(FS_END0 + REL_SLOT_STEP * k) for k in range(4)],
                                                      frame_site=hex(FS_FRAME_SITE), start_site=hex(FS_START_SITE),
@@ -2362,3 +2364,109 @@ def custom_frame(img, ids, main, cs, code_at):
                           table=hex(va(act_at)), items=[hex(i) for i in CF_ROW_ITEMS]),
                 value=CF_VALUE, store=dict(item=hex(CF_ITEM_STORE), bytes=hex(CF_STORE)), ram=hex(CF_RAM),
                 draw_site=hex(GRID_SITE), end=hex(va(at)))
+
+
+# ---- e0: interval timer down to 0 s ---------------------------------------------------------------------------------
+# Interval timer shooting > Interval (state 0x9C, a three-column hours / minutes / seconds spinner): the seconds column
+# holds tenths of a second (0..590, spinner 0xA02848F04).  Stock steps it by 0.5 s below 1 s when hours and minutes
+# are 0 (0x405EB7F8), stores the four items 0x200051A..D (h, m, s, ms) on OK with ms = 500 only for exactly 0.5 s
+# (0x405EBB14 / 0x405EBB28) and refuses 00:00'00" (0x405EBB34).  The sequence start 0x40FB1FD0 refuses a zero interval
+# (error 0xB, 0x40FB2220).  The sequencer (block 0xA03BC7620, interval in ms at +0x4C, next shot time at +0x20) adds the
+# interval to the next shot time; 0x40FBDEDC(now, tolerance 0) says whether to wait, shoot (5), or skip the interval (0)
+# when the camera is late; the callers then loop "skip interval, next += interval" until the next time is not missed.
+# 0x40FCAD00 (time to the next shot) loops "next += interval" until next >= now: with 0 that never ends.
+#
+# The patch: 0.1 s steps below 1 s, any tenth stored as ms (tenths * 100 - seconds * 1000), 00:00'00" accepted at the
+# page and at the start; below 1 s a late shot is taken at once instead of skipping the interval (iv_late), and a shot
+# that is due but whose readiness check fails waits (code 4) instead of being skipped (iv_ready); the time-to-next loop
+# returns max(next - now, 0) for a zero interval (iv_next).  The Interval row shows 00:00'00.N" below 1 s (two
+# redundant movk #0 of the stock format-address load carry the extra test).
+IV_BLOCK = 0xA03BC7620
+IV_WORDS = [  # (site, stock word, new word, text, purpose)
+    (0x405EB7F8, 0x528000AA, 0x5280002A, 'mov w10, #1', 'interval page: seconds step below 1 s 0.5 s -> 0.1 s'),
+    (0x405EBB14, 0x7100155F, 0x52807D11, 'mov w17, #0x3e8', 'interval page OK: (cmp tenths, 5) -> w17 = 1000'),
+    (0x405EBB28, 0x1A9F01A8, 0x1B11B588, 'msub w8, w12, w17, w13', 'interval page OK: ms = tenths * 100 - s * 1000'),
+    (0x405EBB34, 0x3400010A, 0xD503201F, 'nop', 'interval page OK: accept 00:00\'00"'),
+    (0x405F5008, 0x7100151F, 0x2A030049, 'orr w9, w2, w3', 'Interval row text: hours | minutes'),
+    (0x405F500C, 0x54000101, 0x35000109, 'cbnz w9, #0x405f502c', 'Interval row text: hours or minutes -> stock form'),
+    (0x405F5018, 0xF2C00001, 0x7100291F, 'cmp w8, #0xa', 'Interval row text: (movk x1, #0, lsl #32: no-op) -> below 1 s?'),
+    (0x405F501C, 0x528000A4, 0x2A0803E4, 'mov w4, w8', 'Interval row text: the tenth digit'),
+    (0x405F5024, 0xF2E00001, 0x5400004A, 'b.ge #0x405f502c', 'Interval row text: (movk x1, #0, lsl #48: no-op) -> 1 s and more: stock form'),
+    (0x40FB2220, 0x35000128, 0x14000009, 'b #0x40fb2244', 'interval timer start: accept a zero interval'),
+]
+IV_LATE_SITE, IV_LATE_STOCK = 0x40FBDEFC, 0xCB080008       # sub x8, x0, x8 (how late)
+IV_READY_SITE, IV_READY_STOCK = 0x40FBDF5C, 0x528000A9     # mov w9, #5 (due: shoot if ready, else skip)
+IV_NEXT_SITE, IV_NEXT_STOCK = 0x40FCAD3C, 0xCB09010A       # sub x10, x8, x9 (catch-up loop)
+
+
+def interval_code(cs, at):
+    b = Block(at)
+    # late shot (next < now): below 1 s shoot now, else stock (skip if later than the tolerance)
+    b.label('iv_late')
+    b.mov_x64(9, IV_BLOCK)
+    b.ldr_w(9, 9, 0x4C)
+    b.cmp_wi(9, 1000)
+    b.b_cond('hs', 'il_stock')
+    b.mov_w(0, 5)
+    b.b(0x40FBDF64)
+    b.label('il_stock')
+    _r(b, 0xCB080008, 'sub x8, x0, x8')
+    b.b(IV_LATE_SITE + 4)
+    # due within 5 ms: w0 = readiness word; stock: bit 1 set -> 5 (shoot), else 0 (skip); below 1 s: 4 (wait) instead
+    b.label('iv_ready')
+    _tbnz(b, 0, 1, 'ir_shoot')
+    b.mov_x64(9, IV_BLOCK)
+    b.ldr_w(9, 9, 0x4C)
+    b.mov_w(0, 0)
+    b.cmp_wi(9, 1000)
+    b.b_cond('hs', 'ir_done')
+    b.mov_w(0, 4)
+    b.b('ir_done')
+    b.label('ir_shoot')
+    b.mov_w(0, 5)
+    b.label('ir_done')
+    b.b(0x40FBDF64)
+    # time to the next shot: zero interval -> max(next - now, 0) instead of the endless catch-up loop
+    b.label('iv_next')
+    b.cbnz_w(9, 'in_stock')
+    _r(b, 0xEB000108, 'subs x8, x8, x0')
+    _r(b, 0x9A9F8108, 'csel x8, x8, xzr, hi')
+    b.b(0x40FCAD8C)
+    b.label('in_stock')
+    _r(b, 0xCB09010A, 'sub x10, x8, x9')
+    b.b(IV_NEXT_SITE + 4)
+    listing = b.listing(cs)
+    for index, text in getattr(b, 'expect', {}).items():
+        if _norm(listing[index][2]) != _norm(text):
+            raise ValueError(f'interval code raw word {index}: {listing[index][2]!r} != {text!r}')
+    return b, b.bytes(), listing
+
+
+def fast_interval(img, cs, code_at):
+    """e0: interval timer intervals 0 s and 0.1 .. 0.9 s (see IV_* above)."""
+    code_at = (code_at + 15) & ~15
+    code, code_bytes, listing = interval_code(cs, va(code_at))
+    if code_at + len(code_bytes) > FS_GUI_LIMIT:
+        raise ValueError('GUI area too small for the interval code')
+    for at, text in ((0x40FBDF60, 'and w0, w9, w8, asr #31'), (0x40FBDF64, 'ldp x19, x30, [sp], #0x10'),
+                     (0x40FCAD40, 'add x10, x10, x9'), (0x40FCAD8C, 'mov x0, x8'),
+                     (0x405EBB20, 'mul w13, w10, w15'), (0x405EBB1C, 'add w12, w12, w13'),
+                     (0x405EBB30, 'stp w12, w8, [sp, #8]'), (0x40FB2244, 'bl #0x40fdd9d4')):
+        got = next(cs.disasm(img.old[at - BASE:at - BASE + 4], at))
+        if _norm(f'{got.mnemonic} {got.op_str}') != _norm(text):
+            raise ValueError(f'stock interval code differs at {at:#x}')
+    img.put(code_at, code_bytes, 'code (GUI area): interval timer below 1 s (late / ready / next-shot guards)',
+            expect_zero=True)
+    for site, stock, new, text, why in IV_WORDS:
+        got = next(cs.disasm(struct.pack('<I', new), site))
+        if _norm(f'{got.mnemonic} {got.op_str}') != _norm(text):
+            raise ValueError(f'interval edit {site:#x} encodes {got.mnemonic} {got.op_str}')
+        img.put(site - BASE, struct.pack('<I', new), why, expect=struct.pack('<I', stock))
+    for site, stock, label, why in ((IV_LATE_SITE, IV_LATE_STOCK, 'iv_late', 'late shot test -> iv_late'),
+                                    (IV_READY_SITE, IV_READY_STOCK, 'iv_ready', 'due-shot readiness -> iv_ready'),
+                                    (IV_NEXT_SITE, IV_NEXT_STOCK, 'iv_next', 'time-to-next-shot loop -> iv_next')):
+        img.put(site - BASE, struct.pack('<I', _b_word(site, code.labels[label])), 'interval timer: ' + why,
+                expect=struct.pack('<I', stock))
+    return dict(code=dict(at=hex(va(code_at)), bytes=len(code_bytes), labels={k: hex(v) for k, v in code.labels.items()},
+                          listing=[dict(va=hex(x), word=w, text=t) for x, w, t in listing]),
+                edits=[dict(site=hex(s), text=t) for s, _, _, t, _ in IV_WORDS], end=hex(va(code_at) + len(code_bytes)))

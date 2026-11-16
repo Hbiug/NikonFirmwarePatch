@@ -6,7 +6,7 @@
 
 This fork of [XinmiaoZhao/NikonFirmwarePatch](https://github.com/XinmiaoZhao/NikonFirmwarePatch) adds a separate patch for the official **Nikon Z8 C 3.11** firmware, built with `bankmode.py` (branch `z8-menu-bank-behavior`). It is standalone: it does not combine with the toolkit's ProRes, pre-capture, pixel-shift or open-gate/N-RAW features below.
 
-**Status: firmware built from this branch has been flashed successfully onto a Nikon Z8, and the menu-bank, focus shift and Custom frame features have been tested on the camera and work.** Details in [docs/menu-bank.md](docs/menu-bank.md#status). It is still experimental firmware: flash at your own risk (see [LICENSE](LICENSE) and [NOTICE](NOTICE.md)).
+**Status: firmware built from this branch has been flashed successfully onto a Nikon Z8, and the menu-bank, focus shift and Custom frame features have been tested on the camera and work. The newest addition, intervals below 1 s for the interval timer (e0), has not been tested on a camera yet.** Details in [docs/menu-bank.md](docs/menu-bank.md#status). It is still experimental firmware: flash at your own risk (see [LICENSE](LICENSE) and [NOTICE](NOTICE.md)).
 
 ### What it adds
 
@@ -16,6 +16,7 @@ This fork of [XinmiaoZhao/NikonFirmwarePatch](https://github.com/XinmiaoZhao/Nik
 | Bracketing | The **Bracketing burst** button switches bracketing on while it is held. |
 | Focus shift | **Focus end point**: store the current focus position as the end of the series; the camera estimates the number of shots to reach it (on the page and on the focus step width slider). The page shows the end point and the **current focus** distance. The end point is forgotten at standby. |
 | i menu | Selecting **Focus shift shooting** in the i menu starts the series from live view. |
+| Interval timer | **Intervals below 1 s**: 00:00'00" (as fast as the camera can) and 0.1–0.9 s. *Not camera-tested.* |
 | Framing grid | **Custom frame** in Custom Settings › Grid type (photo): crop factor 1.00x–1.50x (0.05 steps) and aspect ratio X:Y (1–99 each, default 1.00x 3:2 = full frame). Live view draws the largest X:Y rectangle centred in the crop area. |
 
 ### Menus
@@ -33,11 +34,11 @@ Emulator screenshots of the patched firmware (English UI).
 ### Build and verify
 
 ```sh
-python bankmode.py "/path/to/Z_8_0311.bin" --version 04.20 --tag d0 --output build/bank
-python verify_bankmode.py "/path/to/Z_8_0311.bin" build/bank/Z_8_0420.bin --version 04.20 --tag d0
+python bankmode.py "/path/to/Z_8_0311.bin" --version 04.20 --tag e0 --output build/bank
+python verify_bankmode.py "/path/to/Z_8_0311.bin" build/bank/Z_8_0420.bin --version 04.20 --tag e0
 ```
 
-Expected output with these arguments: `Z_8_0420.bin`, SHA-256 `b8323e3f71ec6c865a9bb64b4440567b9c6a968f00582ae590f4cdf802b20f7a`. Requirements, the test harness and details: [docs/menu-bank.md](docs/menu-bank.md). The repository contains source only: no Nikon firmware, patched firmware or extracted firmware data. Obtain the official input from [Nikon](https://downloadcenter.nikonimglib.com/en/download/fw/606.html).
+Expected output with these arguments: `Z_8_0420.bin`, SHA-256 `8ae3523b48b983e1defda5eb7f7a06e197035a0d363d88cafbf6ff1c41370c1b`. Requirements, the test harness and details: [docs/menu-bank.md](docs/menu-bank.md). The repository contains source only: no Nikon firmware, patched firmware or extracted firmware data. Obtain the official input from [Nikon](https://downloadcenter.nikonimglib.com/en/download/fw/606.html).
 
 ---
 
