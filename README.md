@@ -39,6 +39,12 @@ python verify_bankmode.py "/path/to/Z_8_0311.bin" build/bank/Z_8_0420.bin --vers
 
 Expected output with these arguments: `Z_8_0420.bin`, SHA-256 `b8323e3f71ec6c865a9bb64b4440567b9c6a968f00582ae590f4cdf802b20f7a`. Requirements, the test harness and details: [docs/menu-bank.md](docs/menu-bank.md). The repository contains source only: no Nikon firmware, patched firmware or extracted firmware data. Obtain the official input from [Nikon](https://downloadcenter.nikonimglib.com/en/download/fw/606.html).
 
+### Experimental: Long exposure merge (`longexposure.py`)
+
+A separate, **emulator-tested only** build adds *Long exposure merge* to the photo shooting menu: it averages a series
+of ordinary NEFs (2-256 consecutive frames, same exposure) on the cards into one `DSC_xxxx_AVG.NEF`, a "fake" long
+exposure without an ND filter. It has never run on a camera. See [docs/long-exposure.md](docs/long-exposure.md).
+
 ---
 
 ## 功能预览 / Feature preview
