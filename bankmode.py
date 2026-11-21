@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Build the Z8 menu-bank behaviour patch (auto-store switch, save command, link banks) from the official C 3.11 package.
 
-Standalone: it does not combine with the toolkit's four features (they share rows, a state and the text
-gap with each other and with this patch).  Same safeguards as patch.py: exact official input, edits only
+It does not combine with the toolkit's ProRes feature (both use the same menu state 0x102 and text gap), nor, for
+now, with pixel shift or open gate / N-RAW.  The toolkit's RAW pre-capture (v0.4.0, from its photo-tools group) can be added with
+--precapture: it uses the reviewed v0.4.0 pre-capture code (resources/precapture.bin from the v0.4.0 Release toolkit,
+copied to resources/precapture-v0.4.0.bin) and its reviewed edits (resources/precapture-v0.4.0.json), which touch no byte this patch changes (the text-copy boundary is computed for both).  Same safeguards as patch.py: exact official input, edits only
 inside declared windows, new output directory, independent re-verification (verify_bankmode.py).
 """
 import argparse
@@ -22,7 +24,37 @@ from z8bankmode import patcher as bp
 STOCK_EG_SHA = 'f85e0138e2f5e660ece8560de62e0d12cb795e0e14983e50f20b61dce906c46c'
 
 
-def build(eg, version, tag):
+PRECAPTURE_RECIPE = Path(__file__).resolve().parent / 'resources/precapture-v0.4.0.json'
+
+
+def add_precapture(img, eg):
+    """The toolkit v0.4.0 pre-capture (part of its photo-tools group): reviewed code bytes and reviewed edit list
+    (resources/precapture-v0.4.0.json, taken from the v0.4.0 toolkit's compiled.json and combinations.json)."""
+    from z8precapture_v040.patcher import edits
+    recipe = json.loads(PRECAPTURE_RECIPE.read_text())
+    path = PRECAPTURE_RECIPE.parent.parent / recipe['code']['resource']
+    require(path.is_file(), f'Missing {recipe["code"]["resource"]}: copy resources/precapture.bin from the v0.4.0 '
+                            'Release toolkit ZIP to that name')
+    code = path.read_bytes()
+    require(len(code) == recipe['code']['bytes'] and sha(code) == recipe['code']['sha256'],
+            'Pre-capture code is not the reviewed v0.4.0 resources/precapture.bin')
+    root = Path(__file__).resolve().parent
+    for name, digest in recipe['code']['source_sha256'].items():
+        local = root / name.replace('z8precapture/', 'z8precapture_v040/')
+        require(sha(local.read_bytes()) == digest, f'{local.name} differs from the v0.4.0 source')
+    rows = edits(code, recipe['symbols'])
+    mine = [dict(offset=hex(e['offset']), bytes=len(e['new']), purpose=e['purpose'],
+                 old_sha256=sha(eg[e['offset']:e['offset'] + len(e['new'])]), new_sha256=sha(e['new'])) for e in rows]
+    require(mine == recipe['edits'], 'Pre-capture edits differ from the reviewed v0.4.0 recipe')
+    for e in rows:
+        require(all(not (e['offset'] < o['end'] and o['offset'] < e['offset'] + len(e['new'])) for o in img.edits),
+                f'Pre-capture edit {e["offset"]:#x} overlaps a menu-bank edit')
+        img.put(e['offset'], e['new'], 'precapture: ' + e['purpose'])
+    return dict(code_sha256=recipe['code']['sha256'], code_bytes=len(code), edits=len(rows),
+                recipe='toolkit v0.4.0 pre-capture (photo-tools group)')
+
+
+def build(eg, version, tag, precapture=False):
     require(len(eg) == 81807711 and sha(eg) == STOCK_EG_SHA, 'Incompatible input: exact original C3.11 EG required')
     require(re.fullmatch(r'[a-z][0-9]', tag), 'Tag must be a lowercase letter and digit')
     public = public_words(version)
@@ -31,6 +63,8 @@ def build(eg, version, tag):
     shared.STRING_IDS['grid-frame'] = (bp.CF_STRING_FIRST, bp.CF_STRING_COUNT)
     strings = shared.Strings()
     img, detail = bp.build_main(eg, strings)
+    if precapture:
+        detail['precapture'] = add_precapture(img, eg)
     detail['shared_strings'] = strings.emit(img)
     detail['loader'] = shared.loader(img, [])
     text = f'{version}.{tag}'.encode()
@@ -59,6 +93,8 @@ def main():
     ap.add_argument('firmware', type=Path, help='Official Nikon Z8 C 3.11 firmware (Z_8_0311.bin)')
     ap.add_argument('--version', default='04.20', help='Output version NN.NN (default 04.20)')
     ap.add_argument('--tag', default='b0', help='Internal revision suffix: lowercase letter plus digit (default b0)')
+    ap.add_argument('--precapture', action='store_true',
+                    help="Also add the toolkit v0.4.0 RAW pre-capture (needs resources/precapture-v0.4.0.bin, see README)")
     ap.add_argument('--output', type=Path, required=True, help='New output directory; must not already exist')
     a = ap.parse_args()
     require(a.firmware.is_file() and a.firmware.stat().st_size == PACKAGE_BYTES, 'Unsupported firmware length')
@@ -66,10 +102,12 @@ def main():
     data = a.firmware.read_bytes()
     require_official_input(data)
     package = Package(data)
-    eg, report = build(package.eg, a.version, a.tag)
+    eg, report = build(package.eg, a.version, a.tag, a.precapture)
     module_name = 'eg2070_' + a.version.replace('.', '') + a.tag + '.bi'
     packet, checked = package.replace_eg(eg, module_name)
     name = 'Z_8_' + a.version.replace('.', '') + '.bin'
+    if a.precapture:
+        report['feature'] = 'menu-bank-behavior+precapture'
     report.update(status='BUILT', input_sha256=package.sha256, input_filename=a.firmware.name,
                   output_sha256=sha(packet), output_bytes=len(packet), output_filename=name,
                   output_eg_sha256=sha(eg), input_modules=package.modules, output_modules=checked.modules,

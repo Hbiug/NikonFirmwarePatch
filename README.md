@@ -4,7 +4,7 @@
 
 ## This fork: menu banks, focus shift and Custom frame (`bankmode.py`)
 
-This fork of [XinmiaoZhao/NikonFirmwarePatch](https://github.com/XinmiaoZhao/NikonFirmwarePatch) adds a separate patch for the official **Nikon Z8 C 3.11** firmware, built with `bankmode.py` (branch `z8-menu-bank-behavior`). It is standalone: it does not combine with the toolkit's ProRes, pre-capture, pixel-shift or open-gate/N-RAW features below.
+This fork of [XinmiaoZhao/NikonFirmwarePatch](https://github.com/XinmiaoZhao/NikonFirmwarePatch) adds a separate patch for the official **Nikon Z8 C 3.11** firmware, built with `bankmode.py` (branch `z8-menu-bank-behavior`). It can include the toolkit's **RAW pre-capture** from v0.4.0 (`--precapture`, see below); it does not combine with the toolkit's ProRes, pixel-shift or open-gate/N-RAW features.
 
 **Status: firmware built from this branch has been flashed successfully onto a Nikon Z8, and the menu-bank, focus shift and Custom frame features have been tested on the camera and work. The newest addition, intervals below 1 s for the interval timer (e0), has not been tested on a camera yet.** Details in [docs/menu-bank.md](docs/menu-bank.md#status). It is still experimental firmware: flash at your own risk (see [LICENSE](LICENSE) and [NOTICE](NOTICE.md)).
 
@@ -38,7 +38,16 @@ python bankmode.py "/path/to/Z_8_0311.bin" --version 04.20 --tag e0 --output bui
 python verify_bankmode.py "/path/to/Z_8_0311.bin" build/bank/Z_8_0420.bin --version 04.20 --tag e0
 ```
 
-Expected output with these arguments: `Z_8_0420.bin`, SHA-256 `8ae3523b48b983e1defda5eb7f7a06e197035a0d363d88cafbf6ff1c41370c1b`. Requirements, the test harness and details: [docs/menu-bank.md](docs/menu-bank.md). The repository contains source only: no Nikon firmware, patched firmware or extracted firmware data. Obtain the official input from [Nikon](https://downloadcenter.nikonimglib.com/en/download/fw/606.html).
+Expected output with these arguments: `Z_8_0420.bin`, SHA-256 `8ae3523b48b983e1defda5eb7f7a06e197035a0d363d88cafbf6ff1c41370c1b`.
+
+**With the toolkit's RAW pre-capture (v0.4.0)** (C15/C30 HE/HE★ RAW and pre-capture in FX and DX, see the v0.4.0 [RAW/pre-capture guide](https://github.com/XinmiaoZhao/NikonFirmwarePatch/blob/v0.4.0/docs/raw-precapture.md)): copy `resources/precapture.bin` from the [v0.4.0 toolkit ZIP](https://github.com/XinmiaoZhao/NikonFirmwarePatch/releases/download/v0.4.0/NikonFirmwarePatch-v0.4.0-toolkit.zip) to `resources/precapture-v0.4.0.bin`, then
+
+```sh
+python bankmode.py "/path/to/Z_8_0311.bin" --version 04.20 --tag f1 --precapture --output build/bank-pc
+python verify_bankmode.py "/path/to/Z_8_0311.bin" build/bank-pc/Z_8_0420.bin --version 04.20 --tag f1 --precapture
+```
+
+Expected: SHA-256 `fd6c9d2be4691b70b3c9ff99149e4e5f73f556d6a5c96ba281d0fff2111963b5`. The combination itself has not been tested on a camera (see [docs/menu-bank.md](docs/menu-bank.md#with-the-toolkits-raw-pre-capture-f1-toolkit-v040)). Requirements, the test harness and details: [docs/menu-bank.md](docs/menu-bank.md). The repository contains source only: no Nikon firmware, patched firmware or extracted firmware data. Obtain the official input from [Nikon](https://downloadcenter.nikonimglib.com/en/download/fw/606.html).
 
 ---
 
