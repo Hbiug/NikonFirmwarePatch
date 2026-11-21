@@ -196,7 +196,20 @@ def precapture_windows(eg0, eg1):
     return out
 
 
-def verify(stock_raw, out_raw, version, tag, precapture=False):
+def pixelshift_windows(eg0, eg1):
+    """--pixelshift: the toolkit v0.4.0 pixel-shift edits (resources/pixelshift-v0.4.0.json): each window must hold
+    exactly the reviewed bytes (old and new SHA-256); its strings are checked with the shared string tables."""
+    recipe = json.loads((Path(__file__).resolve().parent / 'resources/pixelshift-v0.4.0.json').read_text())
+    out = {}
+    for row in recipe['edits']:
+        at, n = int(row['offset'], 16), row['bytes']
+        require(sha(eg0[at:at + n]) == row['old_sha256'] and sha(eg1[at:at + n]) == row['new_sha256'],
+                f'pixel-shift window {at:#x} differs from the reviewed recipe')
+        out[f'pixel-shift {at:#x}'] = (at, n)
+    return out
+
+
+def verify(stock_raw, out_raw, version, tag, precapture=False, pixelshift=False):
     require_official_input(stock_raw)
     ref, new = Package(stock_raw), Package(out_raw)
     require(len(new.eg) == len(ref.eg) and binascii.crc_hqx(new.eg, 0) == 0, 'EG length or CRC')
@@ -208,6 +221,7 @@ def verify(stock_raw, out_raw, version, tag, precapture=False):
     require(eg1[0x14EAA90:0x14EAA98] == ident and eg1[len(eg1) - 11:len(eg1) - 3] == ident, 'identity text')
     allowed = windows(version, tag, len(eg1), eg0)
     pc = precapture_windows(eg0, eg1) if precapture else {}
+    pc.update(pixelshift_windows(eg0, eg1) if pixelshift else {})
     require(not any(a < s + n and s < a + m for a, m in pc.values() for s, n in allowed.values()),
             'pre-capture window overlaps a menu-bank window')
     allowed.update(pc)
@@ -734,9 +748,9 @@ def verify(stock_raw, out_raw, version, tag, precapture=False):
         if a0 != pm.NRAW_OK:
             reach = {int(o.split()[-1], 16) for x, m, o in cf_rows if a <= x < a + 0x60 and m == 'b'}
             require(a0 in reach, f'parameter page: {e0:#x} action never reaches stock {a0:#x}')
-    if precapture:
-        require(set(pc) <= {w for r in report for w in r['windows']}, 'pre-capture window unchanged')
-    return dict(status='VERIFIED', precapture=bool(precapture), changed_ranges=len(report), windows=sorted({w for r in report for w in r['windows']}),
+    if precapture or pixelshift:
+        require(set(pc) <= {w for r in report for w in r['windows']}, 'pre-capture / pixel-shift window unchanged')
+    return dict(status='VERIFIED', precapture=bool(precapture), pixelshift=bool(pixelshift), changed_ranges=len(report), windows=sorted({w for r in report for w in r['windows']}),
                 gate=hex(gate), native=hex(native[0]), link_wrappers=wrappers, custom_frame=dict(draw=hex(draw), pick=hex(pa), page=hex(page)), menu_switch=hex(menu_switch), output_sha256=sha(out_raw))
 
 
@@ -747,8 +761,10 @@ def main():
     ap.add_argument('--version', required=True)
     ap.add_argument('--tag', required=True)
     ap.add_argument('--precapture', action='store_true', help='the output includes the toolkit pre-capture feature')
+    ap.add_argument('--pixelshift', action='store_true', help='the output includes the toolkit pixel-shift merge')
     a = ap.parse_args()
-    print(json.dumps(verify(a.stock.read_bytes(), a.output.read_bytes(), a.version, a.tag, a.precapture), indent=2))
+    print(json.dumps(verify(a.stock.read_bytes(), a.output.read_bytes(), a.version, a.tag, a.precapture, a.pixelshift),
+                     indent=2))
 
 
 if __name__ == '__main__':

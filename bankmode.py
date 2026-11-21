@@ -54,7 +54,42 @@ def add_precapture(img, eg):
                 recipe='toolkit v0.4.0 pre-capture (photo-tools group)')
 
 
-def build(eg, version, tag, precapture=False):
+PIXELSHIFT_RECIPE = Path(__file__).resolve().parent / 'resources/pixelshift-v0.4.0.json'
+
+
+def add_pixelshift(img, eg, strings):
+    """The toolkit v0.4.0 in-camera pixel-shift merge (part of its photo-tools group): reviewed code and AF kernel bytes,
+    the v0.4.0 adapter (z8pixelshift_v040), edits equal to the reviewed rows (resources/pixelshift-v0.4.0.json); its
+    five menu strings (ids 3142..3146) join this build's shared string tables."""
+    from z8pixelshift_v040.patcher import build_main
+    recipe = json.loads(PIXELSHIFT_RECIPE.read_text())
+    root = Path(__file__).resolve().parent
+    blobs = {}
+    for key in ('code', 'af'):
+        unit = recipe[key]
+        path = root / unit['resource']
+        require(path.is_file(), f'Missing {unit["resource"]}: copy resources/{"pixelshift-af" if key == "af" else "pixelshift"}'
+                                '.bin from the v0.4.0 Release toolkit ZIP to that name')
+        blobs[key] = path.read_bytes()
+        require(len(blobs[key]) == unit['bytes'] and sha(blobs[key]) == unit['sha256'],
+                f'{unit["resource"]} is not the reviewed v0.4.0 binary')
+        for name, digest in unit['source_sha256'].items():
+            local = root / name.replace('z8pixelshift/', 'z8pixelshift_v040/')
+            require(local.is_file() and sha(local.read_bytes()) == digest, f'{name} differs from the v0.4.0 source')
+    part, detail = build_main(eg, blobs['code'], recipe['symbols'], blobs['af'], strings)
+    rows = sorted(part.edits, key=lambda e: e['offset'])
+    mine = [dict(offset=hex(e['offset']), bytes=e['end'] - e['offset'], purpose='pixelshift: ' + e['purpose'],
+                 old_sha256=sha(e['old']), new_sha256=sha(e['new'])) for e in rows]
+    require(mine == recipe['edits'], 'Pixel-shift edits differ from the reviewed v0.4.0 recipe')
+    for e in rows:
+        require(all(not (e['offset'] < o['end'] and o['offset'] < e['end']) for o in img.edits),
+                f'Pixel-shift edit {e["offset"]:#x} overlaps an earlier edit')
+        img.put(e['offset'], e['new'], 'pixelshift: ' + e['purpose'])
+    return dict(code_sha256=recipe['code']['sha256'], af_sha256=recipe['af']['sha256'], edits=len(rows),
+                strings=list(range(3142, 3147)), recipe='toolkit v0.4.0 pixel shift (photo-tools group)')
+
+
+def build(eg, version, tag, precapture=False, pixelshift=False):
     require(len(eg) == 81807711 and sha(eg) == STOCK_EG_SHA, 'Incompatible input: exact original C3.11 EG required')
     require(re.fullmatch(r'[a-z][0-9]', tag), 'Tag must be a lowercase letter and digit')
     public = public_words(version)
@@ -65,8 +100,10 @@ def build(eg, version, tag, precapture=False):
     img, detail = bp.build_main(eg, strings)
     if precapture:
         detail['precapture'] = add_precapture(img, eg)
+    if pixelshift:
+        detail['pixelshift'] = add_pixelshift(img, eg, strings)
     detail['shared_strings'] = strings.emit(img)
-    detail['loader'] = shared.loader(img, [])
+    detail['loader'] = shared.loader(img, ['pixelshift'] if pixelshift else [])
     text = f'{version}.{tag}'.encode()
     for at, raw, why in [(0xEB29FC, public, 'public version'), (0x14EAA90, text, 'runtime identity'),
                          (len(eg) - 11, text, 'trailer identity')]:
@@ -95,6 +132,9 @@ def main():
     ap.add_argument('--tag', default='b0', help='Internal revision suffix: lowercase letter plus digit (default b0)')
     ap.add_argument('--precapture', action='store_true',
                     help="Also add the toolkit v0.4.0 RAW pre-capture (needs resources/precapture-v0.4.0.bin, see README)")
+    ap.add_argument('--pixelshift', action='store_true',
+                    help="Also add the toolkit v0.4.0 in-camera pixel-shift merge (needs resources/pixelshift-v0.4.0.bin and "
+                         "resources/pixelshift-af-v0.4.0.bin, see README)")
     ap.add_argument('--output', type=Path, required=True, help='New output directory; must not already exist')
     a = ap.parse_args()
     require(a.firmware.is_file() and a.firmware.stat().st_size == PACKAGE_BYTES, 'Unsupported firmware length')
@@ -102,12 +142,12 @@ def main():
     data = a.firmware.read_bytes()
     require_official_input(data)
     package = Package(data)
-    eg, report = build(package.eg, a.version, a.tag, a.precapture)
+    eg, report = build(package.eg, a.version, a.tag, a.precapture, a.pixelshift)
     module_name = 'eg2070_' + a.version.replace('.', '') + a.tag + '.bi'
     packet, checked = package.replace_eg(eg, module_name)
     name = 'Z_8_' + a.version.replace('.', '') + '.bin'
-    if a.precapture:
-        report['feature'] = 'menu-bank-behavior+precapture'
+    report['feature'] = '+'.join(['menu-bank-behavior'] + [n for n, on in (('precapture', a.precapture),
+                                                                            ('pixelshift', a.pixelshift)) if on])
     report.update(status='BUILT', input_sha256=package.sha256, input_filename=a.firmware.name,
                   output_sha256=sha(packet), output_bytes=len(packet), output_filename=name,
                   output_eg_sha256=sha(eg), input_modules=package.modules, output_modules=checked.modules,

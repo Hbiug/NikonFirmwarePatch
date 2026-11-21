@@ -91,4 +91,20 @@ Firmware sites (all in 3.11 addresses): page step 0x405EB7F8, OK handler 0x405EB
 
 With version 04.20 and tag f1 the output is `Z_8_0420.bin`, SHA-256 `fd6c9d2be4691b70b3c9ff99149e4e5f73f556d6a5c96ba281d0fff2111963b5`.
 
-The toolkit's ProRes feature cannot be combined: it uses the same menu state (0x102) and code page as this patch's sub-page. Pixel shift (v0.4.0 photo-tools) and open gate / N-RAW share only the string tables and could be added later.
+## With the toolkit's pixel-shift merge (f2, toolkit v0.4.0)
+
+`bankmode.py --pixelshift` adds the in-camera pixel-shift merge of NikonFirmwarePatch **v0.4.0** (Photo shooting menu › Pixel shift merge: merges 4/8/16/32-frame FX/L 14-bit lossless pixel-shift NEF groups on the cards into NEFX; v0.4.0 fixes complete groups missing from the list when a burst does not start at file number 0001, 2049 …; guide: [pixel shift](https://github.com/XinmiaoZhao/NikonFirmwarePatch/blob/v0.4.0/docs/pixelshift.md)). Build f2 = f1 + pixel shift (`--precapture --pixelshift`), i.e. the v0.4.0 `photo-tools` group on top of e0.
+
+- **Same code and edits as the toolkit.** Reviewed v0.4.0 merge code (`pixelshift.bin`, SHA-256 `4c1df43e…bf0bb`) and AF kernel (`pixelshift-af.bin`, `b48022fe…bd3e7`) from the Release ZIP, copied to `resources/pixelshift-v0.4.0.bin` / `resources/pixelshift-af-v0.4.0.bin`; adapter and C source in `z8pixelshift_v040/` (source hashes checked; the adapter is identical to v0.3.0's); the 16 pixel-shift rows of the v0.4.0 `photo-tools` recipe in `resources/pixelshift-v0.4.0.json`. The generated edits must equal them.
+- **Shared strings.** Its five menu strings (ids 3142..3146, 36 languages) go into this build's string tables with the menu-bank strings (one owner, the same layout as before at 0x408D0000 / 0x408E0000). Check: all 113,508 strings (36 languages × 3153 ids) resolve to the same text as in f1, except ids 3142..3146, which resolve to the same text as in the toolkit's own `photo-tools` build.
+- **No other shared bytes.** Pixel shift uses photo menu row 45 (item 0x2C13), states 0x1D and 0xC5 and code at 0x40990000..0x409ECC84; this patch uses states 0xB5, 0xB6, 0x102, 0x1C4 and code from 0x40A00000; pre-capture is at 0x409F0000. Byte comparison: f2 equals f1 outside the pixel-shift windows and the string tables, and equals the toolkit's `photo-tools` build inside the pixel-shift windows. `verify_bankmode.py --precapture --pixelshift` passes.
+- **Emulator:** the Pixel shift merge row appears and opens its browser (scan of the virtual card, no groups on it). A merge was not run in the emulator (no pixel-shift NEF set available).
+- **Not camera-tested as a combination.**
+
+With version 04.20 and tag f2 the output is `Z_8_0420.bin`, SHA-256 `5233736a83472025d0782b543daa7975f17265d9aaab1136efee324c33cb84f7`.
+
+| Pixel shift merge row | |
+|---|---|
+| <img src="images/bankmode-pixelshift-row.png" width="420" alt="Photo shooting menu with the Pixel shift merge row" /> | |
+
+The toolkit's ProRes feature cannot be combined: it uses the same menu state (0x102) and code page as this patch's sub-page. Open gate / N-RAW (v0.4.0 framing group) shares the string tables and the code area above 0x40970000 and has not been checked.
